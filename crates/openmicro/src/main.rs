@@ -1,7 +1,7 @@
 mod client;
 mod ui;
 
-use std::io::BufRead;
+use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{self, Event, KeyCode};
@@ -10,6 +10,23 @@ use crossterm::execute;
 use ratatui::prelude::*;
 
 use client::SnapshotDto;
+
+/// RAII guard that restores the terminal on every exit path.
+///
+/// Constructed immediately after raw mode is enabled and the alternate screen
+/// is entered. Its `Drop` impl runs on normal return, on any early
+/// `?`-propagated error, and during panic unwinding, so the user's shell is
+/// never left wedged in raw mode / the alternate screen. Errors from the
+/// restore calls are intentionally ignored (`let _ = ...`) so cleanup never
+/// itself panics or short-circuits the other restore step.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -30,20 +47,19 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Enable raw mode and enter the alternate screen, then IMMEDIATELY install
+    // the RAII guard so every subsequent fallible step (Terminal::new, the run
+    // loop) is covered: any early return via `?` or panic unwinds through
+    // `TerminalGuard::drop`, restoring the terminal. There is no explicit
+    // restore afterwards — the guard owns cleanup, so it cannot be skipped or
+    // double-run in a way that errors.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    // Run the loop and capture the result rather than propagating it directly
-    // with `?`, so the terminal is always restored (raw mode disabled, leave
-    // alternate screen) whether the loop exits normally or via an I/O error.
-    let result = run(&mut terminal, &snap);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    result
+    run(&mut terminal, &snap)
 }
 
 fn run(

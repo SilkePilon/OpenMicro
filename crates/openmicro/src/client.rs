@@ -29,4 +29,16 @@ mod tests {
         assert_eq!(snap.sessions.len(), 1);
         assert_eq!(snap.owner.as_deref(), Some("claude:s1"));
     }
+
+    #[test]
+    fn rejects_non_json() {
+        assert!(parse_snapshot("not json").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        // Valid JSON, but the wrong shape (`sessions` must be an array of
+        // objects): deserialization fails and the `None` path is exercised.
+        assert!(parse_snapshot(r#"{"sessions":"nope"}"#).is_none());
+    }
 }
