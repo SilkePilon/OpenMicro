@@ -2,15 +2,17 @@
 //!
 //! `openmicro` is a CLI-with-default-TUI: with **no** subcommand it launches
 //! the interactive TUI (see `main::run_tui`); with a subcommand it runs that
-//! action and exits. The pure, testable pieces (argv parsing and the
-//! `status` snapshot renderer) live here; the side-effecting runners are thin
-//! wrappers around them.
+//! action and exits. The pure, testable pieces (argv parsing, the `status`
+//! snapshot renderer, the agent/firmware summaries) live here; the
+//! side-effecting runners are thin wrappers around them.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::agents::{self, AgentKind, HookStatus};
 use crate::client::parse_snapshot;
 
 #[derive(Parser, Debug)]
@@ -33,20 +35,61 @@ pub enum Commands {
         /// Action to forward to `systemctl --user ... openmicrod.service`.
         action: ServiceAction,
     },
-    /// Print setup instructions for an agent adapter.
+    /// Run the guided setup wizard (device check, firmware, agent hooks).
+    Setup,
+    /// List the coding agents found on this machine and their hook status.
+    Agents,
+    /// Install OpenMicro hooks into a coding agent's own config.
     InstallAgent {
-        /// Which agent adapter to set up.
-        agent: AgentName,
+        /// Which agent adapter to set up. Omit when using `--all`.
+        agent: Option<AgentKind>,
+        /// Install every detected agent that is missing its hooks.
+        #[arg(long)]
+        all: bool,
+        /// Print the adapter's install documentation instead of changing anything.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Obtain a flashable firmware image.
+    Firmware {
+        #[command(subcommand)]
+        action: FirmwareAction,
     },
     /// Flash device firmware to a Micro 2 in bootloader mode.
     Flash {
         /// Path to the flashable image (defaults to the firmware build output).
         #[arg(long)]
-        image: Option<std::path::PathBuf>,
+        image: Option<PathBuf>,
         /// Serial port to flash over (e.g. /dev/ttyACM0); auto-detected if omitted.
         #[arg(long)]
         port: Option<String>,
     },
+    /// Save the device's current flash so the stock firmware can be restored.
+    Backup {
+        /// Where to write the dump (defaults to ~/.local/share/openmicro).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        port: Option<String>,
+    },
+    /// Write a previously saved stock-firmware backup back to the device.
+    Restore {
+        /// Backup to write (defaults to the one `openmicro backup` created).
+        #[arg(long)]
+        image: Option<PathBuf>,
+        #[arg(long)]
+        port: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum FirmwareAction {
+    /// Compile `firmware/` with the Xtensa toolchain.
+    Build,
+    /// Fetch a prebuilt release image.
+    Download,
+    /// Report which firmware sources are available and which image would be used.
+    Status,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,40 +116,27 @@ impl ServiceAction {
     }
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentName {
-    Claude,
-    Codex,
-    Grok,
-    T3,
-}
-
-impl AgentName {
-    /// Directory under `adapters/` that holds this agent's install docs.
-    pub fn adapter_dir(self) -> &'static str {
-        match self {
-            AgentName::Claude => "claude-code",
-            AgentName::Codex => "codex",
-            AgentName::Grok => "grok-code",
-            AgentName::T3 => "t3-code",
-        }
-    }
-}
-
 /// Dispatch a parsed subcommand. Some arms terminate the process directly
 /// (`status` on a missing daemon, `service` with the child's exit code) rather
 /// than returning, which matches the "print and exit non-zero" contract.
+///
+/// `Setup` is handled by `main` (it needs the terminal), never here.
 pub fn run(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Status => run_status(),
         Commands::Service { action } => run_service(action),
-        Commands::InstallAgent { agent } => run_install_agent(agent),
+        Commands::Setup => unreachable!("`setup` is dispatched by main"),
+        Commands::Agents => run_agents(),
+        Commands::InstallAgent { agent, all, print } => run_install_agent(agent, all, print),
+        Commands::Firmware { action } => run_firmware(action),
         Commands::Flash { image, port } => run_flash(image.as_deref(), port.as_deref()),
+        Commands::Backup { out, port } => run_backup(out.as_deref(), port.as_deref()),
+        Commands::Restore { image, port } => run_restore(image.as_deref(), port.as_deref()),
     }
 }
 
 /// Run the firmware flash. Prints the actionable guidance and exits non-zero on
-/// the common "no image / no esptool / not in bootloader" prerequisites — it
+/// the common "no image / no flash tool / not in bootloader" prerequisites — it
 /// never claims success it did not perform.
 fn run_flash(image: Option<&std::path::Path>, port: Option<&str>) -> anyhow::Result<()> {
     match crate::flash::flash(image, port) {
@@ -119,6 +149,93 @@ fn run_flash(image: Option<&std::path::Path>, port: Option<&str>) -> anyhow::Res
             std::process::exit(1);
         }
     }
+}
+
+/// Dump the device's flash to a file so a later `restore` is possible.
+fn run_backup(out: Option<&std::path::Path>, port: Option<&str>) -> anyhow::Result<()> {
+    match crate::flash::backup(out, port) {
+        Ok((path, lines)) => {
+            for l in lines {
+                println!("{l}");
+            }
+            println!("keep {} safe — it is the only way back to stock.", path.display());
+            Ok(())
+        }
+        Err(msg) => {
+            eprintln!("cannot back up: {msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Write a saved stock-firmware backup back to the device.
+fn run_restore(image: Option<&std::path::Path>, port: Option<&str>) -> anyhow::Result<()> {
+    match crate::flash::restore(image, port) {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        Err(msg) => {
+            eprintln!("cannot restore: {msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build or download a firmware image, or report what is available.
+fn run_firmware(action: FirmwareAction) -> anyhow::Result<()> {
+    let result = match action {
+        FirmwareAction::Status => {
+            print!("{}", format_firmware_status(&crate::firmware::Sources::detect()));
+            return Ok(());
+        }
+        FirmwareAction::Build => crate::firmware::build(),
+        FirmwareAction::Download => crate::firmware::download(),
+    };
+    match result {
+        Ok((path, lines)) => {
+            for l in lines {
+                println!("{l}");
+            }
+            println!("firmware image ready: {}", path.display());
+            Ok(())
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Render the firmware-source summary. Pure, so the wording is testable.
+pub fn format_firmware_status(sources: &crate::firmware::Sources) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("toolchain:    {}\n", sources.toolchain.describe()));
+    out.push_str(&format!(
+        "source dir:   {}\n",
+        sources
+            .firmware_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found (run from a checkout to build)".into())
+    ));
+    out.push_str(&format!("download url: {}\n", sources.url));
+    out.push_str(&format!(
+        "image:        {}\n",
+        sources
+            .existing
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none yet — `openmicro firmware build|download`".into())
+    ));
+    out.push_str(&format!(
+        "can build: {}   can download: {}\n",
+        sources.can_build(),
+        sources.can_download()
+    ));
+    out
 }
 
 /// Path to the daemon's control socket under `$XDG_RUNTIME_DIR`.
@@ -155,9 +272,96 @@ fn run_service(action: ServiceAction) -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// List every adapter with what we found on this machine.
+fn run_agents() -> anyhow::Result<()> {
+    print!("{}", format_agents(&agents::detect(&agents::home())));
+    if agents::hook_binary().is_none() {
+        eprintln!(
+            "warning: openmicro-hook is not on PATH — installed hooks will do nothing until it is."
+        );
+    }
+    Ok(())
+}
+
+/// Render the agent table. Pure, so the wording is testable.
+pub fn format_agents(rows: &[agents::AgentRow]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let presence = if row.present { "installed" } else { "not found" };
+        let status = match &row.status {
+            HookStatus::Installed => "hooks: installed".to_string(),
+            HookStatus::Missing => "hooks: missing".to_string(),
+            HookStatus::Blocked(why) => format!("hooks: blocked — {why}"),
+            HookStatus::Unsupported(_) => "hooks: unsupported by this agent".to_string(),
+        };
+        out.push_str(&format!("{:<8} {:<10} {}\n", row.kind.slug(), presence, status));
+    }
+    out
+}
+
+/// Install hooks for one agent, for every detected agent (`--all`), or just
+/// print the adapter docs (`--print`).
+fn run_install_agent(agent: Option<AgentKind>, all: bool, print: bool) -> anyhow::Result<()> {
+    if print {
+        let Some(agent) = agent else {
+            eprintln!(
+                "--print needs a specific agent, e.g. `openmicro install-agent claude --print`"
+            );
+            std::process::exit(2);
+        };
+        print_adapter_docs(agent);
+        return Ok(());
+    }
+
+    let home = agents::home();
+    let targets: Vec<AgentKind> = match (agent, all) {
+        (Some(a), false) => vec![a],
+        (None, true) => agents::detect(&home)
+            .into_iter()
+            .filter(|r| r.present && r.status == HookStatus::Missing)
+            .map(|r| r.kind)
+            .collect(),
+        (Some(_), true) => {
+            eprintln!("pass either an agent name or --all, not both");
+            std::process::exit(2);
+        }
+        (None, false) => {
+            eprintln!("specify an agent (e.g. `openmicro install-agent claude`) or --all");
+            std::process::exit(2);
+        }
+    };
+
+    if targets.is_empty() {
+        println!("nothing to do: no detected agent is missing its OpenMicro hooks.");
+        return Ok(());
+    }
+
+    if agents::hook_binary().is_none() {
+        eprintln!(
+            "warning: openmicro-hook is not on PATH — the hooks below will be installed but \
+             will do nothing until it is."
+        );
+    }
+
+    let mut failed = false;
+    for kind in targets {
+        match agents::install(kind, &home) {
+            Ok(report) => println!("{}", report.summary()),
+            Err(e) => {
+                failed = true;
+                eprintln!("{}: {e}", kind.slug());
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Print the adapter's install instructions from `adapters/<name>/install.md`
-/// if readable, else a short pointer. Non-destructive by default.
-fn run_install_agent(agent: AgentName) -> anyhow::Result<()> {
+/// if readable, else a short pointer.
+fn print_adapter_docs(agent: AgentKind) {
     let dir = agent.adapter_dir();
     let path = format!("adapters/{dir}/install.md");
     match std::fs::read_to_string(&path) {
@@ -167,7 +371,6 @@ fn run_install_agent(agent: AgentName) -> anyhow::Result<()> {
              source tree for setup steps for this agent."
         ),
     }
-    Ok(())
 }
 
 /// Render a control-socket snapshot line into a human-readable summary.
@@ -236,8 +439,66 @@ mod tests {
         let cli = Cli::try_parse_from(["openmicro", "install-agent", "claude"]).unwrap();
         assert_eq!(
             cli.command,
-            Some(Commands::InstallAgent { agent: AgentName::Claude })
+            Some(Commands::InstallAgent {
+                agent: Some(AgentKind::Claude),
+                all: false,
+                print: false,
+            })
         );
+    }
+
+    #[test]
+    fn parses_install_agent_all_and_print() {
+        let cli = Cli::try_parse_from(["openmicro", "install-agent", "--all"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::InstallAgent { agent: None, all: true, print: false })
+        );
+        let cli = Cli::try_parse_from(["openmicro", "install-agent", "codex", "--print"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::InstallAgent {
+                agent: Some(AgentKind::Codex),
+                all: false,
+                print: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_setup_and_agents() {
+        assert_eq!(
+            Cli::try_parse_from(["openmicro", "setup"]).unwrap().command,
+            Some(Commands::Setup)
+        );
+        assert_eq!(
+            Cli::try_parse_from(["openmicro", "agents"]).unwrap().command,
+            Some(Commands::Agents)
+        );
+    }
+
+    #[test]
+    fn parses_firmware_actions() {
+        for (arg, expected) in [
+            ("build", FirmwareAction::Build),
+            ("download", FirmwareAction::Download),
+            ("status", FirmwareAction::Status),
+        ] {
+            let cli = Cli::try_parse_from(["openmicro", "firmware", arg]).unwrap();
+            assert_eq!(cli.command, Some(Commands::Firmware { action: expected }));
+        }
+        assert!(Cli::try_parse_from(["openmicro", "firmware", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_backup_and_restore() {
+        let cli = Cli::try_parse_from(["openmicro", "backup", "--out", "/tmp/s.bin"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Backup { out: Some(PathBuf::from("/tmp/s.bin")), port: None })
+        );
+        let cli = Cli::try_parse_from(["openmicro", "restore"]).unwrap();
+        assert_eq!(cli.command, Some(Commands::Restore { image: None, port: None }));
     }
 
     #[test]
@@ -255,7 +516,7 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Commands::Flash {
-                image: Some(std::path::PathBuf::from("/tmp/fw.bin")),
+                image: Some(PathBuf::from("/tmp/fw.bin")),
                 port: Some("/dev/ttyACM0".to_string()),
             })
         );
@@ -267,6 +528,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_agent_name() {
+        assert!(Cli::try_parse_from(["openmicro", "install-agent", "bogus"]).is_err());
+    }
+
+    #[test]
     fn service_action_maps_to_systemctl_verb() {
         assert_eq!(ServiceAction::Restart.as_arg(), "restart");
         assert_eq!(ServiceAction::Disable.as_arg(), "disable");
@@ -274,8 +540,34 @@ mod tests {
 
     #[test]
     fn agent_name_maps_to_adapter_dir() {
-        assert_eq!(AgentName::Claude.adapter_dir(), "claude-code");
-        assert_eq!(AgentName::T3.adapter_dir(), "t3-code");
+        assert_eq!(AgentKind::Claude.adapter_dir(), "claude-code");
+        assert_eq!(AgentKind::T3.adapter_dir(), "t3-code");
+    }
+
+    #[test]
+    fn format_agents_lists_every_adapter_with_its_status() {
+        let rows = agents::detect(&std::env::temp_dir().join("openmicro-nonexistent-home"));
+        let text = format_agents(&rows);
+        for kind in agents::ALL_AGENTS {
+            assert!(text.contains(kind.slug()), "{} missing from:\n{text}", kind.slug());
+        }
+        assert!(text.contains("unsupported by this agent"), "t3 row:\n{text}");
+    }
+
+    #[test]
+    fn format_firmware_status_reports_both_paths() {
+        let sources = crate::firmware::Sources {
+            toolchain: crate::firmware::Toolchain::Missing,
+            firmware_dir: None,
+            existing: None,
+            url: "https://example/fw.bin".into(),
+            have_curl: true,
+        };
+        let text = format_firmware_status(&sources);
+        assert!(text.contains("espup"), "{text}");
+        assert!(text.contains("https://example/fw.bin"), "{text}");
+        assert!(text.contains("can build: false"), "{text}");
+        assert!(text.contains("can download: true"), "{text}");
     }
 
     #[test]

@@ -14,22 +14,22 @@ The MCU is confirmed **ESP32-S3**, but no GPIO pin numbers are public (see `crea
 
 Fill the results into `firmware/src/pins.rs` (every unknown is a grouped `// TODO(pinout):` there — one file to edit).
 
-## Step 2 — Build the firmware
-Install the Xtensa Rust toolchain and build (details in `firmware/README.md`):
+## Steps 2 and 3 — just run the wizard
 ```
-espup install && source ~/export-esp.sh
-cd firmware && cargo build --release
+openmicro setup
 ```
-The embedded crate was written against current esp-hal / TrouBLE but **never compiled here** (no toolchain), so expect to fix a few API/version details on the first real build — the effect logic (`openmicro-effects`) is already host-tested, so the bugs will be in the hardware glue, not the animation math.
+The TUI now drives the rest end to end. It shows the custom-firmware warning (including that reverting is possible **only** from a backup you take first), watches USB and Bluetooth with a spinner until it finds the device, tells you exactly what to do next based on what it found — swap to a USB cable if it is only on Bluetooth, hold the power/boot button while replugging if it is cabled but running — and moves on by itself the moment the device shows up in bootloader mode.
 
-## Step 3 — Flash it (super easy from here)
-Put the device in bootloader mode again (boot button + replug), then either:
-```
-openmicro flash              # auto-detects the built image + device
-```
-or open the TUI (`openmicro`), press **`f`**, and follow the checklist (it tells you exactly what's missing until all three items are green, then flashes).
+Its firmware menu then does the remaining work, greying out anything it cannot do yet and saying why:
 
-After flashing, reset the device. Set `transport = "ble"` in `~/.config/openmicro/config.toml`, start the daemon (`systemctl --user enable --now openmicrod`), and your agent keys should light up with live state. Install per-agent hooks with `openmicro install-agent claude` (and `codex`/`grok`/`t3`).
+- **Back up the stock firmware** — do this first. (`openmicro backup` from the CLI.) It dumps all 4 MiB to `~/.local/share/openmicro/stock-firmware.bin` and is the only route back (`openmicro restore`).
+- **Build firmware from source** — needs the Xtensa toolchain (`cargo install espup && espup install`; details in `firmware/README.md`). Equivalent to `openmicro firmware build`. The embedded crate was written against current esp-hal / TrouBLE but **never compiled here** (no toolchain), so expect to fix a few API/version details on the first real build — the effect logic (`openmicro-effects`) is already host-tested, so the bugs will be in the hardware glue, not the animation math.
+- **Download prebuilt firmware** — `openmicro firmware download`, fetching the latest release asset (override with `$OPENMICRO_FIRMWARE_URL`). No release exists yet, so this fails cleanly until you cut one.
+- **Flash the device** — picks the right tool for the image: `espflash` for a from-source ELF, `esptool` for a merged release `.bin`.
+
+Finally it asks which coding agents to wire up, detecting what is installed on this machine and merging the hooks into each agent's own config (backing the previous file up first). `openmicro agents` and `openmicro install-agent --all` do the same from the CLI.
+
+After flashing, reset the device, set `transport = "ble"` in `~/.config/openmicro/config.toml`, and start the daemon (`systemctl --user enable --now openmicrod`). Your agent keys should then light up with live state.
 
 ## Known follow-ups (v1.2, not blocking)
 - BLE auto-reconnect is wired but minimal (bounded 2s attempt, 5s cooldown) — a proper background supervisor is nicer.

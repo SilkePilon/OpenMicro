@@ -6,9 +6,17 @@ edition.workspace = true
 [dependencies]
 openmicro-proto = { path = "../openmicro-proto", features = ["std"] }
 serde = { workspace = true, features = ["std"] }
-serde_json.workspace = true
+# `preserve_order` keeps the user's own key order when OpenMicro hooks are
+# merged into an agent's settings.json — without it serde_json would silently
+# alphabetise every key in a config file we do not own.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 clap.workspace = true
+# Used by the setup wizard's device probe, to tell "already running OpenMicro
+# firmware" apart from "stock firmware" over BLE before any cable is attached.
+bluer.workspace = true
+futures.workspace = true
+uuid.workspace = true

@@ -26,8 +26,16 @@ pub const NORMAL_VID_PID: (u16, u16) = (0x303a, 0x8298);
 pub const DEFAULT_IMAGE_REL: &str =
     "firmware/target/xtensa-esp32s3-none-elf/release/openmicro-fw";
 
-/// esptool chip argument for this board.
+/// esptool/espflash chip argument for this board.
 pub const CHIP: &str = "esp32s3";
+
+/// Where a full stock-firmware backup is written by [`backup`] and read back by
+/// [`restore`]. Keeping the original image is what makes going back to the
+/// stock firmware possible at all.
+pub const BACKUP_REL: &str = ".local/share/openmicro/stock-firmware.bin";
+
+/// Flash size dumped by [`backup`]: 4 MiB, the Micro 2's documented size.
+pub const FLASH_SIZE: &str = "0x400000";
 
 /// What (if anything) OpenMicro sees on the USB bus for the Micro 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,15 +73,24 @@ pub fn resolve_image(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
     for base in candidate_roots() {
         let candidate = base.join(DEFAULT_IMAGE_REL);
-        if candidate.exists() {
+        if candidate.is_file() {
             return Ok(candidate);
         }
     }
 
+    // A firmware image downloaded by `openmicro firmware download` (or the TUI
+    // setup wizard) is equally flashable, and is the only source available when
+    // running from an installed binary rather than a source checkout.
+    let cached = crate::firmware::cache_image();
+    if cached.is_file() {
+        return Ok(cached);
+    }
+
     Err(format!(
-        "no firmware image found (looked for {DEFAULT_IMAGE_REL}). \
-         Build it first: cd firmware && cargo build --release — see firmware/README.md \
-         for the Xtensa toolchain setup."
+        "no firmware image found (looked for {DEFAULT_IMAGE_REL} and {}). \
+         Get one first: `openmicro firmware build` (needs the Xtensa toolchain — see \
+         firmware/README.md) or `openmicro firmware download`.",
+        cached.display()
     ))
 }
 
@@ -149,11 +166,11 @@ pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String>
     args
 }
 
-/// Locate an `esptool` / `esptool.py` executable: honor `$PATH`, then fall
-/// back to `~/.local/bin` (where `pip install --user` / `uv tool` put it).
-pub fn esptool_path() -> Option<PathBuf> {
-    let names = ["esptool", "esptool.py"];
-
+/// Locate the first of `names` that is an executable: honor `$PATH`, then fall
+/// back to `~/.local/bin` and `~/.cargo/bin` (where `pip install --user`,
+/// `uv tool install` and `cargo install` put things without always being on the
+/// PATH of a non-login shell).
+pub fn which(names: &[&str]) -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
             for name in names {
@@ -166,11 +183,13 @@ pub fn esptool_path() -> Option<PathBuf> {
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        let local_bin = PathBuf::from(home).join(".local/bin");
-        for name in names {
-            let candidate = local_bin.join(name);
-            if is_executable(&candidate) {
-                return Some(candidate);
+        let home = PathBuf::from(home);
+        for extra in [".local/bin", ".cargo/bin"] {
+            for name in names {
+                let candidate = home.join(extra).join(name);
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -178,14 +197,221 @@ pub fn esptool_path() -> Option<PathBuf> {
     None
 }
 
+/// Locate an `esptool` / `esptool.py` executable.
+pub fn esptool_path() -> Option<PathBuf> {
+    which(&["esptool", "esptool.py"])
+}
+
+/// Locate `espflash`, the Rust ESP flashing tool (`cargo install espflash`).
+pub fn espflash_path() -> Option<PathBuf> {
+    which(&["espflash"])
+}
+
 /// True if `path` is a regular file the current user can execute.
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
         Err(_) => false,
     }
 }
+
+/// True if `path` starts with the ELF magic (`\x7fELF`).
+///
+/// This is what distinguishes the two kinds of image we can be handed: the
+/// `firmware/` build output is an **ELF**, while a downloaded release asset is a
+/// **merged flash image**. They need different tools, so guessing from the file
+/// extension (the build output has none) is not good enough.
+pub fn is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    matches!(f.read_exact(&mut magic), Ok(())) && magic == *b"\x7fELF"
+}
+
+/// The tool that will perform the write, chosen from the image's format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flasher {
+    /// `espflash`: takes the firmware **ELF** directly and derives the
+    /// bootloader, partition table and app offsets itself.
+    Espflash(PathBuf),
+    /// `esptool`: writes a **merged binary** (bootloader + partition table +
+    /// app already combined) at offset `0x0`.
+    Esptool(PathBuf),
+}
+
+impl Flasher {
+    /// Path of the executable to run.
+    pub fn program(&self) -> &Path {
+        match self {
+            Flasher::Espflash(p) | Flasher::Esptool(p) => p,
+        }
+    }
+
+    /// Argument vector for writing `image` to the device.
+    pub fn args(&self, chip: &str, port: Option<&str>, image: &Path) -> Vec<String> {
+        match self {
+            Flasher::Espflash(_) => espflash_args(chip, port, image),
+            Flasher::Esptool(_) => esptool_args(chip, port, image),
+        }
+    }
+}
+
+/// Pick the flashing tool for `image`, or explain what to install.
+///
+/// An ELF requires `espflash` — handing a bare ELF to `esptool write_flash`
+/// would write a file the chip cannot boot, so we refuse rather than produce a
+/// bricked device. A merged `.bin` works with either tool; `esptool` is
+/// preferred there because that is the documented layout.
+pub fn pick_flasher(image: &Path) -> Result<Flasher, String> {
+    if is_elf(image) {
+        return espflash_path().map(Flasher::Espflash).ok_or_else(|| {
+            "the firmware image is an ELF (a from-source build), which needs `espflash` to \
+             derive the bootloader and partition table. Install it: cargo install espflash."
+                .to_string()
+        });
+    }
+    if let Some(p) = esptool_path() {
+        return Ok(Flasher::Esptool(p));
+    }
+    if let Some(p) = espflash_path() {
+        return Ok(Flasher::Espflash(p));
+    }
+    Err("no flashing tool found — install one: `pip install esptool` or \
+         `cargo install espflash`."
+        .to_string())
+}
+
+/// Build the `espflash` argument vector to flash an ELF image.
+pub fn espflash_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String> {
+    let mut args = vec!["flash".to_string(), "--chip".to_string(), chip.to_string()];
+    if let Some(p) = port {
+        args.push("--port".to_string());
+        args.push(p.to_string());
+    }
+    // Do not drop into the serial monitor: the TUI/CLI owns the terminal and a
+    // monitor would never return.
+    args.push("--non-interactive".to_string());
+    args.push(image.display().to_string());
+    args
+}
+
+/// Build the `esptool` argument vector to read the whole flash into `dest` —
+/// the stock-firmware backup that makes a later [`restore`] possible.
+pub fn backup_args(chip: &str, port: Option<&str>, dest: &Path) -> Vec<String> {
+    let mut args = vec!["--chip".to_string(), chip.to_string()];
+    if let Some(p) = port {
+        args.push("--port".to_string());
+        args.push(p.to_string());
+    }
+    args.push("read_flash".to_string());
+    args.push("0x0".to_string());
+    args.push(FLASH_SIZE.to_string());
+    args.push(dest.display().to_string());
+    args
+}
+
+/// Default path of the stock-firmware backup.
+pub fn backup_path() -> PathBuf {
+    crate::agents::home().join(BACKUP_REL)
+}
+
+/// Dump the device's entire flash to `dest` (default [`backup_path`]) so the
+/// original firmware can be put back later.
+///
+/// Requires `esptool` and a device in bootloader mode, exactly like flashing.
+/// Returns the captured output lines.
+pub fn backup(dest: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
+    let esptool = esptool_path().ok_or_else(|| {
+        "reading the stock firmware needs esptool. Install it: pip install esptool.".to_string()
+    })?;
+    require_bootloader()?;
+
+    let dest = dest.map(|p| p.to_path_buf()).unwrap_or_else(backup_path);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+
+    let args = backup_args(CHIP, port, &dest);
+    let output = Command::new(&esptool)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+    let mut lines = combine_output(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        lines.push(format!("esptool exited with {}.", exit_desc(output.status.code())));
+        return Err(lines.join("\n"));
+    }
+    lines.push(format!("stock firmware saved to {}", dest.display()));
+    Ok((dest, lines))
+}
+
+/// Write a previously saved stock-firmware backup back to the device.
+///
+/// This is the "undo" for installing custom firmware. It is *not* a supported
+/// use of the hardware by its vendor — it only works because [`backup`] kept a
+/// byte-for-byte copy of the original flash — so it refuses outright when no
+/// backup exists rather than pretending.
+pub fn restore(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, String> {
+    let path = image.map(|p| p.to_path_buf()).unwrap_or_else(backup_path);
+    if !path.is_file() {
+        return Err(format!(
+            "no stock-firmware backup at {} — a restore is only possible from a backup taken \
+             BEFORE flashing custom firmware (`openmicro backup`).",
+            path.display()
+        ));
+    }
+    let esptool = esptool_path().ok_or_else(|| {
+        "restoring needs esptool. Install it: pip install esptool.".to_string()
+    })?;
+    require_bootloader()?;
+
+    let args = esptool_args(CHIP, port, &path);
+    let output = Command::new(&esptool)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+    let mut lines = combine_output(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        lines.push(format!("esptool exited with {}.", exit_desc(output.status.code())));
+        return Err(lines.join("\n"));
+    }
+    lines.push(format!("restored {} — reset the device.", path.display()));
+    Ok(lines)
+}
+
+/// Merge a child process's stdout and stderr into display lines.
+fn combine_output(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(stderr).lines())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Error out unless a Micro 2 is currently in ROM bootloader mode.
+fn require_bootloader() -> Result<(), String> {
+    match classify_usb(&detect_usb()) {
+        DeviceState::Bootloader => Ok(()),
+        DeviceState::NormalDevice => Err(BOOTLOADER_HINT_CONNECTED.to_string()),
+        DeviceState::Absent => Err(BOOTLOADER_HINT_ABSENT.to_string()),
+    }
+}
+
+/// Guidance shown when the device is plugged in but running its firmware.
+pub const BOOTLOADER_HINT_CONNECTED: &str =
+    "the Micro 2 is connected but running normally, not in bootloader mode. It uses native \
+     USB-Serial-JTAG with no auto-reset, so you must enter download mode by hand: hold the \
+     boot/power button while plugging in USB, then release once it re-enumerates.";
+
+/// Guidance shown when no Micro 2 is on the bus at all.
+pub const BOOTLOADER_HINT_ABSENT: &str =
+    "no Micro 2 detected on USB. Plug it in with a data-capable USB cable, and to enter \
+     bootloader mode hold the boot/power button while connecting (native USB-Serial-JTAG has \
+     no auto-reset).";
 
 /// A single guided-checklist item: whether the prerequisite is satisfied and
 /// the line to show the user (a hint when unsatisfied).
@@ -198,24 +424,21 @@ pub type ChecklistItem = (bool, String);
 /// three are satisfied, i.e. a real flash could be attempted.
 pub fn checklist(
     image: &Result<PathBuf, String>,
-    esptool: Option<&Path>,
+    flasher: &Result<Flasher, String>,
     device: DeviceState,
 ) -> Vec<ChecklistItem> {
     let image_row = match image {
         Ok(p) => (true, format!("firmware image: {}", p.display())),
         Err(_) => (
             false,
-            "firmware image: not built — cd firmware && cargo build --release (see firmware/README.md)"
+            "firmware image: none yet — `openmicro firmware build` or `openmicro firmware download`"
                 .to_string(),
         ),
     };
 
-    let esptool_row = match esptool {
-        Some(p) => (true, format!("esptool: {}", p.display())),
-        None => (
-            false,
-            "esptool: not found — install it (pip install esptool)".to_string(),
-        ),
+    let flasher_row = match flasher {
+        Ok(f) => (true, format!("flash tool: {}", f.program().display())),
+        Err(e) => (false, format!("flash tool: {e}")),
     };
 
     let device_row = match device {
@@ -234,7 +457,7 @@ pub fn checklist(
         ),
     };
 
-    vec![image_row, esptool_row, device_row]
+    vec![image_row, flasher_row, device_row]
 }
 
 /// True iff every checklist row is satisfied (a real flash may be attempted).
@@ -249,19 +472,19 @@ pub fn ready(items: &[ChecklistItem]) -> bool {
 /// esptool, device not in bootloader mode) and NEVER fabricates success. The
 /// end-to-end write is only ever exercised by the user on real hardware.
 pub fn flash(image: Option<&Path>, port: Option<&str>) -> Result<(), String> {
-    let (esptool, args) = prepare(image, port)?;
-    println!("flashing: {} {}", esptool.display(), args.join(" "));
+    let (tool, args) = prepare(image, port)?;
+    println!("flashing: {} {}", tool.display(), args.join(" "));
 
-    let status = Command::new(&esptool)
+    let status = Command::new(&tool)
         .args(&args)
         .status()
-        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+        .map_err(|e| format!("failed to launch {}: {e}", tool.display()))?;
 
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "esptool exited with {} — see its output above.",
+            "the flash tool exited with {} — see its output above.",
             exit_desc(status.code())
         ))
     }
@@ -271,24 +494,20 @@ pub fn flash(image: Option<&Path>, port: Option<&str>) -> Result<(), String> {
 /// as lines (for the TUI's scrollable output area) instead of streaming to the
 /// terminal. Same prerequisite checks; same honesty contract.
 pub fn flash_capture(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, String> {
-    let (esptool, args) = prepare(image, port)?;
+    let (tool, args) = prepare(image, port)?;
 
-    let output = Command::new(&esptool)
+    let output = Command::new(&tool)
         .args(&args)
         .output()
-        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+        .map_err(|e| format!("failed to launch {}: {e}", tool.display()))?;
 
-    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .chain(String::from_utf8_lossy(&output.stderr).lines())
-        .map(|l| l.to_string())
-        .collect();
+    let mut lines = combine_output(&output.stdout, &output.stderr);
 
     if output.status.success() {
         Ok(lines)
     } else {
         lines.push(format!(
-            "esptool exited with {}.",
+            "the flash tool exited with {}.",
             exit_desc(output.status.code())
         ));
         Err(lines.join("\n"))
@@ -301,38 +520,13 @@ pub fn flash_capture(image: Option<&Path>, port: Option<&str>) -> Result<Vec<Str
 /// [`flash_capture`] so both stay honest and consistent.
 fn prepare(image: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
     let image = resolve_image(image)?;
-
-    let esptool = esptool_path().ok_or_else(|| {
-        "esptool not found on PATH or in ~/.local/bin. Install it first: \
-         pip install esptool (or `uv tool install esptool`)."
-            .to_string()
-    })?;
-
-    match classify_usb(&detect_usb()) {
-        DeviceState::Bootloader => {}
-        DeviceState::NormalDevice => {
-            return Err(
-                "the Micro 2 is connected but running normally, not in bootloader mode. \
-                 It uses native USB-Serial-JTAG with no auto-reset, so you must enter \
-                 download mode by hand: hold the boot button while plugging in USB, then \
-                 release once it re-enumerates, and run `openmicro flash` again."
-                    .to_string(),
-            );
-        }
-        DeviceState::Absent => {
-            return Err(
-                "no Micro 2 detected on USB. Plug it in, and to enter bootloader mode hold \
-                 the boot button while connecting (native USB-Serial-JTAG has no auto-reset)."
-                    .to_string(),
-            );
-        }
-    }
-
-    Ok((esptool, esptool_args(CHIP, port, &image)))
+    let flasher = pick_flasher(&image)?;
+    require_bootloader()?;
+    Ok((flasher.program().to_path_buf(), flasher.args(CHIP, port, &image)))
 }
 
 /// Human-readable description of a process exit code (or a signal if none).
-fn exit_desc(code: Option<i32>) -> String {
+pub fn exit_desc(code: Option<i32>) -> String {
     code.map(|c| c.to_string())
         .unwrap_or_else(|| "a signal".to_string())
 }
@@ -378,7 +572,11 @@ mod tests {
         // No image is built in this environment, so the default lookup fails.
         let err = resolve_image(None).unwrap_err();
         assert!(err.contains("firmware/README.md"), "{err}");
-        assert!(err.contains("cargo build --release"), "{err}");
+        // Both ways to get an image are offered, and the download cache is
+        // named so it is obvious where a fetched image would have landed.
+        assert!(err.contains("openmicro firmware build"), "{err}");
+        assert!(err.contains("openmicro firmware download"), "{err}");
+        assert!(err.contains(crate::firmware::CACHE_REL), "{err}");
     }
 
     #[test]
@@ -435,14 +633,14 @@ mod tests {
     fn checklist_all_missing() {
         let items = checklist(
             &Err("no image".to_string()),
-            None,
+            &Err("no flash tool".to_string()),
             DeviceState::Absent,
         );
         assert_eq!(items.len(), 3);
         assert!(!items[0].0 && !items[1].0 && !items[2].0);
         assert!(!ready(&items));
-        assert!(items[0].1.contains("cargo build"));
-        assert!(items[1].1.contains("install"));
+        assert!(items[0].1.contains("firmware build") || items[0].1.contains("download"));
+        assert!(items[1].1.contains("no flash tool"));
         assert!(items[2].1.contains("not detected"));
     }
 
@@ -450,11 +648,11 @@ mod tests {
     fn checklist_normal_device_hint() {
         let items = checklist(
             &Ok(PathBuf::from("/tmp/fw.bin")),
-            Some(Path::new("/usr/bin/esptool")),
+            &Ok(Flasher::Esptool(PathBuf::from("/usr/bin/esptool"))),
             DeviceState::NormalDevice,
         );
         assert!(items[0].0, "image ok");
-        assert!(items[1].0, "esptool ok");
+        assert!(items[1].0, "flash tool ok");
         assert!(!items[2].0, "device not ready");
         assert!(items[2].1.contains("boot button"));
         assert!(!ready(&items));
@@ -464,7 +662,7 @@ mod tests {
     fn checklist_all_ready() {
         let items = checklist(
             &Ok(PathBuf::from("/tmp/fw.bin")),
-            Some(Path::new("/usr/bin/esptool")),
+            &Ok(Flasher::Esptool(PathBuf::from("/usr/bin/esptool"))),
             DeviceState::Bootloader,
         );
         assert!(ready(&items));
@@ -478,5 +676,92 @@ mod tests {
             esptool_path().is_some(),
             "expected to find esptool on PATH or in ~/.local/bin"
         );
+    }
+
+    #[test]
+    fn which_finds_a_ubiquitous_binary_and_misses_a_fake_one() {
+        assert!(which(&["sh"]).is_some(), "sh must be findable on PATH");
+        assert!(which(&["definitely-not-a-real-binary-xyz"]).is_none());
+    }
+
+    #[test]
+    fn is_elf_detects_a_real_elf_and_rejects_other_files() {
+        // The test binary itself is an ELF on Linux.
+        let me = std::env::current_exe().unwrap();
+        assert!(is_elf(&me), "the test executable should be an ELF");
+        let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("Cargo.toml");
+        assert!(!is_elf(&manifest), "a TOML file is not an ELF");
+        assert!(!is_elf(Path::new("/nope/missing")), "a missing file is not an ELF");
+    }
+
+    #[test]
+    fn espflash_args_flash_an_elf_without_a_monitor() {
+        let img = PathBuf::from("/tmp/openmicro-fw");
+        let args = espflash_args("esp32s3", Some("/dev/ttyACM0"), &img);
+        assert_eq!(args[0], "flash");
+        assert!(args.contains(&"--non-interactive".to_string()), "must not open a monitor");
+        assert!(args.contains(&"/dev/ttyACM0".to_string()));
+        assert_eq!(args.last().unwrap(), "/tmp/openmicro-fw");
+    }
+
+    #[test]
+    fn flasher_args_dispatch_on_tool() {
+        let img = PathBuf::from("/tmp/fw.bin");
+        let esptool = Flasher::Esptool(PathBuf::from("/usr/bin/esptool"));
+        assert_eq!(esptool.args("esp32s3", None, &img), esptool_args("esp32s3", None, &img));
+        assert_eq!(esptool.program(), Path::new("/usr/bin/esptool"));
+
+        let espflash = Flasher::Espflash(PathBuf::from("/usr/bin/espflash"));
+        assert_eq!(espflash.args("esp32s3", None, &img), espflash_args("esp32s3", None, &img));
+    }
+
+    #[test]
+    fn pick_flasher_refuses_an_elf_without_espflash() {
+        // An ELF handed to `esptool write_flash 0x0` would write something the
+        // chip cannot boot, so with no espflash installed we must refuse.
+        if espflash_path().is_some() {
+            return; // espflash present here: the refusal path is not reachable
+        }
+        let me = std::env::current_exe().unwrap();
+        let err = pick_flasher(&me).unwrap_err();
+        assert!(err.contains("espflash"), "{err}");
+    }
+
+    #[test]
+    fn pick_flasher_uses_esptool_for_a_merged_bin() {
+        let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("Cargo.toml"); // any non-ELF file
+        match pick_flasher(&manifest) {
+            Ok(Flasher::Esptool(_)) => {}
+            other => panic!("expected esptool for a non-ELF image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_args_read_the_whole_flash() {
+        let args = backup_args("esp32s3", None, Path::new("/tmp/stock.bin"));
+        assert_eq!(
+            args,
+            vec!["--chip", "esp32s3", "read_flash", "0x0", FLASH_SIZE, "/tmp/stock.bin"]
+        );
+    }
+
+    #[test]
+    fn backup_args_include_the_port_when_given() {
+        let args = backup_args("esp32s3", Some("/dev/ttyACM0"), Path::new("/tmp/s.bin"));
+        assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]));
+    }
+
+    #[test]
+    fn restore_without_a_backup_refuses() {
+        let err = restore(Some(Path::new("/definitely/not/here/stock.bin")), None).unwrap_err();
+        assert!(err.contains("no stock-firmware backup"), "{err}");
+        assert!(err.contains("BEFORE"), "must explain when a backup had to be taken: {err}");
+    }
+
+    #[test]
+    fn backup_path_is_under_the_users_data_dir() {
+        assert!(backup_path().ends_with(BACKUP_REL));
     }
 }
