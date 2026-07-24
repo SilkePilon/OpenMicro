@@ -1,6 +1,6 @@
 use openmicro_proto::LedFrame;
 
-pub trait DeviceLink {
+pub trait DeviceLink: Send {
     fn set_leds(&mut self, frame: &LedFrame);
     fn last_frame(&self) -> LedFrame;
 }
