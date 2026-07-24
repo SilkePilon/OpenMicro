@@ -89,8 +89,10 @@ impl BleDevice {
 
     /// Re-run discovery and re-resolve handles using capped exponential backoff.
     ///
-    /// Wired for P2 (input routing / resilience); kept off the hot render path.
-    #[allow(dead_code)]
+    /// Called from the `set_leds` failure path with a small `max_attempts`
+    /// (currently 1) so it can't stall the render path for the full
+    /// exponential-backoff cap; a fuller standalone supervisor (retrying in
+    /// the background, independent of any particular write) can come later.
     pub async fn reconnect(&mut self, max_attempts: u32) -> anyhow::Result<()> {
         for attempt in 0..max_attempts {
             match discover_and_resolve(&self.adapter).await {
@@ -259,6 +261,23 @@ impl DeviceLink for BleDevice {
         if let Err(e) = self.led.write_ext(&bytes, &req).await {
             eprintln!("ble: LED write failed, marking disconnected: {e}");
             self.connected = false;
+            // Best-effort, bounded reconnect: a single attempt (not the full
+            // exponential-backoff supervisor `reconnect` supports) so one
+            // failed write can't stall the render path for the full 30s
+            // backoff cap. On success, retry the write once; on failure, the
+            // frame stays cached in `self.last` and `connected` stays false —
+            // the next `set_leds` call will attempt this same recovery again.
+            //
+            // NOTE: this talks to real BlueZ/adapter state and cannot be
+            // exercised without hardware in CI. Validated on hardware only.
+            // It must never fabricate success: a failed retry here is
+            // reported exactly like an unrecovered failure today.
+            if self.reconnect(1).await.is_ok() {
+                if let Err(e) = self.led.write_ext(&bytes, &req).await {
+                    eprintln!("ble: LED write failed again after reconnect: {e}");
+                    self.connected = false;
+                }
+            }
         }
     }
 
