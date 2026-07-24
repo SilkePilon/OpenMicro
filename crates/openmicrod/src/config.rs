@@ -1,14 +1,24 @@
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Mock,
+    Ble,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub brightness: u8,
+    #[serde(default)]
+    pub transport: Transport,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { brightness: 200 }
+        Self { brightness: 200, transport: Transport::Mock }
     }
 }
 
@@ -49,5 +59,23 @@ mod tests {
     #[test]
     fn invalid_falls_back_to_default() {
         assert_eq!(Config::from_toml_str("brightness = \"nope\"").brightness, 200);
+    }
+
+    #[test]
+    fn transport_ble_parses() {
+        assert_eq!(Config::from_toml_str("transport = \"ble\"").transport, Transport::Ble);
+    }
+
+    #[test]
+    fn transport_defaults_to_mock() {
+        assert_eq!(Config::from_toml_str("").transport, Transport::Mock);
+        assert_eq!(Config::from_toml_str("brightness = 80").transport, Transport::Mock);
+    }
+
+    #[test]
+    fn invalid_transport_falls_back_to_default_config() {
+        let cfg = Config::from_toml_str("transport = \"laser\"");
+        assert_eq!(cfg.transport, Transport::Mock);
+        assert_eq!(cfg.brightness, 200);
     }
 }

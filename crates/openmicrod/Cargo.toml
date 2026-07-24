@@ -11,3 +11,6 @@ toml.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+bluer.workspace = true
+uuid.workspace = true
+futures.workspace = true

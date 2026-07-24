@@ -64,6 +64,16 @@ pub enum InputEvent {
     Joystick { dir: u8 },
 }
 
+impl InputEvent {
+    pub fn encode(&self) -> Result<alloc::vec::Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Battery {
     pub pct: u8,
@@ -85,5 +95,19 @@ mod tests {
         let bytes = frame.encode().unwrap();
         let back = LedFrame::decode(&bytes).unwrap();
         assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn input_event_roundtrips() {
+        for ev in [
+            InputEvent::Key { id: 3, pressed: true },
+            InputEvent::Key { id: 0, pressed: false },
+            InputEvent::Encoder { delta: -5 },
+            InputEvent::Joystick { dir: 2 },
+        ] {
+            let bytes = ev.encode().unwrap();
+            let back = InputEvent::decode(&bytes).unwrap();
+            assert_eq!(ev, back);
+        }
     }
 }
