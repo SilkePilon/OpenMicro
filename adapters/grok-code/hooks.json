@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --agent grok --state thinking" } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --agent grok --state working" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --agent grok --state awaiting_approval" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --agent grok --state idle" } ] }
+    ]
+  }
+}

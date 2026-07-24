@@ -1,16 +1,16 @@
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "openmicro-hook --agent claude --session \"$CLAUDE_SESSION_ID\" --state thinking" } ] }
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --state thinking" } ] }
     ],
     "PreToolUse": [
-      { "hooks": [ { "type": "command", "command": "openmicro-hook --agent claude --session \"$CLAUDE_SESSION_ID\" --state working" } ] }
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --state working" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "openmicro-hook --agent claude --session \"$CLAUDE_SESSION_ID\" --state awaiting_approval" } ] }
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --state awaiting_approval" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "openmicro-hook --agent claude --session \"$CLAUDE_SESSION_ID\" --state idle" } ] }
+      { "hooks": [ { "type": "command", "command": "openmicro-hook claude-hook --state idle" } ] }
     ]
   }
 }
