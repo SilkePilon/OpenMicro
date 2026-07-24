@@ -135,6 +135,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // `ingress` and `control` are the daemon's core IPC surfaces: neither
+    // returns in normal operation, so any end of one of them (clean exit,
+    // error, or panic) means the daemon is no longer useful and must exit
+    // non-zero so systemd's `Restart=on-failure` kicks in. `battery`,
+    // `input-routing`, and `sleeper` are best-effort: their end is logged but
+    // the daemon keeps running.
+    fn is_fatal_task(name: &str) -> bool {
+        matches!(name, "ingress" | "control")
+    }
+
     println!("openmicrod running (transport: {:?}). Ctrl-C to stop.", cfg.transport);
     loop {
         tokio::select! {
@@ -142,27 +152,41 @@ async fn main() -> anyhow::Result<()> {
                 match res {
                     Some(Ok((name, Ok(())))) => {
                         eprintln!("openmicrod: task '{name}' exited");
+                        if is_fatal_task(name) {
+                            eprintln!("openmicrod: '{name}' is a core task; shutting down.");
+                            anyhow::bail!("core task '{name}' exited unexpectedly");
+                        }
                     }
                     Some(Ok((name, Err(e)))) => {
                         eprintln!("openmicrod: task '{name}' exited with error: {e}");
+                        if is_fatal_task(name) {
+                            eprintln!("openmicrod: '{name}' is a core task; shutting down.");
+                            return Err(e.context(format!("core task '{name}' failed")));
+                        }
                     }
                     Some(Err(join_err)) => {
                         eprintln!("openmicrod: a background task panicked: {join_err}");
+                        // We don't have the task name for a panic (the closure
+                        // never returned its tag), so treat any panic as
+                        // fatal: a panicked ingress/control task must still
+                        // trigger a restart, and panics are unexpected enough
+                        // that "restart to be safe" is the right default even
+                        // for the best-effort tasks.
+                        return Err(anyhow::Error::from(join_err).context("background task panicked"));
                     }
                     None => {
                         // Every task has now exited (ingress/control never return
                         // in normal operation, so this means every task hit an
                         // error/panic already logged above): nothing left to do.
                         eprintln!("openmicrod: all background tasks have exited; shutting down.");
-                        break;
+                        anyhow::bail!("all background tasks exited");
                     }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("openmicrod: received Ctrl-C, shutting down.");
-                break;
+                return Ok(());
             }
         }
     }
-    Ok(())
 }
