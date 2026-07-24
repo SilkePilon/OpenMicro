@@ -128,12 +128,13 @@ esp-hal/Embassy/TrouBLE application: BLE GATT server, WS2812 render loop, key
 and encoder and joystick scanning.
 
 Two things are still outstanding. Every physical pin is a `// TODO(pinout):`
-placeholder, because the Creator Micro 2's GPIO assignments aren't public — see
-[the research notes](docs/hardware/creator-micro-2-pinout-research.md) and
-[what&#39;s left](docs/hardware/NEXT-STEPS.md). And it has never been compiled, so
-expect the first build to need fixes in the hardware glue. The LED effect code
-([`crates/openmicro-effects`](crates/openmicro-effects)) is shared with the host
-and is already tested, so that part isn't where the bugs will be.
+placeholder, because the Creator Micro 2's GPIO assignments aren't public (see
+[the research notes](docs/hardware/creator-micro-2-pinout-research.md)). And it
+doesn't build yet: `esp-hal-embassy` and `esp-hal` have drifted apart, and the
+pinned versions turn out not to be mutually compatible.
+[What's left](docs/hardware/NEXT-STEPS.md) has the errors and where to start.
+The LED effect code ([`crates/openmicro-effects`](crates/openmicro-effects)) is
+shared with the host and already tested, so that part isn't where the bugs are.
 
 Until then the daemon runs against a mock device. Set `transport = "ble"` in the
 config once you have real firmware on the board.
