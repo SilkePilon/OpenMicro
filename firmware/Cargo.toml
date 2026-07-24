@@ -60,7 +60,9 @@ trouble-host = { version = "0.6.0", default-features = false }
 bt-hci = "0.8"
 smart-leds-trait = "0.3.2"
 esp-alloc = "0.10.0"
-esp-println = { version = "0.16", default-features = false, features = ["esp32s3", "log-04"] }
+# `jtag-serial`: esp-println requires exactly one output backend, and the Micro 2
+# exposes no UART header — its only host link is the native USB-Serial-JTAG.
+esp-println = { version = "0.16", default-features = false, features = ["esp32s3", "log-04", "jtag-serial"] }
 esp-backtrace = { version = "0.18", default-features = false, features = ["esp32s3", "panic-handler", "println"] }
 static_cell = "2.1.0"
 heapless = "0.9"
