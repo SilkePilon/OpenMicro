@@ -166,15 +166,23 @@ fn run_tui(start: Screen) -> anyhow::Result<()> {
 /// the spinner has to keep turning while the user holds a button down.
 fn spawn_job(job: Job, tx: Sender<JobMsg>) {
     std::thread::spawn(move || {
-        if matches!(job, Job::Probe) {
-            let _ = tx.send(JobMsg::Probed(probe::probe()));
-            return;
+        // These two answer with data rather than log lines.
+        match &job {
+            Job::Probe => {
+                let _ = tx.send(JobMsg::Probed(probe::probe()));
+                return;
+            }
+            Job::FetchReleases => {
+                let _ = tx.send(JobMsg::Releases(firmware::fetch_releases()));
+                return;
+            }
+            _ => {}
         }
         let result = match &job {
-            Job::Probe => unreachable!("handled above"),
+            Job::Probe | Job::FetchReleases => unreachable!("handled above"),
             Job::Backup => flash::backup(None, None).map(|(_, lines)| lines),
             Job::Build => firmware::build().map(|(_, lines)| lines),
-            Job::Download => firmware::download().map(|(_, lines)| lines),
+            Job::DownloadRelease(r) => firmware::download_release(r).map(|(_, lines)| lines),
             Job::Flash => flash::flash_capture(None, None),
             Job::InstallAgents(list) => install_agents(list),
         };
@@ -227,6 +235,10 @@ fn run_wizard(terminal: &mut Term) -> anyhow::Result<Screen> {
                 JobMsg::Probed(p) => {
                     probing = false;
                     w.on_probe(p);
+                }
+                JobMsg::Releases(result) => {
+                    w.busy = None;
+                    w.on_releases(result);
                 }
                 JobMsg::Finished { job, result } => {
                     w.busy = None;
@@ -317,6 +329,23 @@ fn wizard_key(
             KeyCode::Enter => start_selected_action(w, tx),
             _ => {}
         },
+        Stage::Releases => match code {
+            KeyCode::Up => w.release_move(-1),
+            KeyCode::Down => w.release_move(1),
+            KeyCode::Esc => w.stage = Stage::Firmware,
+            KeyCode::Enter => {
+                let release = w.selected_release().cloned()?;
+                if let Some(why) = release.blocker() {
+                    w.push_log([format!("cannot install {}: {why}", release.tag)]);
+                    return None;
+                }
+                let job = Job::DownloadRelease(release);
+                w.push_log([format!("starting: {}", job.label())]);
+                w.busy = Some(job.clone());
+                spawn_job(job, tx.clone());
+            }
+            _ => {}
+        },
         Stage::Flashed => {
             if code == KeyCode::Enter {
                 w.stage = Stage::Agents;
@@ -366,7 +395,8 @@ fn start_selected_action(w: &mut Wizard, tx: &Sender<JobMsg>) {
     let job = match item.action {
         Action::BackupStock => Job::Backup,
         Action::Build => Job::Build,
-        Action::Download => Job::Download,
+        // "Download" first fetches the version list; the picker comes next.
+        Action::Download => Job::FetchReleases,
         Action::Flash => Job::Flash,
     };
     w.push_log([format!("starting: {}", job.label())]);
@@ -379,6 +409,8 @@ fn on_job_success(w: &mut Wizard, job: &Job) {
     match job {
         // A flash is the one job that changes what is running on the device.
         Job::Flash => w.stage = Stage::Flashed,
+        // Image in hand: back to the menu, where "Flash" is now available.
+        Job::DownloadRelease(_) => w.stage = Stage::Firmware,
         Job::InstallAgents(_) => {
             w.stage = Stage::Done;
             onboarding::mark_setup_done();
@@ -507,22 +539,22 @@ mod tests {
     }
 
     #[test]
-    fn install_agents_reports_a_failing_agent_but_keeps_going() {
-        // T3 has no hook mechanism and always fails; Claude installs into a
-        // scratch HOME. The overall result must be Err, with BOTH outcomes
-        // listed, so the UI can never show a clean success for a partial run.
+    fn a_failing_agent_is_reported_and_the_others_still_install() {
+        // Codex's config already points `notify` somewhere else, so it must be
+        // refused; Claude in the same scratch HOME must still be installed. The
+        // UI can then never show a clean success for a partial run.
         let tmp = std::env::temp_dir()
             .join(format!("openmicro-install-agents-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(tmp.join(".codex")).unwrap();
+        std::fs::write(tmp.join(".codex/config.toml"), "notify = [\"someone-else\"]\n").unwrap();
 
-        // `agents::install` takes the home explicitly; drive it directly so this
-        // test never mutates the process environment (other tests run in
-        // parallel threads and would see it).
-        let ok = agents::install(AgentKind::Claude, &tmp).unwrap();
-        assert!(ok.changed);
-        let err = agents::install(AgentKind::T3, &tmp).unwrap_err();
-        assert!(err.contains("no hook API"), "{err}");
+        // `agents::install` takes the home explicitly; drive it directly rather
+        // than through `install_agents`, so this test never mutates the process
+        // environment (other tests run in parallel threads and would see it).
+        assert!(agents::install(AgentKind::Claude, &tmp).unwrap().changed);
+        let err = agents::install(AgentKind::Codex, &tmp).unwrap_err();
+        assert!(err.contains("different `notify`"), "{err}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -78,7 +78,6 @@ these and call `push` directly.
 | [Claude Code](./claude-code/install.md) | Hooks, JSON on stdin (`claude-hook`)   | Confirmed                          |
 | [Codex CLI](./codex/install.md)         | `notify` program (`codex-notify`)      | Confirmed                          |
 | [Grok Code](./grok-code/install.md)     | Claude-compatible hooks, JSON on stdin | Confirmed mechanism; see caveats   |
-| [T3 Code](./t3-code/install.md)         | Delegates to the underlying agent      | Mechanism unconfirmed — see notes  |
 
 ## Verifying any adapter
 

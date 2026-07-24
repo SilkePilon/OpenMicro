@@ -82,12 +82,20 @@ pub enum Commands {
     },
 }
 
-#[derive(Subcommand, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum FirmwareAction {
     /// Compile `firmware/` with the Xtensa toolchain.
     Build,
+    /// List the published firmware versions.
+    List,
     /// Fetch a prebuilt release image.
-    Download,
+    Download {
+        /// Release tag to install (e.g. v1.2.0). Defaults to the newest
+        /// release that has a firmware asset, preferring stable over
+        /// pre-release.
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Report which firmware sources are available and which image would be used.
     Status,
 }
@@ -191,8 +199,20 @@ fn run_firmware(action: FirmwareAction) -> anyhow::Result<()> {
             print!("{}", format_firmware_status(&crate::firmware::Sources::detect()));
             return Ok(());
         }
+        FirmwareAction::List => {
+            match crate::firmware::fetch_releases() {
+                Ok(releases) => {
+                    print!("{}", format_releases(&releases));
+                    return Ok(());
+                }
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
         FirmwareAction::Build => crate::firmware::build(),
-        FirmwareAction::Download => crate::firmware::download(),
+        FirmwareAction::Download { version } => crate::firmware::download(version.as_deref()),
     };
     match result {
         Ok((path, lines)) => {
@@ -209,6 +229,30 @@ fn run_firmware(action: FirmwareAction) -> anyhow::Result<()> {
     }
 }
 
+/// Render the published-release list. Pure, so the wording is testable.
+///
+/// The version `firmware download` would pick without `--version` is marked, so
+/// the default is visible rather than implied.
+pub fn format_releases(releases: &[crate::firmware::Release]) -> String {
+    if releases.is_empty() {
+        return "no firmware releases published yet — build from source instead.\n".to_string();
+    }
+    let default = crate::firmware::pick_release(releases, None).ok().map(|r| r.tag.clone());
+    let mut out = String::new();
+    for r in releases {
+        let marker = if Some(&r.tag) == default.as_ref() { "*" } else { " " };
+        let note = match r.blocker() {
+            Some(why) => format!("  [{why}]"),
+            None => format!("  {} KiB", r.asset_size / 1024),
+        };
+        out.push_str(&format!("{marker} {}{note}\n", r.label()));
+    }
+    if default.is_some() {
+        out.push_str("\n* installed by `openmicro firmware download` (override with --version)\n");
+    }
+    out
+}
+
 /// Render the firmware-source summary. Pure, so the wording is testable.
 pub fn format_firmware_status(sources: &crate::firmware::Sources) -> String {
     let mut out = String::new();
@@ -221,14 +265,23 @@ pub fn format_firmware_status(sources: &crate::firmware::Sources) -> String {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found (run from a checkout to build)".into())
     ));
-    out.push_str(&format!("download url: {}\n", sources.url));
     out.push_str(&format!(
-        "image:        {}\n",
+        "releases:     {}{}\n",
+        sources.url,
+        if sources.forced { "  (forced by OPENMICRO_FIRMWARE_URL)" } else { "" }
+    ));
+    out.push_str(&format!(
+        "image:        {}{}\n",
         sources
             .existing
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "none yet — `openmicro firmware build|download`".into())
+            .unwrap_or_else(|| "none yet — `openmicro firmware build|download`".into()),
+        sources
+            .cached_version
+            .as_ref()
+            .map(|v| format!("  (version {v})"))
+            .unwrap_or_default()
     ));
     out.push_str(&format!(
         "can build: {}   can download: {}\n",
@@ -292,7 +345,6 @@ pub fn format_agents(rows: &[agents::AgentRow]) -> String {
             HookStatus::Installed => "hooks: installed".to_string(),
             HookStatus::Missing => "hooks: missing".to_string(),
             HookStatus::Blocked(why) => format!("hooks: blocked — {why}"),
-            HookStatus::Unsupported(_) => "hooks: unsupported by this agent".to_string(),
         };
         out.push_str(&format!("{:<8} {:<10} {}\n", row.kind.slug(), presence, status));
     }
@@ -481,13 +533,59 @@ mod tests {
     fn parses_firmware_actions() {
         for (arg, expected) in [
             ("build", FirmwareAction::Build),
-            ("download", FirmwareAction::Download),
+            ("list", FirmwareAction::List),
+            ("download", FirmwareAction::Download { version: None }),
             ("status", FirmwareAction::Status),
         ] {
             let cli = Cli::try_parse_from(["openmicro", "firmware", arg]).unwrap();
             assert_eq!(cli.command, Some(Commands::Firmware { action: expected }));
         }
         assert!(Cli::try_parse_from(["openmicro", "firmware", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_firmware_download_with_a_version() {
+        let cli =
+            Cli::try_parse_from(["openmicro", "firmware", "download", "--version", "v1.2.0"])
+                .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Firmware {
+                action: FirmwareAction::Download { version: Some("v1.2.0".to_string()) }
+            })
+        );
+    }
+
+    #[test]
+    fn format_releases_marks_the_default_and_flags_assetless_versions() {
+        let releases = crate::firmware::parse_releases(
+            r#"[{"tag_name":"v2.0.0-rc1","prerelease":true,"draft":false,
+                 "published_at":"2026-07-22T00:00:00Z",
+                 "assets":[{"name":"openmicro-fw.bin","size":204800,
+                            "browser_download_url":"https://x/rc"}]},
+                {"tag_name":"v1.0.0","prerelease":false,"draft":false,
+                 "published_at":"2026-07-01T00:00:00Z",
+                 "assets":[{"name":"openmicro-fw.bin","size":204800,
+                            "browser_download_url":"https://x/stable"}]},
+                {"tag_name":"v0.9.0","prerelease":false,"draft":false,
+                 "published_at":"2026-06-01T00:00:00Z","assets":[]}]"#,
+        )
+        .unwrap();
+
+        let text = format_releases(&releases);
+        assert!(text.contains("v2.0.0-rc1") && text.contains("(pre-release)"), "{text}");
+        // The newest *stable* build with an asset is the default.
+        assert!(
+            text.lines().any(|l| l.starts_with("* v1.0.0")),
+            "default not marked:\n{text}"
+        );
+        assert!(text.contains("no firmware asset"), "assetless release not flagged:\n{text}");
+        assert!(text.contains("--version"), "{text}");
+    }
+
+    #[test]
+    fn format_releases_of_nothing_points_at_building() {
+        assert!(format_releases(&[]).contains("build from source"));
     }
 
     #[test]
@@ -541,7 +639,7 @@ mod tests {
     #[test]
     fn agent_name_maps_to_adapter_dir() {
         assert_eq!(AgentKind::Claude.adapter_dir(), "claude-code");
-        assert_eq!(AgentKind::T3.adapter_dir(), "t3-code");
+        assert_eq!(AgentKind::Grok.adapter_dir(), "grok-code");
     }
 
     #[test]
@@ -551,7 +649,7 @@ mod tests {
         for kind in agents::ALL_AGENTS {
             assert!(text.contains(kind.slug()), "{} missing from:\n{text}", kind.slug());
         }
-        assert!(text.contains("unsupported by this agent"), "t3 row:\n{text}");
+        assert_eq!(text.lines().count(), agents::ALL_AGENTS.len(), "one row per agent");
     }
 
     #[test]
@@ -560,12 +658,14 @@ mod tests {
             toolchain: crate::firmware::Toolchain::Missing,
             firmware_dir: None,
             existing: None,
-            url: "https://example/fw.bin".into(),
+            url: "https://example/releases".into(),
+            forced: false,
+            cached_version: None,
             have_curl: true,
         };
         let text = format_firmware_status(&sources);
         assert!(text.contains("espup"), "{text}");
-        assert!(text.contains("https://example/fw.bin"), "{text}");
+        assert!(text.contains("https://example/releases"), "{text}");
         assert!(text.contains("can build: false"), "{text}");
         assert!(text.contains("can download: true"), "{text}");
     }

@@ -36,19 +36,18 @@ const HOOK_MARKER: &str = "openmicro-hook";
 /// A coding agent OpenMicro ships an adapter for.
 ///
 /// `ValueEnum` so the same type is the CLI's `install-agent <agent>` argument;
-/// clap derives the value names (`claude`, `codex`, `grok`, `t3`) from the
+/// clap derives the value names (`claude`, `codex`, `grok`) from the
 /// variants, matching [`AgentKind::slug`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AgentKind {
     Claude,
     Codex,
     Grok,
-    T3,
 }
 
 /// Every adapter, in display order.
-pub const ALL_AGENTS: [AgentKind; 4] =
-    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok, AgentKind::T3];
+pub const ALL_AGENTS: [AgentKind; 3] =
+    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok];
 
 /// How an agent's hooks are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +57,6 @@ pub enum Mechanism {
     ClaudeHooks { agent_flag: Option<&'static str> },
     /// Codex CLI `notify` root key in a TOML config.
     CodexNotify,
-    /// No hook/notify mechanism exists in this agent — the reason is the
-    /// payload, shown verbatim to the user rather than a fake success.
-    Unsupported(&'static str),
 }
 
 impl AgentKind {
@@ -70,7 +66,6 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Grok => "grok",
-            AgentKind::T3 => "t3",
         }
     }
 
@@ -80,7 +75,6 @@ impl AgentKind {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex CLI",
             AgentKind::Grok => "Grok Code",
-            AgentKind::T3 => "T3 Code",
         }
     }
 
@@ -90,18 +84,15 @@ impl AgentKind {
             AgentKind::Claude => "claude-code",
             AgentKind::Codex => "codex",
             AgentKind::Grok => "grok-code",
-            AgentKind::T3 => "t3-code",
         }
     }
 
     /// Config file (relative to `$HOME`) whose contents we merge into.
-    /// `None` for agents with no supported mechanism.
-    pub fn config_rel(self) -> Option<&'static str> {
+    pub fn config_rel(self) -> &'static str {
         match self {
-            AgentKind::Claude => Some(".claude/settings.json"),
-            AgentKind::Codex => Some(".codex/config.toml"),
-            AgentKind::Grok => Some(".grok/user-settings.json"),
-            AgentKind::T3 => None,
+            AgentKind::Claude => ".claude/settings.json",
+            AgentKind::Codex => ".codex/config.toml",
+            AgentKind::Grok => ".grok/user-settings.json",
         }
     }
 
@@ -111,7 +102,6 @@ impl AgentKind {
             AgentKind::Claude => &[".claude", ".claude.json"],
             AgentKind::Codex => &[".codex"],
             AgentKind::Grok => &[".grok"],
-            AgentKind::T3 => &[".t3code", ".config/t3code"],
         }
     }
 
@@ -122,7 +112,6 @@ impl AgentKind {
             AgentKind::Claude => &["claude"],
             AgentKind::Codex => &["codex"],
             AgentKind::Grok => &["grok", "grok-cli"],
-            AgentKind::T3 => &["t3code", "t3"],
         }
     }
 
@@ -132,11 +121,6 @@ impl AgentKind {
             AgentKind::Claude => Mechanism::ClaudeHooks { agent_flag: None },
             AgentKind::Grok => Mechanism::ClaudeHooks { agent_flag: Some("grok") },
             AgentKind::Codex => Mechanism::CodexNotify,
-            AgentKind::T3 => Mechanism::Unsupported(
-                "T3 Code drives other agents and exposes no hook API of its own — \
-                 install the Claude Code or Codex adapter instead; those fire whether \
-                 the agent runs in a terminal or inside T3 Code.",
-            ),
         }
     }
 
@@ -156,8 +140,6 @@ pub enum HookStatus {
     /// Something in the config blocks a safe merge (unparseable, or a
     /// conflicting `notify` key). The payload is shown to the user as-is.
     Blocked(String),
-    /// The agent has no hook mechanism to install into.
-    Unsupported(&'static str),
 }
 
 /// One row of the TUI's agent picker.
@@ -168,8 +150,8 @@ pub struct AgentRow {
     pub present: bool,
     /// Whether *our* hooks are already in its config.
     pub status: HookStatus,
-    /// Config file we would write (absolute), when there is one.
-    pub config_path: Option<PathBuf>,
+    /// Config file we would write (absolute).
+    pub config_path: PathBuf,
     /// Preselected in the picker (present + installable + not already done).
     pub selected: bool,
 }
@@ -190,10 +172,7 @@ pub fn is_present(kind: AgentKind, home: &Path) -> bool {
 /// Read an agent's config file, returning `""` when it does not exist yet
 /// (an absent file is a perfectly installable starting point).
 fn read_config(kind: AgentKind, home: &Path) -> Result<String, String> {
-    let Some(rel) = kind.config_rel() else {
-        return Ok(String::new());
-    };
-    let path = home.join(rel);
+    let path = home.join(kind.config_rel());
     match std::fs::read_to_string(&path) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -204,7 +183,6 @@ fn read_config(kind: AgentKind, home: &Path) -> Result<String, String> {
 /// Inspect an agent's current hook status without modifying anything.
 pub fn hook_status(kind: AgentKind, home: &Path) -> HookStatus {
     match kind.mechanism() {
-        Mechanism::Unsupported(why) => HookStatus::Unsupported(why),
         Mechanism::ClaudeHooks { agent_flag } => {
             let contents = match read_config(kind, home) {
                 Ok(c) => c,
@@ -241,13 +219,7 @@ pub fn detect(home: &Path) -> Vec<AgentRow> {
             let present = is_present(kind, home);
             let status = hook_status(kind, home);
             let selected = present && status == HookStatus::Missing;
-            AgentRow {
-                kind,
-                present,
-                status,
-                config_path: kind.config_rel().map(|r| home.join(r)),
-                selected,
-            }
+            AgentRow { kind, present, status, config_path: home.join(kind.config_rel()), selected }
         })
         .collect()
 }
@@ -456,19 +428,12 @@ impl InstallReport {
 /// `<name>.openmicro.bak` before the merged version is written, the write is
 /// atomic (temp file + rename), and an unchanged config is not rewritten at all.
 pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
-    let rel = match kind.mechanism() {
-        Mechanism::Unsupported(why) => return Err(why.to_string()),
-        _ => kind
-            .config_rel()
-            .ok_or_else(|| format!("{} has no config file to write", kind.slug()))?,
-    };
-    let path = home.join(rel);
+    let path = home.join(kind.config_rel());
     let existing = read_config(kind, home)?;
 
     let merged = match kind.mechanism() {
         Mechanism::ClaudeHooks { agent_flag } => merge_claude_hooks(&existing, agent_flag)?,
         Mechanism::CodexNotify => insert_codex_notify(&existing)?,
-        Mechanism::Unsupported(why) => return Err(why.to_string()),
     };
 
     if merged == existing {
@@ -712,10 +677,14 @@ mod tests {
     }
 
     #[test]
-    fn install_t3_is_refused_with_guidance() {
-        let home = TempHome::new("t3");
-        let err = install(AgentKind::T3, home.path()).unwrap_err();
-        assert!(err.contains("no hook API"), "{err}");
+    fn install_grok_uses_its_own_settings_file_and_agent_flag() {
+        let home = TempHome::new("grok");
+        let report = install(AgentKind::Grok, home.path()).unwrap();
+        assert!(report.changed);
+        assert!(report.path.ends_with(".grok/user-settings.json"), "{:?}", report.path);
+        let text = std::fs::read_to_string(&report.path).unwrap();
+        assert!(text.contains("--agent grok"), "{text}");
+        assert_eq!(hook_status(AgentKind::Grok, home.path()), HookStatus::Installed);
     }
 
     #[test]
@@ -736,9 +705,11 @@ mod tests {
         assert!(claude.present, "a ~/.claude dir means Claude Code is installed");
         assert_eq!(claude.status, HookStatus::Missing);
         assert!(claude.selected, "installed + missing hooks is preselected");
+        assert!(claude.config_path.ends_with(".claude/settings.json"));
 
-        let t3 = rows.iter().find(|r| r.kind == AgentKind::T3).unwrap();
-        assert!(!t3.selected, "an unsupported agent is never preselected");
+        let grok = rows.iter().find(|r| r.kind == AgentKind::Grok).unwrap();
+        assert!(!grok.present, "no ~/.grok in this scratch home");
+        assert!(!grok.selected, "an agent that isn't installed is never preselected");
     }
 
     #[test]

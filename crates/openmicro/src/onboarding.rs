@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use crate::agents::{AgentKind, AgentRow};
-use crate::firmware::Sources;
+use crate::firmware::{Release, Sources};
 use crate::probe::{Connection, FirmwareKind, Probe};
 
 /// Marker file (under `$HOME`) written once setup has been completed or
@@ -58,6 +58,8 @@ pub enum Stage {
     NeedCable,
     /// In bootloader mode: choose backup / build / download / flash.
     Firmware,
+    /// Pick which published firmware version to download.
+    Releases,
     /// Flash finished; tell the user to reset the device.
     Flashed,
     /// Pick which installed coding agents to wire up.
@@ -156,10 +158,13 @@ pub fn actions(
         .build_blocker()
         .unwrap_or_else(|| "compiles firmware/ with the Xtensa toolchain".to_string());
 
-    let download_note = if sources.can_download() {
-        format!("from {}", sources.url)
-    } else {
-        "curl not found".to_string()
+    let download_note = match (sources.can_download(), sources.forced) {
+        (false, _) => "curl not found".to_string(),
+        (true, true) => format!("from {}", sources.url),
+        (true, false) => match &sources.cached_version {
+            Some(v) => format!("choose a published version (cached: {v})"),
+            None => "choose from the published versions".to_string(),
+        },
     };
 
     let flash_note = match (image, ready) {
@@ -202,7 +207,10 @@ pub enum Job {
     Probe,
     Backup,
     Build,
-    Download,
+    /// Fetch the published release list, to populate the version picker.
+    FetchReleases,
+    /// Download one specific release's firmware asset.
+    DownloadRelease(Release),
     Flash,
     InstallAgents(Vec<AgentKind>),
 }
@@ -214,7 +222,8 @@ impl Job {
             Job::Probe => "looking for the device".to_string(),
             Job::Backup => "reading the stock firmware (this takes a minute)".to_string(),
             Job::Build => "building firmware".to_string(),
-            Job::Download => "downloading firmware".to_string(),
+            Job::FetchReleases => "fetching the list of firmware versions".to_string(),
+            Job::DownloadRelease(r) => format!("downloading firmware {}", r.tag),
             Job::Flash => "flashing".to_string(),
             Job::InstallAgents(a) => format!("installing hooks for {} agent(s)", a.len()),
         }
@@ -226,6 +235,8 @@ impl Job {
 pub enum JobMsg {
     /// A fresh device observation.
     Probed(Probe),
+    /// The published release list (or why it could not be fetched).
+    Releases(Result<Vec<Release>, String>),
     /// A job finished: `Ok` carries its output lines, `Err` the failure text.
     Finished { job: Job, result: Result<Vec<String>, String> },
 }
@@ -247,6 +258,10 @@ pub struct Wizard {
     /// Agent picker rows, and the cursor into them.
     pub agents: Vec<AgentRow>,
     pub agent_sel: usize,
+    /// Published firmware versions, and the cursor into them. Empty until the
+    /// release list has been fetched.
+    pub releases: Vec<Release>,
+    pub release_sel: usize,
     /// Resolved firmware image, when one exists.
     pub image: Option<PathBuf>,
     /// Existing stock-firmware backup, when one exists.
@@ -271,6 +286,8 @@ impl Wizard {
             action_sel: 0,
             agents: Vec::new(),
             agent_sel: 0,
+            releases: Vec::new(),
+            release_sel: 0,
             image: None,
             backup: None,
             sources: Sources::detect(),
@@ -342,6 +359,40 @@ impl Wizard {
         self.agent_sel = move_cursor(self.agent_sel, self.agents.len(), delta);
     }
 
+    /// Move the version-picker cursor.
+    pub fn release_move(&mut self, delta: i32) {
+        self.release_sel = move_cursor(self.release_sel, self.releases.len(), delta);
+    }
+
+    /// The highlighted firmware version, if the list is non-empty.
+    pub fn selected_release(&self) -> Option<&Release> {
+        self.releases.get(self.release_sel)
+    }
+
+    /// Fold in a fetched release list: on success, open the picker with the
+    /// cursor on the version [`pick_release`](crate::firmware::pick_release)
+    /// would have chosen, so pressing Enter straight away does the sensible
+    /// thing. On failure, stay put and log why.
+    pub fn on_releases(&mut self, result: Result<Vec<Release>, String>) {
+        match result {
+            Ok(releases) if releases.is_empty() => {
+                self.push_log([
+                    "no firmware releases published yet — build from source instead.".to_string(),
+                ]);
+            }
+            Ok(releases) => {
+                let default = crate::firmware::pick_release(&releases, None)
+                    .ok()
+                    .and_then(|r| releases.iter().position(|x| x.tag == r.tag))
+                    .unwrap_or(0);
+                self.releases = releases;
+                self.release_sel = default;
+                self.stage = Stage::Releases;
+            }
+            Err(e) => self.push_log(e.lines().map(|l| l.to_string())),
+        }
+    }
+
     /// Toggle the highlighted agent, refusing to select ones that cannot be
     /// installed (unsupported mechanism, or a config we must not touch).
     pub fn toggle_agent(&mut self) {
@@ -378,12 +429,10 @@ impl Default for Wizard {
     }
 }
 
-/// Whether an agent row can have hooks installed into it.
+/// Whether an agent row can have hooks installed into it. False only when the
+/// agent's own config blocks a safe merge.
 pub fn is_installable(row: &AgentRow) -> bool {
-    matches!(
-        row.status,
-        crate::agents::HookStatus::Missing | crate::agents::HookStatus::Installed
-    )
+    !matches!(row.status, crate::agents::HookStatus::Blocked(_))
 }
 
 /// Move a cursor by `delta` within `len`, clamping at both ends. A zero-length
@@ -515,7 +564,9 @@ mod tests {
             toolchain: crate::firmware::Toolchain::Missing,
             firmware_dir: None,
             existing: None,
-            url: "https://example/fw.bin".to_string(),
+            url: "https://example/releases".to_string(),
+            forced: false,
+            cached_version: None,
             have_curl: false,
         }
     }
@@ -594,13 +645,68 @@ mod tests {
     }
 
     #[test]
-    fn download_is_available_with_curl_and_names_the_url() {
+    fn download_offers_a_version_choice_when_curl_is_available() {
         let mut s = barren_sources();
         s.have_curl = true;
         let items = actions(&s, Probe::default(), None, None);
         let dl = items.iter().find(|i| i.action == Action::Download).unwrap();
         assert!(dl.available);
-        assert!(dl.note.contains("https://example/fw.bin"));
+        assert!(dl.note.contains("published versions"), "{}", dl.note);
+
+        // A cached download says which version is already sitting there.
+        s.cached_version = Some("v1.2.0".to_string());
+        let items = actions(&s, Probe::default(), None, None);
+        let dl = items.iter().find(|i| i.action == Action::Download).unwrap();
+        assert!(dl.note.contains("v1.2.0"), "{}", dl.note);
+
+        // A forced URL bypasses the picker, so it names the URL instead.
+        s.forced = true;
+        let items = actions(&s, Probe::default(), None, None);
+        let dl = items.iter().find(|i| i.action == Action::Download).unwrap();
+        assert!(dl.note.contains("https://example/releases"), "{}", dl.note);
+    }
+
+    #[test]
+    fn fetched_releases_open_the_picker_on_the_default_version() {
+        let mut w = Wizard::new();
+        let releases = crate::firmware::parse_releases(
+            r#"[{"tag_name":"v2.0.0-rc1","prerelease":true,"draft":false,"published_at":"",
+                 "assets":[{"name":"openmicro-fw.bin","size":1,
+                            "browser_download_url":"https://x/rc"}]},
+                {"tag_name":"v1.0.0","prerelease":false,"draft":false,"published_at":"",
+                 "assets":[{"name":"openmicro-fw.bin","size":1,
+                            "browser_download_url":"https://x/stable"}]}]"#,
+        )
+        .unwrap();
+
+        w.on_releases(Ok(releases));
+
+        assert_eq!(w.stage, Stage::Releases);
+        // The cursor starts on the newest *stable* build, not simply the first
+        // row, so Enter straight away installs the sensible thing.
+        assert_eq!(w.selected_release().unwrap().tag, "v1.0.0");
+    }
+
+    #[test]
+    fn an_empty_or_failed_release_list_does_not_open_the_picker() {
+        let mut w = Wizard::new();
+        w.stage = Stage::Firmware;
+        w.on_releases(Ok(Vec::new()));
+        assert_eq!(w.stage, Stage::Firmware);
+        assert!(w.log.iter().any(|l| l.contains("no firmware releases")), "{:?}", w.log);
+
+        w.log.clear();
+        w.on_releases(Err("rate limited".to_string()));
+        assert_eq!(w.stage, Stage::Firmware);
+        assert!(w.log.iter().any(|l| l.contains("rate limited")), "{:?}", w.log);
+    }
+
+    #[test]
+    fn the_version_picker_never_moves_itself() {
+        assert!(!Stage::Releases.polls());
+        assert!(!Stage::Releases.is_waiting());
+        let p = probe(DeviceState::Absent, BleState::Absent);
+        assert_eq!(auto_stage(Stage::Releases, p), Stage::Releases);
     }
 
     #[test]
@@ -632,17 +738,26 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_agents_cannot_be_selected() {
+    fn agents_with_a_blocked_config_cannot_be_selected() {
+        // A config we must not touch (invalid JSON, a conflicting `notify`) is
+        // not something the user can tick their way past.
         let mut w = Wizard::new();
-        // T3 has no hook mechanism; find it and try to tick it.
-        w.agent_sel = w
+        let Some(idx) = w
             .agents
             .iter()
-            .position(|r| r.kind == AgentKind::T3)
-            .expect("t3 row exists");
+            .position(|r| matches!(r.status, crate::agents::HookStatus::Blocked(_)))
+        else {
+            // No agent on this machine has a broken config: assert the rule
+            // directly instead.
+            let mut row = w.agents[0].clone();
+            row.status = crate::agents::HookStatus::Blocked("bad json".into());
+            assert!(!is_installable(&row));
+            return;
+        };
+        w.agent_sel = idx;
         w.toggle_agent();
-        assert!(!w.agents[w.agent_sel].selected);
-        assert!(!w.chosen_agents().contains(&AgentKind::T3));
+        assert!(!w.agents[idx].selected);
+        assert!(!w.chosen_agents().contains(&w.agents[idx].kind));
     }
 
     #[test]

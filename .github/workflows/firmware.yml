@@ -1,0 +1,86 @@
+# Builds the ESP32-S3 firmware and attaches a flashable image to the release.
+#
+# `openmicro firmware download` reads the release list from the GitHub API and
+# looks for an asset named `openmicro-fw*.bin`, so the name below is part of
+# that contract — changing it breaks the TUI's version picker.
+#
+# Run it with "Run workflow" (workflow_dispatch) before cutting a release: the
+# firmware crate carries `// TODO(pinout):` placeholders and has never been
+# compiled, so the first runs are expected to surface real build errors rather
+# than produce an image.
+
+name: firmware
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach assets to the release
+
+jobs:
+  build:
+    name: build and attach openmicro-fw.bin
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The firmware targets Xtensa, which is not in upstream rustc; this
+      # installs the Espressif Rust fork and the esp32s3 target.
+      - name: Install the Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          buildtargets: esp32s3
+          default: true
+          ldproxy: false
+
+      # `firmware/` is deliberately its own Cargo workspace, so it is cached
+      # separately from the host crates.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+
+      # espflash turns the firmware ELF into a flashable image; it derives the
+      # bootloader and partition table, which a bare `objcopy` would not.
+      - name: Install espflash
+        run: cargo install espflash --locked
+
+      - name: Build firmware
+        working-directory: firmware
+        run: cargo build --release
+
+      # `--merge` writes bootloader + partition table + app into one image that
+      # is flashed at offset 0x0 — which is exactly what `openmicro flash`
+      # expects from a downloaded release.
+      - name: Create the merged flash image
+        working-directory: firmware
+        run: |
+          espflash save-image \
+            --chip esp32s3 \
+            --merge \
+            target/xtensa-esp32s3-none-elf/release/openmicro-fw \
+            openmicro-fw.bin
+          sha256sum openmicro-fw.bin | tee sha256sums.txt
+          ls -l openmicro-fw.bin
+
+      # Available on every run, including workflow_dispatch, so the build can
+      # be exercised without cutting a release.
+      - name: Upload the build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openmicro-fw
+          path: |
+            firmware/openmicro-fw.bin
+            firmware/sha256sums.txt
+          if-no-files-found: error
+
+      - name: Attach the image to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            firmware/openmicro-fw.bin
+            firmware/sha256sums.txt

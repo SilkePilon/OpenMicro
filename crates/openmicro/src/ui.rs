@@ -272,6 +272,7 @@ pub fn stage_title(stage: Stage) -> &'static str {
         Stage::NeedCable => "Connect a USB cable",
         Stage::NeedBootMode => "Enter bootloader mode",
         Stage::Firmware => "Firmware",
+        Stage::Releases => "Choose a firmware version",
         Stage::Flashed => "Firmware written",
         Stage::Agents => "Coding agents",
         Stage::Done => "All set",
@@ -291,6 +292,7 @@ pub fn stage_keys(stage: Stage, busy: bool) -> &'static str {
         Stage::Firmware => {
             " [↑↓] choose   [Enter] run   [r] re-check   [a] agent setup   [s] skip   [q] quit "
         }
+        Stage::Releases => " [↑↓] choose a version   [Enter] download   [Esc] back   [q] quit ",
         Stage::Flashed => " [Enter] continue to agent setup   [s] skip   [q] quit ",
         Stage::Agents => {
             " [↑↓] move   [space] toggle   [Enter] install selected   [n] skip   [q] quit "
@@ -421,6 +423,7 @@ fn wizard_body(w: &Wizard) -> Vec<Line<'static>> {
             ],
         ),
         Stage::Firmware => firmware_body(w),
+        Stage::Releases => releases_body(w),
         Stage::Flashed => vec![
             Line::styled(
                 "Firmware written successfully.",
@@ -509,6 +512,59 @@ fn firmware_body(w: &Wizard) -> Vec<Line<'static>> {
     lines
 }
 
+/// The published-firmware-version picker.
+fn releases_body(w: &Wizard) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(
+            "Published firmware versions, newest first:".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    if w.releases.is_empty() {
+        lines.push(Line::raw("No releases found."));
+        return lines;
+    }
+    for (i, release) in w.releases.iter().enumerate() {
+        let selected = i == w.release_sel;
+        let usable = release.blocker().is_none();
+        let marker = if selected { "> " } else { "  " };
+        let mark = if usable { "•" } else { "✗" };
+        let style = match (selected, usable) {
+            (true, true) => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            (false, true) => Style::default(),
+            (false, false) => Style::default().fg(Color::DarkGray),
+        };
+        lines.push(Line::styled(format!("{marker}{mark} {}", release.label()), style));
+        if selected {
+            let detail = match release.blocker() {
+                Some(why) => why.to_string(),
+                None => format!("{} KiB", release.asset_size / 1024),
+            };
+            lines.push(Line::styled(
+                format!("      {detail}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    lines
+}
+
+/// Short one-line status for an agent row, and the colour to draw it in.
+///
+/// Deliberately short: a long reason (a blocked config's explanation is a
+/// sentence) is shown under the highlighted row instead, so the picker never
+/// wraps into an unreadable block.
+pub fn agent_status_label(row: &crate::agents::AgentRow) -> (&'static str, Color) {
+    match &row.status {
+        HookStatus::Installed => ("hooks installed", Color::Green),
+        HookStatus::Missing if row.present => ("detected, hooks missing", Color::Yellow),
+        HookStatus::Missing => ("not installed on this machine", Color::DarkGray),
+        HookStatus::Blocked(_) => ("cannot install — see below", Color::Red),
+    }
+}
+
 /// The agent picker.
 fn agents_body(w: &Wizard) -> Vec<Line<'static>> {
     let mut lines = vec![Line::styled(
@@ -526,23 +582,13 @@ fn agents_body(w: &Wizard) -> Vec<Line<'static>> {
     for (i, row) in w.agents.iter().enumerate() {
         let selected = i == w.agent_sel;
         let marker = if selected { "> " } else { "  " };
-        let installable = crate::onboarding::is_installable(row);
         let check = match (&row.status, row.selected) {
             (HookStatus::Installed, _) => "[✓]",
+            (HookStatus::Blocked(_), _) => "[-]",
             (_, true) => "[x]",
-            _ if installable => "[ ]",
-            _ => "[-]",
+            _ => "[ ]",
         };
-        // Keep every row to ONE line: a long reason (the unsupported/blocked
-        // explanations are sentences) is shown under the highlighted row
-        // instead of wrapping the list into an unreadable block.
-        let (status_text, status_color) = match &row.status {
-            HookStatus::Installed => ("hooks installed", Color::Green),
-            HookStatus::Missing if row.present => ("detected, hooks missing", Color::Yellow),
-            HookStatus::Missing => ("not installed on this machine", Color::DarkGray),
-            HookStatus::Blocked(_) => ("cannot install — see below", Color::Red),
-            HookStatus::Unsupported(_) => ("unsupported by this agent", Color::DarkGray),
-        };
+        let (status_text, status_color) = agent_status_label(row);
         let name_style = if selected {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
@@ -557,13 +603,8 @@ fn agents_body(w: &Wizard) -> Vec<Line<'static>> {
         // this agent cannot be installed.
         if selected {
             let detail = match &row.status {
-                HookStatus::Unsupported(why) => (*why).to_string(),
                 HookStatus::Blocked(why) => format!("blocked: {why}"),
-                _ => row
-                    .config_path
-                    .as_ref()
-                    .map(|p| format!("writes {}", p.display()))
-                    .unwrap_or_else(|| "no config file to write".to_string()),
+                _ => format!("writes {}", row.config_path.display()),
             };
             lines.push(Line::styled(
                 format!("      {detail}"),
@@ -750,12 +791,13 @@ mod tests {
     }
 
     /// Every wizard screen, for exhaustive rendering tests.
-    const ALL_STAGES: [Stage; 8] = [
+    const ALL_STAGES: [Stage; 9] = [
         Stage::Warning,
         Stage::Detect,
         Stage::NeedCable,
         Stage::NeedBootMode,
         Stage::Firmware,
+        Stage::Releases,
         Stage::Flashed,
         Stage::Agents,
         Stage::Done,
@@ -820,16 +862,56 @@ mod tests {
 
     #[test]
     fn every_agent_row_stays_on_one_line() {
-        // Long explanations (the unsupported/blocked reasons are sentences)
-        // must not wrap the picker into an unreadable block; they belong under
-        // the highlighted row instead.
+        // A long "blocked" reason is a sentence and must not wrap the picker
+        // into an unreadable block; it belongs under the highlighted row.
         let text = draw_stage(Stage::Agents, None);
-        for line in text.lines() {
-            if line.contains("T3 Code") {
-                assert!(line.contains("unsupported by this agent"), "{line}");
-                assert!(!line.contains("drives other agents"), "long reason inline: {line}");
-            }
+        for row in crate::agents::detect(&crate::agents::home()) {
+            let line = text
+                .lines()
+                .find(|l| l.contains(row.kind.label()))
+                .unwrap_or_else(|| panic!("{} row missing:\n{text}", row.kind.label()));
+            let (status, _) = agent_status_label(&row);
+            // A wrapped row would show a truncated status on the label line.
+            assert!(line.contains(status), "row wrapped or truncated: {line}");
         }
+    }
+
+    #[test]
+    fn the_version_picker_shows_versions_dates_and_what_is_uninstallable() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut w = Wizard::new();
+        w.stage = Stage::Releases;
+        w.releases = crate::firmware::parse_releases(
+            r#"[{"tag_name":"v2.0.0-rc1","name":null,"draft":false,"prerelease":true,
+                 "published_at":"2026-07-22T09:00:00Z",
+                 "assets":[{"name":"openmicro-fw.bin","size":829440,
+                            "browser_download_url":"https://x/a"}]},
+                {"tag_name":"v1.2.0","name":"OpenMicro 1.2.0","draft":false,"prerelease":false,
+                 "published_at":"2026-07-20T09:00:00Z",
+                 "assets":[{"name":"openmicro-fw.bin","size":820224,
+                            "browser_download_url":"https://x/b"}]},
+                {"tag_name":"v1.1.0","name":"OpenMicro 1.1.0","draft":false,"prerelease":false,
+                 "published_at":"2026-07-10T09:00:00Z","assets":[]}]"#,
+        )
+        .unwrap();
+        w.release_sel = 1;
+        terminal.draw(|f| render_wizard(f, &w)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|r| r.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("v2.0.0-rc1") && text.contains("(pre-release)"), "{text}");
+        assert!(text.contains("2026-07-20"), "publish dates help pick: {text}");
+        // The highlighted row shows its size; the assetless one is marked ✗.
+        assert!(text.contains("801 KiB"), "{text}");
+        let v11 = text.lines().find(|l| l.contains("v1.1.0")).unwrap();
+        assert!(v11.contains('✗'), "a release with no image must be marked: {v11}");
     }
 
     #[test]

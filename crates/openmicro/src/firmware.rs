@@ -13,16 +13,21 @@ use std::process::Command;
 /// Where a downloaded firmware image is cached.
 pub const CACHE_REL: &str = ".cache/openmicro/firmware/openmicro-fw.bin";
 
-/// Release asset fetched by [`download`] when `$OPENMICRO_FIRMWARE_URL` is
-/// unset. Points at the "latest release" redirect so it keeps working across
-/// versions; until a release exists it 404s, which surfaces as a plain
-/// "download failed" rather than a silent bad image.
-pub const DEFAULT_FIRMWARE_URL: &str =
-    "https://github.com/SilkePilon/OpenMicro/releases/latest/download/openmicro-fw.bin";
+/// GitHub API listing every published release, newest first. The firmware
+/// images are built and attached by `.github/workflows/firmware.yml`.
+pub const RELEASES_API: &str = "https://api.github.com/repos/SilkePilon/OpenMicro/releases";
 
-/// Environment variable that overrides [`DEFAULT_FIRMWARE_URL`] (a fork, a
-/// self-hosted build, or a `file://` path for testing).
+/// Environment variable that overrides [`RELEASES_API`], for a fork or a local
+/// mirror (a `file://` path works too, which is how the parser is exercised).
+pub const RELEASES_URL_ENV: &str = "OPENMICRO_RELEASES_URL";
+
+/// Environment variable that bypasses the release list entirely and downloads
+/// one specific URL. Useful for a self-hosted or locally built image.
 pub const FIRMWARE_URL_ENV: &str = "OPENMICRO_FIRMWARE_URL";
+
+/// Sibling file recording which release the cached image came from, so the CLI
+/// and the wizard can say *which version* is sitting in the cache.
+pub const CACHE_VERSION_REL: &str = ".cache/openmicro/firmware/openmicro-fw.version";
 
 /// Whether the Xtensa toolchain needed to build the firmware is usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,13 +113,187 @@ pub fn cache_image() -> PathBuf {
     crate::agents::home().join(CACHE_REL)
 }
 
-/// The URL [`download`] fetches: `$OPENMICRO_FIRMWARE_URL` if set and non-empty,
-/// else [`DEFAULT_FIRMWARE_URL`].
-pub fn firmware_url() -> String {
-    std::env::var(FIRMWARE_URL_ENV)
+/// Path of the file recording the cached image's release tag.
+pub fn cache_version_file() -> PathBuf {
+    crate::agents::home().join(CACHE_VERSION_REL)
+}
+
+/// The release tag of the cached image, if one was downloaded.
+pub fn cached_version() -> Option<String> {
+    std::fs::read_to_string(cache_version_file())
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_FIRMWARE_URL.to_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A direct download URL forced by `$OPENMICRO_FIRMWARE_URL`, if set. When
+/// present it bypasses the release list entirely.
+pub fn forced_url() -> Option<String> {
+    std::env::var(FIRMWARE_URL_ENV).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The API endpoint the release list is fetched from.
+pub fn releases_url() -> String {
+    std::env::var(RELEASES_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| RELEASES_API.to_string())
+}
+
+/// One published firmware release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// Git tag, e.g. `v1.2.0`. The stable identifier users pick by.
+    pub tag: String,
+    /// Human title; falls back to the tag when GitHub has none.
+    pub name: String,
+    pub prerelease: bool,
+    /// ISO-8601 publish timestamp, or empty when absent.
+    pub published: String,
+    /// Download URL of the firmware asset, when the release has one. A release
+    /// whose build failed (or predates the workflow) has none, and cannot be
+    /// installed — the picker shows it greyed out rather than hiding it.
+    pub asset_url: Option<String>,
+    /// Size of that asset in bytes.
+    pub asset_size: u64,
+}
+
+impl Release {
+    /// One-line label for the picker.
+    pub fn label(&self) -> String {
+        let date = self.published.split('T').next().unwrap_or("").to_string();
+        let kind = if self.prerelease { "  (pre-release)" } else { "" };
+        let title = if self.name.is_empty() || self.name == self.tag {
+            String::new()
+        } else {
+            format!("  {}", self.name)
+        };
+        format!("{}{title}{kind}   {date}", self.tag)
+    }
+
+    /// Why this release cannot be installed, when it cannot.
+    pub fn blocker(&self) -> Option<&'static str> {
+        self.asset_url.is_none().then_some("no firmware asset attached to this release")
+    }
+}
+
+/// Parse the GitHub releases JSON into [`Release`]s, newest first.
+///
+/// Pure, so the shape of the API response is pinned by tests rather than
+/// discovered at runtime. Drafts are dropped (they are not downloadable), and
+/// a release with no `.bin` asset is kept but marked uninstallable, which is
+/// more honest than silently omitting a version the user can see on GitHub.
+pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("release list is not valid JSON ({e})"))?;
+    let items = value.as_array().ok_or_else(|| {
+        // A rate-limited or errored API responds with an object, not an array.
+        let msg = value.get("message").and_then(|m| m.as_str()).unwrap_or("unexpected response");
+        format!("could not list releases: {msg}")
+    })?;
+
+    let mut out = Vec::new();
+    for item in items {
+        if item.get("draft").and_then(|d| d.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let Some(tag) = item.get("tag_name").and_then(|t| t.as_str()) else { continue };
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or(tag);
+        let asset = item
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .and_then(|assets| assets.iter().find(|a| is_firmware_asset(a)));
+
+        out.push(Release {
+            tag: tag.to_string(),
+            name: name.to_string(),
+            prerelease: item.get("prerelease").and_then(|p| p.as_bool()).unwrap_or(false),
+            published: item
+                .get("published_at")
+                .and_then(|p| p.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            asset_url: asset
+                .and_then(|a| a.get("browser_download_url"))
+                .and_then(|u| u.as_str())
+                .map(str::to_string),
+            asset_size: asset.and_then(|a| a.get("size")).and_then(|s| s.as_u64()).unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
+/// True for an asset that looks like a flashable firmware image.
+fn is_firmware_asset(asset: &serde_json::Value) -> bool {
+    asset
+        .get("name")
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.ends_with(".bin") && n.contains("openmicro"))
+}
+
+/// Fetch and parse the published release list.
+pub fn fetch_releases() -> Result<Vec<Release>, String> {
+    let curl = crate::flash::which(&["curl"])
+        .ok_or_else(|| "curl not found — install curl to list firmware releases.".to_string())?;
+    let url = releases_url();
+    let output = std::process::Command::new(&curl)
+        .args(release_list_args(&url))
+        .output()
+        .map_err(|e| format!("cannot run curl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not fetch the release list from {url} ({}): {}",
+            crate::flash::exit_desc(output.status.code()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_releases(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `curl` argv for the release list: GitHub's API requires a User-Agent and
+/// rejects requests without one.
+pub fn release_list_args(url: &str) -> Vec<String> {
+    vec![
+        "--fail".into(),
+        "--location".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--user-agent".into(),
+        concat!("openmicro/", env!("CARGO_PKG_VERSION")).into(),
+        "--header".into(),
+        "Accept: application/vnd.github+json".into(),
+        url.to_string(),
+    ]
+}
+
+/// Choose which release to install.
+///
+/// With an explicit `version`, only an exact tag match will do — silently
+/// falling back to a different version is the last thing anyone wants from a
+/// firmware installer. Without one, the newest release that actually has an
+/// asset wins, preferring stable over pre-release.
+pub fn pick_release<'a>(
+    releases: &'a [Release],
+    version: Option<&str>,
+) -> Result<&'a Release, String> {
+    if let Some(tag) = version {
+        return releases
+            .iter()
+            .find(|r| r.tag == tag)
+            .ok_or_else(|| match releases.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>() {
+                tags if tags.is_empty() => format!("no release {tag}: no releases published yet"),
+                tags => format!("no release {tag}. Available: {}", tags.join(", ")),
+            });
+    }
+    releases
+        .iter()
+        .find(|r| !r.prerelease && r.asset_url.is_some())
+        .or_else(|| releases.iter().find(|r| r.asset_url.is_some()))
+        .ok_or_else(|| {
+            "no published release has a firmware asset yet — build from source instead."
+                .to_string()
+        })
 }
 
 /// Build the firmware from source. Returns the built image path plus the
@@ -159,16 +338,46 @@ pub fn build() -> Result<(PathBuf, Vec<String>), String> {
     Ok((image, lines))
 }
 
-/// Download a prebuilt firmware image into the cache directory.
+/// Download the firmware for `version` (or the newest suitable release).
+///
+/// With `$OPENMICRO_FIRMWARE_URL` set, that URL is fetched directly and the
+/// release list is not consulted at all.
+pub fn download(version: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
+    if let Some(url) = forced_url() {
+        return download_from(&url, &format!("({FIRMWARE_URL_ENV})"));
+    }
+    let releases = fetch_releases()?;
+    let release = pick_release(&releases, version)?;
+    download_release(release)
+}
+
+/// Download one specific release's firmware asset.
+pub fn download_release(release: &Release) -> Result<(PathBuf, Vec<String>), String> {
+    let url = release.asset_url.as_ref().ok_or_else(|| {
+        format!(
+            "release {} has no firmware asset attached — pick another version, or build \
+             from source.",
+            release.tag
+        )
+    })?;
+    let result = download_from(url, &release.tag);
+    if result.is_ok() {
+        // Best-effort note of which version is now cached; a failure here only
+        // costs us the ability to display it later.
+        let _ = std::fs::write(cache_version_file(), format!("{}\n", release.tag));
+    }
+    result
+}
+
+/// Fetch `url` into the firmware cache.
 ///
 /// Uses `curl` (present on every machine that can install this project) with
 /// `--fail`, so an HTML 404 page is never mistaken for firmware. The file is
 /// written to a temp path and renamed only after a successful transfer, so a
 /// half-downloaded image can never be flashed.
-pub fn download() -> Result<(PathBuf, Vec<String>), String> {
+fn download_from(url: &str, label: &str) -> Result<(PathBuf, Vec<String>), String> {
     let curl = crate::flash::which(&["curl"])
         .ok_or_else(|| "curl not found — install curl, or build the firmware instead.".to_string())?;
-    let url = firmware_url();
     let dest = cache_image();
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -176,7 +385,7 @@ pub fn download() -> Result<(PathBuf, Vec<String>), String> {
     }
     let tmp = dest.with_extension("part");
 
-    let args = curl_args(&url, &tmp);
+    let args = curl_args(url, &tmp);
     let output = Command::new(&curl)
         .args(&args)
         .output()
@@ -186,8 +395,8 @@ pub fn download() -> Result<(PathBuf, Vec<String>), String> {
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
         lines.push(format!(
-            "download failed ({}) from {url} — no published image yet? Set {FIRMWARE_URL_ENV} \
-             to a working URL, or build the firmware from source instead.",
+            "download failed ({}) from {url} — build the firmware from source instead, or \
+             set {FIRMWARE_URL_ENV} to a working URL.",
             crate::flash::exit_desc(output.status.code())
         ));
         return Err(lines.join("\n"));
@@ -201,7 +410,7 @@ pub fn download() -> Result<(PathBuf, Vec<String>), String> {
     std::fs::rename(&tmp, &dest)
         .map_err(|e| format!("cannot move the download into place: {e}"))?;
 
-    lines.push(format!("downloaded {size} bytes to {}", dest.display()));
+    lines.push(format!("downloaded {label}: {size} bytes to {}", dest.display()));
     Ok((dest, lines))
 }
 
@@ -239,17 +448,26 @@ pub struct Sources {
     pub firmware_dir: Option<PathBuf>,
     /// An already-built or already-downloaded image, if one exists.
     pub existing: Option<PathBuf>,
+    /// Where firmware would be fetched from: the release list, or a forced URL.
     pub url: String,
+    /// True when `$OPENMICRO_FIRMWARE_URL` forces one URL and the release list
+    /// is bypassed — the version picker has nothing to offer in that case.
+    pub forced: bool,
+    /// Release tag of the cached image, when it came from a download.
+    pub cached_version: Option<String>,
     pub have_curl: bool,
 }
 
 impl Sources {
     pub fn detect() -> Sources {
+        let forced = forced_url();
         Sources {
             toolchain: toolchain(),
             firmware_dir: firmware_dir(),
             existing: crate::flash::resolve_image(None).ok(),
-            url: firmware_url(),
+            url: forced.clone().unwrap_or_else(releases_url),
+            forced: forced.is_some(),
+            cached_version: cached_version(),
             have_curl: crate::flash::which(&["curl"]).is_some(),
         }
     }
@@ -313,13 +531,144 @@ mod tests {
 
     #[test]
     fn firmware_url_honors_the_env_override() {
-        // Serialized implicitly: this is the only test touching the var.
+        // Serialized implicitly: this is the only test touching these vars.
         std::env::set_var(FIRMWARE_URL_ENV, "https://elsewhere/fw.bin");
-        assert_eq!(firmware_url(), "https://elsewhere/fw.bin");
+        assert_eq!(forced_url().as_deref(), Some("https://elsewhere/fw.bin"));
         std::env::set_var(FIRMWARE_URL_ENV, "   ");
-        assert_eq!(firmware_url(), DEFAULT_FIRMWARE_URL, "blank falls back to the default");
+        assert_eq!(forced_url(), None, "blank is not an override");
         std::env::remove_var(FIRMWARE_URL_ENV);
-        assert_eq!(firmware_url(), DEFAULT_FIRMWARE_URL);
+        assert_eq!(forced_url(), None);
+        assert_eq!(releases_url(), RELEASES_API);
+    }
+
+    /// A trimmed-down copy of what the GitHub releases API returns.
+    const RELEASES_JSON: &str = r#"[
+      {"tag_name":"v1.2.0","name":"OpenMicro 1.2.0","draft":false,"prerelease":false,
+       "published_at":"2026-07-20T10:00:00Z",
+       "assets":[{"name":"openmicro-fw.bin","size":812345,
+                  "browser_download_url":"https://example/v1.2.0/openmicro-fw.bin"},
+                 {"name":"sha256sums.txt","size":90,
+                  "browser_download_url":"https://example/v1.2.0/sha256sums.txt"}]},
+      {"tag_name":"v1.3.0-rc1","name":null,"draft":false,"prerelease":true,
+       "published_at":"2026-07-22T10:00:00Z",
+       "assets":[{"name":"openmicro-fw.bin","size":812999,
+                  "browser_download_url":"https://example/v1.3.0-rc1/openmicro-fw.bin"}]},
+      {"tag_name":"v1.1.0","name":"OpenMicro 1.1.0","draft":false,"prerelease":false,
+       "published_at":"2026-07-10T10:00:00Z","assets":[]},
+      {"tag_name":"v9.9.9","name":"unfinished","draft":true,"prerelease":false,
+       "published_at":null,"assets":[]}
+    ]"#;
+
+    #[test]
+    fn parse_releases_reads_tags_assets_and_flags() {
+        let rels = parse_releases(RELEASES_JSON).unwrap();
+        assert_eq!(rels.len(), 3, "the draft must be dropped");
+        assert_eq!(rels[0].tag, "v1.2.0");
+        assert_eq!(
+            rels[0].asset_url.as_deref(),
+            Some("https://example/v1.2.0/openmicro-fw.bin"),
+            "must pick the firmware .bin, not the checksums file"
+        );
+        assert_eq!(rels[0].asset_size, 812_345);
+        assert!(!rels[0].prerelease);
+
+        assert!(rels[1].prerelease);
+        assert_eq!(rels[1].name, "v1.3.0-rc1", "a null name falls back to the tag");
+
+        // A release with no firmware asset is kept, but marked uninstallable —
+        // hiding a version the user can see on GitHub would be confusing.
+        assert_eq!(rels[2].tag, "v1.1.0");
+        assert!(rels[2].asset_url.is_none());
+        assert!(rels[2].blocker().is_some());
+    }
+
+    #[test]
+    fn parse_releases_reports_an_api_error_object() {
+        let err = parse_releases(r#"{"message":"API rate limit exceeded"}"#).unwrap_err();
+        assert!(err.contains("rate limit"), "{err}");
+    }
+
+    #[test]
+    fn parse_releases_rejects_garbage() {
+        assert!(parse_releases("not json").unwrap_err().contains("not valid JSON"));
+        assert!(parse_releases("").is_err());
+    }
+
+    #[test]
+    fn parse_releases_of_an_empty_list_is_empty() {
+        assert!(parse_releases("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pick_release_prefers_the_newest_stable_with_an_asset() {
+        let rels = parse_releases(RELEASES_JSON).unwrap();
+        // v1.3.0-rc1 is newer but a pre-release; v1.1.0 is stable but has no
+        // asset. v1.2.0 is the only correct answer.
+        assert_eq!(pick_release(&rels, None).unwrap().tag, "v1.2.0");
+    }
+
+    #[test]
+    fn pick_release_falls_back_to_a_prerelease_when_nothing_else_has_an_asset() {
+        let rels: Vec<Release> = parse_releases(RELEASES_JSON)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.tag != "v1.2.0")
+            .collect();
+        assert_eq!(pick_release(&rels, None).unwrap().tag, "v1.3.0-rc1");
+    }
+
+    #[test]
+    fn pick_release_matches_an_explicit_tag_exactly() {
+        let rels = parse_releases(RELEASES_JSON).unwrap();
+        assert_eq!(pick_release(&rels, Some("v1.3.0-rc1")).unwrap().tag, "v1.3.0-rc1");
+
+        // Never silently substitute a different version.
+        let err = pick_release(&rels, Some("v0.0.1")).unwrap_err();
+        assert!(err.contains("no release v0.0.1"), "{err}");
+        assert!(err.contains("v1.2.0"), "must list what is available: {err}");
+    }
+
+    #[test]
+    fn pick_release_with_nothing_installable_says_so() {
+        let err = pick_release(&[], None).unwrap_err();
+        assert!(err.contains("build from source"), "{err}");
+    }
+
+    #[test]
+    fn release_label_is_readable() {
+        let rels = parse_releases(RELEASES_JSON).unwrap();
+        let stable = rels[0].label();
+        assert!(stable.contains("v1.2.0") && stable.contains("2026-07-20"), "{stable}");
+        assert!(!stable.contains("pre-release"));
+        assert!(rels[1].label().contains("(pre-release)"), "{}", rels[1].label());
+    }
+
+    #[test]
+    fn release_list_args_identify_the_client() {
+        // GitHub rejects API requests without a User-Agent.
+        let args = release_list_args("https://api/x");
+        assert!(args.contains(&"--user-agent".to_string()), "{args:?}");
+        assert!(args.contains(&"--fail".to_string()));
+        assert_eq!(args.last().unwrap(), "https://api/x");
+    }
+
+    #[test]
+    fn fetch_releases_parses_a_local_file_url() {
+        // End-to-end through curl, without touching the network: curl reads
+        // file:// URLs, so this exercises the real fetch + parse path.
+        let path = std::env::temp_dir()
+            .join(format!("openmicro-releases-{}.json", std::process::id()));
+        std::fs::write(&path, RELEASES_JSON).unwrap();
+        std::env::set_var(RELEASES_URL_ENV, format!("file://{}", path.display()));
+
+        let result = fetch_releases();
+
+        std::env::remove_var(RELEASES_URL_ENV);
+        let _ = std::fs::remove_file(&path);
+
+        let rels = result.unwrap();
+        assert_eq!(rels.len(), 3);
+        assert_eq!(rels[0].tag, "v1.2.0");
     }
 
     #[test]

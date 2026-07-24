@@ -1,204 +1,248 @@
 # OpenMicro
 
-OpenMicro is an all-Rust control plane that turns an ESP32-based macropad into a
-live status display and controller for your terminal AI agents. A background
-daemon (`openmicrod`) tracks each agent session's state (idle / thinking /
-working / awaiting-approval), drives the device's per-key LEDs to reflect them,
-and routes physical key presses back to the focused session. A terminal UI and a
-small CLI let you watch and configure everything from your shell.
+Your macropad's keys light up with what your coding agents are doing.
 
-The **host side is complete and works today** (against a mock transport and over
-BLE). The **firmware is a separate, still-pending piece** — see
-[Firmware status](#firmware-status) below.
+Each agent session gets a key. It glows one colour while the agent is thinking,
+another while it's running tools, and a third when it's stuck waiting on you —
+so you can look away from the terminal and still know when you're needed. Press
+the key to jump focus to that session.
 
-## Components
+Written in Rust, top to bottom: daemon, TUI, agent adapters, and the ESP32-S3
+firmware.
 
-- `openmicrod` — the daemon. Serves the hook socket (agents push state) and the
-  control socket (clients read snapshots / send config commands).
-- `openmicro` — the user-facing binary. With no arguments it launches the TUI;
-  with a subcommand it acts as a CLI (see below).
-- `openmicro-hook` — the shim agents call from their lifecycle hooks to report
-  state transitions to the daemon.
+**Where this is:** the host side works today. The firmware compiles from a
+skeleton that still needs the device's GPIO pinout filled in, and has never been
+flashed. See [Firmware](#firmware).
+
+## How it works
+
+```
+coding agent  ──hook──▶  openmicro-hook  ──▶  openmicrod  ──BLE──▶  macropad
+                                                  │
+                                                  └──▶  openmicro (TUI / CLI)
+```
+
+Three binaries:
+
+| | |
+| --- | --- |
+| `openmicrod` | The daemon. Tracks session state, drives the LEDs, routes key presses back. |
+| `openmicro` | What you run. No arguments opens the TUI; with a subcommand it's a CLI. |
+| `openmicro-hook` | A tiny shim your agent calls on each state change. Always exits 0, so it can't break your agent. |
+
+Four states, and that's the whole vocabulary: `idle`, `thinking`, `working`,
+`awaiting_approval`.
 
 ## Install
-
-From a checkout of this repo:
 
 ```sh
 packaging/install.sh
 ```
 
-This builds the release binaries, installs `openmicrod`, `openmicro`, and
-`openmicro-hook` into `~/.local/bin`, and installs a systemd **user** service.
-Then enable the daemon and open the UI:
+Builds release binaries into `~/.local/bin` and installs a systemd **user**
+service. Make sure `~/.local/bin` is on your `PATH`.
 
 ```sh
-systemctl --user enable --now openmicrod   # start now and on login
-openmicro                                  # open the TUI
+systemctl --user enable --now openmicrod   # start now, and on login
+openmicro                                  # first run opens the setup wizard
 ```
 
-Make sure `~/.local/bin` is on your `PATH`. To keep the daemon running after you
-log out, run `loginctl enable-linger "$USER"` once.
+If you want the daemon to survive logout, run `loginctl enable-linger "$USER"`
+once.
 
-To remove everything: `packaging/uninstall.sh` (add `--purge` to also delete
-`~/.config/openmicro`).
+Uninstall with `packaging/uninstall.sh`, or `--purge` to also drop
+`~/.config/openmicro`.
 
-## Setup wizard
+## First run
 
-The first time you run `openmicro`, it opens a guided wizard instead of the
-dashboard. It walks the whole path from an untouched device to a working one:
+`openmicro` opens a wizard the first time, and takes you from an untouched
+device to a working one:
 
-1. **Custom-firmware warning.** Flashing OpenMicro is not an intended use of the
-   Creator Micro 2. Going back to stock **is** possible, but only from a backup
-   of your own device taken *before* flashing — the wizard offers to take it.
-2. **Device detection.** It scans USB and Bluetooth with a live spinner until it
-   finds the macropad, and reports what it found and how.
-3. **Already on OpenMicro firmware?** It skips straight to agent setup.
-4. **Reachable over Bluetooth only?** It asks for a USB cable — firmware can
-   only be written over USB — and then for the boot button, polling until the
-   device appears in ROM bootloader mode.
-5. **Firmware.** Back up the stock image, **build** it from `firmware/` or
-   **download** a prebuilt release, then flash. Actions you cannot run yet are
-   greyed out with the reason (missing toolchain, no image, not in bootloader
-   mode) rather than failing halfway.
-6. **Agents.** It detects which coding agents are installed and installs their
-   hooks for the ones you tick.
+1. **The warning.** Flashing OpenMicro is not something the vendor supports.
+   You can go back, but only from a backup of your own device taken beforehand —
+   the wizard offers to take it.
+2. **Finding the device.** It watches USB and Bluetooth until the macropad turns
+   up, and tells you what it found.
+3. If it's already running OpenMicro firmware, it skips ahead to step 5.
+4. **Getting it into bootloader mode.** Firmware only goes over USB, so if the
+   device is Bluetooth-only it asks for a cable first. Then it asks you to hold
+   the boot button while replugging, and waits.
+5. **Firmware.** Back up the stock image, pick a version to download or build
+   one from source, then flash.
+6. **Agents.** It finds the coding agents installed on your machine and wires up
+   the ones you tick.
 
-Re-run it any time with `openmicro setup`, or press `s` on the dashboard. It is
-resumable and every step is skippable.
+Anything it can't do yet is greyed out with the reason, rather than failing
+partway through. Every step is skippable, and `openmicro setup` reopens it.
 
-## CLI
+## Everyday use
 
-Running `openmicro` with no subcommand opens the interactive TUI (the wizard on
-first run, the dashboard afterwards). The subcommands are:
+Run `openmicro` for the dashboard: one row per live session, the focused one in
+yellow, battery in the title bar.
 
-| Command | Description |
-| ------- | ----------- |
-| `openmicro status` | Print a one-shot summary of the daemon's state (agents, states, owner, battery). Exits non-zero with `daemon not running` if the daemon is down. |
-| `openmicro service <start\|stop\|restart\|status\|enable\|disable>` | Wrapper around `systemctl --user <action> openmicrod.service`. |
-| `openmicro setup` | Re-open the guided setup wizard. |
-| `openmicro agents` | List which coding agents are installed here and whether their OpenMicro hooks are wired. |
-| `openmicro install-agent <claude\|codex\|grok\|t3> [--print]` | Install that agent's hooks into its own config (`--print` shows the adapter docs instead). |
-| `openmicro install-agent --all` | Install hooks for every detected agent that is missing them. |
-| `openmicro firmware <build\|download\|status>` | Build the firmware from source, fetch a prebuilt release, or report which sources are available. |
-| `openmicro flash [--image <path>] [--port <path>]` | Flash firmware to a Micro 2 in bootloader mode (see [Flash the firmware](#flash-the-firmware)). Stops with clear guidance and a non-zero exit if the image is missing, no flash tool is installed, or the device isn't in bootloader mode. |
-| `openmicro backup [--out <path>]` | Dump the device's whole flash so the stock firmware can be restored later. |
-| `openmicro restore [--image <path>]` | Write a saved stock-firmware backup back to the device. |
+| Key | |
+| --- | --- |
+| `c` | Config panel: brightness, per-state colours, idle-sleep timeout. Changes apply live and are saved. |
+| `f` | Flash screen. |
+| `s` | Reopen the setup wizard. |
+| `q` | Quit. |
 
-## Agent setup
+## Agents
 
-Each supported agent has an adapter under `adapters/`. The wizard's agent screen
-installs them for you; from the CLI:
+Each supported agent has an adapter in [`adapters/`](adapters/).
+
+| Agent | Mechanism |
+| --- | --- |
+| [Claude Code](adapters/claude-code/install.md) | Lifecycle hooks, event JSON on stdin |
+| [Codex CLI](adapters/codex/install.md) | The `notify` program |
+| [Grok Code](adapters/grok-code/install.md) | Claude-compatible hooks |
+
+The wizard installs them, or from the shell:
 
 ```sh
-openmicro agents                  # what's installed, and what's already wired
-openmicro install-agent claude    # wire one agent
-openmicro install-agent --all     # wire every detected agent
-openmicro install-agent claude --print   # just show the adapter's install.md
+openmicro agents                # what's installed here, and what's already wired
+openmicro install-agent claude  # wire one
+openmicro install-agent --all   # wire everything detected
 ```
 
-Installing is **merge-only and idempotent**: your existing settings and hooks are
-preserved (including key order), the previous file is copied to
-`<name>.openmicro.bak`, the new file is written atomically, and re-running is a
-no-op. If a config cannot be merged safely — invalid JSON, or a Codex `notify`
-key already pointing somewhere else — it is reported and left untouched rather
-than overwritten.
+Installing merges into the agent's own config file. Your existing keys and hooks
+survive, key order included; the old file is copied to `<name>.openmicro.bak`;
+the write is atomic; running it twice does nothing the second time. If a config
+can't be merged safely — invalid JSON, or a Codex `notify` already pointing at
+another program — OpenMicro says so and leaves the file alone.
 
-T3 Code has no hook API of its own (it drives other agents), so it is listed but
-cannot be installed; wire the underlying Claude Code or Codex adapter instead.
-
-The hooks call `openmicro-hook` by bare name, so it must be on the `PATH` your
-agent runs with — the wizard and CLI warn when it is not.
-
-## Firmware status
-
-The firmware that runs on the macropad is **separate from this host software and
-is not yet ready to flash** — it exists as a documented skeleton awaiting
-hardware pinout confirmation and a build. What's done:
-
-- **`crates/openmicro-effects`** — the LED effect resolver (Solid / Breath /
-  Pulse / Rainbow) is complete, host-tested (`cargo test -p
-  openmicro-effects`), `no_std`, and shared by the firmware unchanged.
-- **`firmware/`** — an ESP32-S3 embedded skeleton (BLE GATT server, WS2812
-  render loop, key/encoder/joystick input scanning) with every physical pin
-  as a documented `// TODO(pinout):` placeholder. It is its own Cargo
-  workspace so it never affects `cargo build/test/clippy --workspace` at the
-  repo root. **It has not been compiled** — there is no Xtensa Rust toolchain
-  in this environment; see [`firmware/README.md`](firmware/README.md) for the
-  toolchain install, build, and flashing steps once you have the device and
-  its pinout in hand.
-
-Until firmware is built, flashed, and the pinout is filled in, the daemon runs
-against a mock device (and can talk to a real device over BLE where
-available). The hardware investigation lives in
-[`docs/hardware/creator-micro-2-pinout-research.md`](docs/hardware/creator-micro-2-pinout-research.md).
-
-## Flash the firmware
-
-The easiest path is `openmicro setup`, which walks the whole thing. Underneath
-it there are two other front-ends over the same engine: the `openmicro flash`
-CLI and the TUI installer screen (press `f`). All three are honest about
-prerequisites — they will **not** pretend to flash if something is missing.
-
-Three things must be true before a flash can happen:
-
-1. **You have a firmware image.** Either build it or download one:
-   ```sh
-   openmicro firmware build      # needs the Espressif Xtensa toolchain (espup)
-   openmicro firmware download   # fetches a prebuilt release
-   openmicro firmware status     # what's available here, and which image is used
-   ```
-   See [`firmware/README.md`](firmware/README.md) for the toolchain setup. The
-   default build output is
-   `firmware/target/xtensa-esp32s3-none-elf/release/openmicro-fw` and downloads
-   land in `~/.cache/openmicro/firmware/`; pass a different one with `--image`.
-   Set `OPENMICRO_FIRMWARE_URL` to download from a fork or a local `file://`.
-2. **A flash tool is installed** and on your `PATH` (or in `~/.local/bin` /
-   `~/.cargo/bin`). Which one depends on the image: a from-source build is an
-   **ELF**, which needs `espflash` to derive the bootloader and partition table;
-   a downloaded release is a **merged binary**, which `esptool` writes at `0x0`.
-   ```sh
-   cargo install espflash     # for from-source builds
-   pip install esptool        # for merged release images, and for backup/restore
-   ```
-   OpenMicro picks the right one from the image's format and refuses to hand an
-   ELF to `esptool` (that would write something the chip cannot boot).
-3. **The device is in bootloader mode.** The Micro 2 uses native
-   USB-Serial-JTAG with **no auto-reset**, so you must enter download mode by
-   hand: **hold the boot button while plugging in the USB cable**, then release
-   once it re-enumerates. (In bootloader mode it shows up as USB `303a:1001`;
-   running normally it is `303a:8298`.)
-
-Then flash from the CLI:
+Anything that can run a shell command can be wired up by hand:
 
 ```sh
-openmicro flash                 # auto-detects the image and device
+openmicro-hook push --agent <name> --session <id> --state working
+```
+
+One catch: hooks call `openmicro-hook` by bare name, so it has to be on the
+`PATH` your agent runs with. OpenMicro warns you when it isn't.
+
+## Firmware
+
+The firmware lives in [`firmware/`](firmware/) as its own Cargo workspace, so it
+never interferes with `cargo build` at the repo root. It's an
+esp-hal/Embassy/TrouBLE application: BLE GATT server, WS2812 render loop, key
+and encoder and joystick scanning.
+
+Two things are still outstanding. Every physical pin is a `// TODO(pinout):`
+placeholder, because the Creator Micro 2's GPIO assignments aren't public — see
+[the research notes](docs/hardware/creator-micro-2-pinout-research.md) and
+[what's left](docs/hardware/NEXT-STEPS.md). And it has never been compiled, so
+expect the first build to need fixes in the hardware glue. The LED effect code
+([`crates/openmicro-effects`](crates/openmicro-effects)) is shared with the host
+and is already tested, so that part isn't where the bugs will be.
+
+Until then the daemon runs against a mock device. Set `transport = "ble"` in the
+config once you have real firmware on the board.
+
+### Getting an image
+
+```sh
+openmicro firmware list                       # published versions
+openmicro firmware download                   # newest stable release
+openmicro firmware download --version v1.2.0  # a specific one
+openmicro firmware build                      # compile it yourself
+openmicro firmware status                     # what's available on this machine
+```
+
+Releases are built by [`.github/workflows/firmware.yml`](.github/workflows/firmware.yml)
+and attached to the GitHub release as `openmicro-fw.bin`. Downloads are cached in
+`~/.cache/openmicro/firmware/`. Building needs the Espressif Xtensa toolchain
+(`cargo install espup && espup install`); see
+[`firmware/README.md`](firmware/README.md).
+
+Point `OPENMICRO_FIRMWARE_URL` at any URL to bypass the release list entirely,
+or `OPENMICRO_RELEASES_URL` at a fork's API endpoint.
+
+### Flashing
+
+`openmicro setup` walks you through it. Or press `f` in the TUI for a checklist,
+or use the CLI:
+
+```sh
+openmicro flash
 openmicro flash --image path/to/fw.bin --port /dev/ttyACM0
 ```
 
-or open the TUI (`openmicro`), press `f`, and follow the checklist — each item
-shows ✓ or ✗ with what to fix, and once all three pass you can press Enter to
-flash.
+Three things have to be true first, and all three front-ends tell you which one
+isn't:
 
-If a prerequisite is missing, every front-end prints exactly what to do and
-exits non-zero; nothing is written to the device.
+1. **You have an image**, built or downloaded.
+2. **A flash tool is installed.** Which one depends on the image. A source build
+   is an ELF and needs `espflash` (`cargo install espflash`) to derive the
+   bootloader and partition table. A downloaded release is already merged, and
+   `esptool` (`pip install esptool`) writes it at `0x0`. OpenMicro picks from the
+   file's format, and refuses to hand an ELF to `esptool` — that writes something
+   the chip can't boot.
+3. **The device is in bootloader mode.** There's no auto-reset on this board
+   (native USB-Serial-JTAG), so you hold the boot button while plugging the cable
+   in, and let go once it re-enumerates. Bootloader mode shows up on USB as
+   `303a:1001`; running normally it's `303a:8298`.
 
-## Going back to the stock firmware
+Nothing gets written to the device if a step is missing.
 
-Reverting **is** possible, but it is not a supported use of the device and it
-only works from a backup of *your own* device — there is no published stock
-image to fall back on. Take the backup **before** you flash, with the device in
-bootloader mode:
+### Going back to stock
+
+Possible, but only from a backup of your own board — there's no published stock
+image anywhere. Take it **before** you flash, with the device in bootloader mode:
 
 ```sh
-openmicro backup                # dumps the whole 4 MiB flash (needs esptool)
+openmicro backup    # dumps all 4 MiB to ~/.local/share/openmicro/
 ```
 
-It lands in `~/.local/share/openmicro/stock-firmware.bin`. Keep it. To go back,
-re-enter bootloader mode and:
+Keep that file. To go back, re-enter bootloader mode and run `openmicro restore`.
+Without a backup, `restore` tells you it can't help rather than trying.
+
+## CLI
+
+```
+openmicro                    open the TUI
+openmicro status             one-shot summary of the daemon's state
+openmicro service <action>   start | stop | restart | status | enable | disable
+openmicro setup              reopen the setup wizard
+openmicro agents             list detected agents and their hook status
+openmicro install-agent ...  wire an agent's hooks (--all, --print)
+openmicro firmware ...       list | download [--version] | build | status
+openmicro flash              write firmware to a device in bootloader mode
+openmicro backup             save the current flash
+openmicro restore            write a saved backup back
+```
+
+## Configuration
+
+`~/.config/openmicro/config.toml`, written by the TUI's config panel:
+
+```toml
+transport = "mock"     # or "ble"
+brightness = 200       # 0-255
+sleep_minutes = 3      # blank the LEDs after this long idle; 0 disables
+
+[colors.idle]
+r = 0
+g = 0
+b = 0
+# ...and thinking / working / awaiting_approval
+```
+
+## Development
 
 ```sh
-openmicro restore
+cargo test --workspace
+cargo clippy --workspace --all-targets
 ```
 
-Without a backup, `restore` refuses rather than pretending it can help.
+The firmware is excluded from the root workspace on purpose; build it from
+inside `firmware/` with the Xtensa toolchain active.
+
+Layout: `crates/openmicro-proto` (shared types, `no_std`),
+`crates/openmicro-effects` (LED effects, `no_std`, shared with the firmware),
+`crates/openmicrod` (daemon), `crates/openmicro` (TUI and CLI),
+`crates/openmicro-hook` (agent shim), `firmware/` (ESP32-S3), `adapters/` (per-agent
+integration docs), `packaging/` (install scripts and the systemd unit).
+
+## License
+
+MIT.
