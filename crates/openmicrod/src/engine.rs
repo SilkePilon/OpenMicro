@@ -64,7 +64,6 @@ impl Engine {
 
     /// Put the LEDs to sleep: blank the device and mark the engine asleep.
     /// Wired into the idle-sleep timer in the daemon.
-    #[allow(dead_code)]
     pub async fn sleep(&mut self, device: &mut dyn DeviceLink) {
         self.asleep = true;
         self.rerender(device).await;
