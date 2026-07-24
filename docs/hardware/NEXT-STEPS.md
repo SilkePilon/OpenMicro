@@ -1,9 +1,20 @@
 # What's left for you (the physical hardware steps)
 
+> **Update, 2026-07-24:** the GPIO pinout has been recovered from Work Louder's
+> own published firmware and is wired into `firmware/src/pins.rs` — Step 1 below
+> is done, and you no longer need to open the case. What remains needs the board
+> in hand: the HAL plumbing in `main.rs`'s task bodies, the key-ID map, and the
+> MAX77972's I2C pins. See `creator-micro-2-pinout-findings.md`.
+>
+> Restoring the vendor firmware also no longer depends on taking a backup first
+> — Work Louder publish their images, and the TUI downloads them.
+
 Everything that can be built and tested without the hardware loop is **done** (host software: daemon, TUI, adapters, packaging, effect core, installer — 118 tests, v1.1.0). What remains needs you physically present with the Creator Micro 2: recovering the GPIO pinout (possibly by opening the case), and being there if a flash goes wrong. Bootloader mode itself no longer needs you — OpenMicro asks the firmware to reboot into it over HID.
 
-## Step 1 — Get the GPIO pinout (one-time)
-The MCU is confirmed **ESP32-S3**, but no GPIO pin numbers are public (see `creator-micro-2-pinout-research.md`). Pick one:
+## Step 1 — Get the GPIO pinout (one-time) — **DONE**
+Recovered by disassembling the vendor's own published firmware; see
+`creator-micro-2-pinout-findings.md`. The two manual routes below are kept only
+as a fallback if something in that map turns out wrong on the bench:
 
 - **A. Read-flash + disassemble (no case opening):** put the device in bootloader mode (run `openmicro`, **Device → Reboot into bootloader mode**; it then enumerates as `303a:1001`), then:
   ```

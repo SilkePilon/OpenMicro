@@ -121,14 +121,19 @@ never interferes with `cargo build` at the repo root. It's an
 esp-hal/Embassy/TrouBLE application: BLE GATT server, WS2812 render loop, key
 and encoder and joystick scanning.
 
-Two things are still outstanding. Every physical pin is a `// TODO(pinout):`
-placeholder, because the Creator Micro 2's GPIO assignments aren't public (see
-[the research notes](docs/hardware/creator-micro-2-pinout-research.md)). And it
-doesn't build yet: `esp-hal-embassy` and `esp-hal` have drifted apart, and the
-pinned versions turn out not to be mutually compatible.
-[What's left](docs/hardware/NEXT-STEPS.md) has the errors and where to start.
-The LED effect code ([`crates/openmicro-effects`](crates/openmicro-effects)) is
-shared with the host and already tested, so that part isn't where the bugs are.
+It builds, and the GPIO map is real: Work Louder publish their firmware
+unencrypted, so the pinout was recovered by disassembling it rather than by
+opening the case ([findings](docs/hardware/creator-micro-2-pinout-findings.md)).
+`pins.rs` asserts at compile time that no function collides with another or with
+the flash, PSRAM and USB pins.
+
+What it cannot do yet is drive the board: the HAL plumbing in `main.rs`'s task
+bodies is still stubbed, the key-ID to matrix-coordinate map is unknown, and the
+MAX77972 fuel gauge's I2C pins were the one thing the vendor image would not
+give up statically. [What's left](docs/hardware/NEXT-STEPS.md) has the details.
+The LED effect and WS2812 encoding code
+([`crates/openmicro-effects`](crates/openmicro-effects)) is shared with the host
+and unit-tested, so that part isn't where the bugs are.
 
 Until then the daemon runs against a mock device. Set `transport = "ble"` in the
 config once you have real firmware on the board.
@@ -186,13 +191,14 @@ bootloader mode it shows up on USB as `303a:1001`; running its firmware it is
 
 ### Going back to stock
 
-Possible, but only from a backup of your own board — there's no published stock
-image anywhere. Take it **before** you flash, with the device in bootloader mode:
+Straightforward: Work Louder publish their firmware openly, as unencrypted
+merged images. **Firmware → Restore the stock firmware** lists every published
+vendor version and writes the one you pick. No backup required.
 
-**Firmware → Back up the stock firmware** dumps all 4 MiB to
-`~/.local/share/openmicro/`. Keep that file. To go back, use **Firmware →
-Restore the stock firmware**. Without a backup, restore tells you it can't help
-rather than trying.
+**Firmware → Back up the stock firmware** is still worth doing before you flash
+if you want your device's *exact* image, settings and all, rather than a stock
+one — it dumps all 4 MiB to `~/.local/share/openmicro/`, and restore offers it
+alongside the vendor releases.
 
 ## Configuration
 
