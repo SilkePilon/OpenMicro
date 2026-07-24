@@ -52,10 +52,14 @@ pub fn snapshot(engine: &Engine) -> Snapshot {
     Snapshot { sessions, owner }
 }
 
-/// Persist the engine's current brightness + colors to config, preserving the
-/// on-disk transport setting. Best-effort: errors are logged, not propagated.
-fn persist(engine: &Engine) {
-    let (brightness, colors) = engine.to_config_fields();
+/// Persist the given brightness + colors to config, preserving the on-disk
+/// transport (and any other) fields by loading the current config first.
+///
+/// This performs blocking synchronous filesystem I/O (read + write + rename),
+/// so it must NOT be called while any engine/device lock is held. Callers
+/// capture the fields to persist, drop their guards, and then invoke this.
+/// Best-effort: errors are logged, not propagated.
+fn persist(brightness: u8, colors: openmicro_proto::StateColors) {
     let mut cfg = crate::config::load();
     cfg.brightness = brightness;
     cfg.colors = colors;
@@ -109,12 +113,23 @@ pub async fn serve(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                // Lock order: engine -> device (mirrors ingress).
-                let mut eng = engine_r.lock().await;
-                let mut dev = device_r.lock().await;
-                eng.apply_command(cmd, &mut *dev).await;
-                drop(dev);
-                persist(&eng);
+                // Lock order: engine -> device (mirrors ingress). Apply the
+                // command under the locks, capture the fields to persist, then
+                // drop both guards BEFORE doing any blocking filesystem I/O so
+                // other tasks (snapshot writer, ingress hook events) aren't
+                // stalled waiting on the engine lock.
+                let (brightness, colors) = {
+                    let mut eng = engine_r.lock().await;
+                    let mut dev = device_r.lock().await;
+                    eng.apply_command(cmd, &mut *dev).await;
+                    let fields = eng.to_config_fields();
+                    drop(dev);
+                    drop(eng);
+                    fields
+                };
+                // No engine/device lock is held here: run the sync read/write
+                // /rename off the async runtime so it can't block other tasks.
+                let _ = tokio::task::spawn_blocking(move || persist(brightness, colors)).await;
             }
         });
     }
