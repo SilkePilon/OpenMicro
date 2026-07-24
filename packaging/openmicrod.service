@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenMicro daemon (macropad control plane)
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/openmicrod
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
