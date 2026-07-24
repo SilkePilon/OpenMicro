@@ -22,3 +22,6 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.28"
 crossterm = "0.28"
 async-trait = "0.1"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+uuid = "1"
+futures = "0.3"

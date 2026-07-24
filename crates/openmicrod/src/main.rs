@@ -1,3 +1,4 @@
+mod ble;
 mod config;
 mod control;
 mod device;
