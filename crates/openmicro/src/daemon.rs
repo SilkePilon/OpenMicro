@@ -30,12 +30,6 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(rt).join("openmicro-ctl.sock")
 }
 
-/// Where the hook shim pushes agent state.
-pub fn hook_socket_path() -> PathBuf {
-    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(rt).join("openmicro.sock")
-}
-
 /// Path of the systemd user unit, honouring `$XDG_CONFIG_HOME`.
 pub fn unit_path() -> PathBuf {
     match std::env::var("XDG_CONFIG_HOME") {
@@ -218,12 +212,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn socket_paths_live_under_the_runtime_dir() {
+    fn the_control_socket_lives_under_the_runtime_dir() {
         let ctl = socket_path();
-        let hook = hook_socket_path();
         assert!(ctl.ends_with("openmicro-ctl.sock"), "{ctl:?}");
-        assert!(hook.ends_with("openmicro.sock"), "{hook:?}");
-        assert_ne!(ctl, hook, "the control and hook sockets are different files");
+        assert!(ctl.parent().is_some());
     }
 
     #[test]

@@ -34,11 +34,7 @@ pub const CODEX_NOTIFY_LINE: &str = r#"notify = ["openmicro-hook", "codex-notify
 const HOOK_MARKER: &str = "openmicro-hook";
 
 /// A coding agent OpenMicro ships an adapter for.
-///
-/// `ValueEnum` so the same type is the CLI's `install-agent <agent>` argument;
-/// clap derives the value names (`claude`, `codex`, `grok`) from the
-/// variants, matching [`AgentKind::slug`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
     Codex,
@@ -60,7 +56,7 @@ pub enum Mechanism {
 }
 
 impl AgentKind {
-    /// Short stable name used on the wire (`--agent`) and in the CLI.
+    /// Short stable name used on the wire (`--agent`) and as the picker value.
     pub fn slug(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -75,15 +71,6 @@ impl AgentKind {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex CLI",
             AgentKind::Grok => "Grok Code",
-        }
-    }
-
-    /// Directory under `adapters/` holding this agent's install docs.
-    pub fn adapter_dir(self) -> &'static str {
-        match self {
-            AgentKind::Claude => "claude-code",
-            AgentKind::Codex => "codex",
-            AgentKind::Grok => "grok-code",
         }
     }
 
@@ -124,7 +111,7 @@ impl AgentKind {
         }
     }
 
-    /// Parse a CLI slug back into a kind.
+    /// Parse a slug back into a kind.
     pub fn from_slug(s: &str) -> Option<AgentKind> {
         ALL_AGENTS.into_iter().find(|a| a.slug() == s)
     }
@@ -152,8 +139,6 @@ pub struct AgentRow {
     pub status: HookStatus,
     /// Config file we would write (absolute).
     pub config_path: PathBuf,
-    /// Preselected in the picker (present + installable + not already done).
-    pub selected: bool,
 }
 
 /// `$HOME` as a path, falling back to `/` so callers never have to handle the
@@ -216,10 +201,12 @@ pub fn detect(home: &Path) -> Vec<AgentRow> {
     ALL_AGENTS
         .into_iter()
         .map(|kind| {
-            let present = is_present(kind, home);
-            let status = hook_status(kind, home);
-            let selected = present && status == HookStatus::Missing;
-            AgentRow { kind, present, status, config_path: home.join(kind.config_rel()), selected }
+            AgentRow {
+                kind,
+                present: is_present(kind, home),
+                status: hook_status(kind, home),
+                config_path: home.join(kind.config_rel()),
+            }
         })
         .collect()
 }
@@ -917,12 +904,10 @@ mod tests {
         let claude = rows.iter().find(|r| r.kind == AgentKind::Claude).unwrap();
         assert!(claude.present, "a ~/.claude dir means Claude Code is installed");
         assert_eq!(claude.status, HookStatus::Missing);
-        assert!(claude.selected, "installed + missing hooks is preselected");
         assert!(claude.config_path.ends_with(".claude/settings.json"));
 
         let grok = rows.iter().find(|r| r.kind == AgentKind::Grok).unwrap();
         assert!(!grok.present, "no ~/.grok in this scratch home");
-        assert!(!grok.selected, "an agent that isn't installed is never preselected");
     }
 
     #[test]

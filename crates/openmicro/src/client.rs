@@ -11,17 +11,6 @@ pub const PALETTE: [Rgb; 6] = [
     Rgb { r: 160, g: 60, b: 255 },
 ];
 
-/// Step a palette index by `dir` (+1/-1), wrapping within `PALETTE`.
-pub fn step_preset(idx: usize, dir: i32) -> usize {
-    let len = PALETTE.len() as i32;
-    (((idx as i32 + dir) % len + len) % len) as usize
-}
-
-/// Adjust brightness by `delta`, clamped to `0..=255`.
-pub fn adjust_brightness(b: u8, delta: i32) -> u8 {
-    (b as i32 + delta).clamp(0, 255) as u8
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SessionDto {
     pub agent: String,
@@ -137,20 +126,6 @@ mod tests {
     #[test]
     fn rejects_non_json() {
         assert!(parse_snapshot("not json").is_none());
-    }
-
-    #[test]
-    fn step_preset_wraps_both_directions() {
-        assert_eq!(step_preset(0, 1), 1);
-        assert_eq!(step_preset(PALETTE.len() - 1, 1), 0);
-        assert_eq!(step_preset(0, -1), PALETTE.len() - 1);
-    }
-
-    #[test]
-    fn adjust_brightness_clamps() {
-        assert_eq!(adjust_brightness(100, 8), 108);
-        assert_eq!(adjust_brightness(250, 8), 255);
-        assert_eq!(adjust_brightness(4, -8), 0);
     }
 
     #[test]

@@ -12,9 +12,7 @@ serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio.workspace = true
 anyhow.workspace = true
-ratatui.workspace = true
 crossterm.workspace = true
-clap.workspace = true
 # Used by the setup wizard's device probe, to tell "already running OpenMicro
 # firmware" apart from "stock firmware" over BLE before any cable is attached.
 bluer.workspace = true

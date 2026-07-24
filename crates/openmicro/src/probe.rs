@@ -104,11 +104,6 @@ impl Probe {
         FirmwareKind::Unknown
     }
 
-    /// True when a real flash could be attempted right now.
-    pub fn bootloader_ready(self) -> bool {
-        self.usb == DeviceState::Bootloader
-    }
-
     /// True when we can see the device at all.
     pub fn any_device(self) -> bool {
         self.connection() != Connection::None
@@ -235,7 +230,6 @@ mod tests {
     fn bootloader_is_reported_before_any_firmware_guess() {
         let probe = p(DeviceState::Bootloader, BleState::OpenMicro);
         assert_eq!(probe.firmware(), FirmwareKind::Bootloader);
-        assert!(probe.bootloader_ready());
         assert_eq!(probe.connection(), Connection::Cable);
     }
 
@@ -244,7 +238,6 @@ mod tests {
         let probe = p(DeviceState::Absent, BleState::OpenMicro);
         assert_eq!(probe.firmware(), FirmwareKind::OpenMicro);
         assert_eq!(probe.connection(), Connection::Ble);
-        assert!(!probe.bootloader_ready());
     }
 
     #[test]

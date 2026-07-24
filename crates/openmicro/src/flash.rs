@@ -417,83 +417,6 @@ pub const BOOTLOADER_HINT_ABSENT: &str =
      bootloader mode hold the boot/power button while connecting (native USB-Serial-JTAG has \
      no auto-reset).";
 
-/// A single guided-checklist item: whether the prerequisite is satisfied and
-/// the line to show the user (a hint when unsatisfied).
-pub type ChecklistItem = (bool, String);
-
-/// Build the guided installer checklist from the current environment state.
-///
-/// Pure: takes the resolved facts and returns display rows. The three rows are
-/// (1) firmware image, (2) esptool, (3) device state. `ready()` is true iff all
-/// three are satisfied, i.e. a real flash could be attempted.
-pub fn checklist(
-    image: &Result<PathBuf, String>,
-    flasher: &Result<Flasher, String>,
-    device: DeviceState,
-) -> Vec<ChecklistItem> {
-    let image_row = match image {
-        Ok(p) => (true, format!("firmware image: {}", p.display())),
-        Err(_) => (
-            false,
-            "firmware image: none yet — `openmicro firmware build` or `openmicro firmware download`"
-                .to_string(),
-        ),
-    };
-
-    let flasher_row = match flasher {
-        Ok(f) => (true, format!("flash tool: {}", f.program().display())),
-        Err(e) => (false, format!("flash tool: {e}")),
-    };
-
-    let device_row = match device {
-        DeviceState::Bootloader => {
-            (true, "device: in bootloader mode (ready to flash)".to_string())
-        }
-        DeviceState::NormalDevice => (
-            false,
-            "device: running normally — hold the boot button while plugging in USB to enter bootloader mode"
-                .to_string(),
-        ),
-        DeviceState::Absent => (
-            false,
-            "device: not detected — plug in the Micro 2 (hold boot to enter bootloader mode)"
-                .to_string(),
-        ),
-    };
-
-    vec![image_row, flasher_row, device_row]
-}
-
-/// True iff every checklist row is satisfied (a real flash may be attempted).
-pub fn ready(items: &[ChecklistItem]) -> bool {
-    items.iter().all(|(ok, _)| *ok)
-}
-
-/// Flash `image` to a bootloader-mode Micro 2 via `esptool`, streaming its
-/// stdout/stderr straight to the terminal.
-///
-/// Stops with a clear error at the first missing prerequisite (no image, no
-/// esptool, device not in bootloader mode) and NEVER fabricates success. The
-/// end-to-end write is only ever exercised by the user on real hardware.
-pub fn flash(image: Option<&Path>, port: Option<&str>) -> Result<(), String> {
-    let (tool, args) = prepare(image, port)?;
-    println!("flashing: {} {}", tool.display(), args.join(" "));
-
-    let status = Command::new(&tool)
-        .args(&args)
-        .status()
-        .map_err(|e| format!("failed to launch {}: {e}", tool.display()))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the flash tool exited with {} — see its output above.",
-            exit_desc(status.code())
-        ))
-    }
-}
-
 /// Like [`flash`], but captures esptool's combined stdout/stderr and returns it
 /// as lines (for the TUI's scrollable output area) instead of streaming to the
 /// terminal. Same prerequisite checks; same honesty contract.
@@ -648,46 +571,6 @@ mod tests {
                 "/tmp/fw.bin"
             ]
         );
-    }
-
-    #[test]
-    fn checklist_all_missing() {
-        let items = checklist(
-            &Err("no image".to_string()),
-            &Err("no flash tool".to_string()),
-            DeviceState::Absent,
-        );
-        assert_eq!(items.len(), 3);
-        assert!(!items[0].0 && !items[1].0 && !items[2].0);
-        assert!(!ready(&items));
-        assert!(items[0].1.contains("firmware build") || items[0].1.contains("download"));
-        assert!(items[1].1.contains("no flash tool"));
-        assert!(items[2].1.contains("not detected"));
-    }
-
-    #[test]
-    fn checklist_normal_device_hint() {
-        let items = checklist(
-            &Ok(PathBuf::from("/tmp/fw.bin")),
-            &Ok(Flasher::Esptool(PathBuf::from("/usr/bin/esptool"))),
-            DeviceState::NormalDevice,
-        );
-        assert!(items[0].0, "image ok");
-        assert!(items[1].0, "flash tool ok");
-        assert!(!items[2].0, "device not ready");
-        assert!(items[2].1.contains("boot button"));
-        assert!(!ready(&items));
-    }
-
-    #[test]
-    fn checklist_all_ready() {
-        let items = checklist(
-            &Ok(PathBuf::from("/tmp/fw.bin")),
-            &Ok(Flasher::Esptool(PathBuf::from("/usr/bin/esptool"))),
-            DeviceState::Bootloader,
-        );
-        assert!(ready(&items));
-        assert!(items[2].1.contains("ready to flash"));
     }
 
     #[test]

@@ -6,14 +6,9 @@ thing: call `openmicro-hook` on state transitions.
 
 ## Installing them
 
-You do not have to follow these documents by hand — the setup wizard
-(`openmicro setup`) and the CLI install them for you:
-
-```sh
-openmicro agents                  # which agents are here, and what's already wired
-openmicro install-agent claude    # merge one adapter into that agent's config
-openmicro install-agent --all     # every detected agent that's missing its hooks
-```
+You do not have to follow these documents by hand. Run `openmicro`, pick
+**Coding agents**, and tick the ones you want; the guided setup does the same
+thing as its last step.
 
 Installing is merge-only and idempotent: your existing keys and hooks survive
 (key order included), the previous file is copied to `<name>.openmicro.bak`, the
@@ -22,7 +17,7 @@ cannot be merged safely — invalid JSON, or a Codex `notify` already pointing a
 another program — is reported and left untouched.
 
 The per-agent `install.md` files below stay the reference for what is written
-and why (`openmicro install-agent <agent> --print` prints them).
+and why.
 
 ## The universal contract
 

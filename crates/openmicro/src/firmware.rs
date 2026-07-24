@@ -446,15 +446,12 @@ pub struct Sources {
     pub toolchain: Toolchain,
     /// `firmware/` crate directory, when running from a source checkout.
     pub firmware_dir: Option<PathBuf>,
-    /// An already-built or already-downloaded image, if one exists.
-    pub existing: Option<PathBuf>,
-    /// Where firmware would be fetched from: the release list, or a forced URL.
+    /// Where firmware would be fetched from: the release list, or the URL
+    /// `$OPENMICRO_FIRMWARE_URL` forces.
     pub url: String,
     /// True when `$OPENMICRO_FIRMWARE_URL` forces one URL and the release list
     /// is bypassed — the version picker has nothing to offer in that case.
     pub forced: bool,
-    /// Release tag of the cached image, when it came from a download.
-    pub cached_version: Option<String>,
     pub have_curl: bool,
 }
 
@@ -464,10 +461,8 @@ impl Sources {
         Sources {
             toolchain: toolchain(),
             firmware_dir: firmware_dir(),
-            existing: crate::flash::resolve_image(None).ok(),
             url: forced.clone().unwrap_or_else(releases_url),
             forced: forced.is_some(),
-            cached_version: cached_version(),
             have_curl: crate::flash::which(&["curl"]).is_some(),
         }
     }

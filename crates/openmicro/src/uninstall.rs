@@ -458,7 +458,7 @@ mod tests {
             error: Some("permission denied".to_string()),
         };
         assert_eq!(summarise(&[]), "Nothing selected.");
-        assert_eq!(summarise(&[ok.clone()]), "Removed 1 item(s).");
+        assert_eq!(summarise(std::slice::from_ref(&ok)), "Removed 1 item(s).");
         let mixed = summarise(&[ok, bad]);
         assert!(mixed.contains("1 failed"), "{mixed}");
     }

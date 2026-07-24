@@ -46,12 +46,8 @@ Make sure ${BIN_DIR} is on your PATH, then:
   # Enable + start the daemon now and on login:
   systemctl --user enable --now openmicrod
 
-  # Open the TUI:
+  # Open the interface (one command, no subcommands):
   openmicro
-
-  # Or inspect state from the CLI:
-  openmicro status
-  openmicro install-agent claude
 
 If the daemon should keep running after you log out, enable lingering once:
 

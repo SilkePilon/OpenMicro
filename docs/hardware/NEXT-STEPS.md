@@ -1,11 +1,11 @@
 # What's left for you (the physical hardware steps)
 
-Everything that can be built and tested without the hardware loop is **done** (host software: daemon, TUI, adapters, packaging, effect core, installer — 118 tests, v1.1.0). Three things remain that need you physically present with the Creator Micro 2, because they involve the boot button and (possibly) opening the case, and a bad flash needs someone there to recover.
+Everything that can be built and tested without the hardware loop is **done** (host software: daemon, TUI, adapters, packaging, effect core, installer — 118 tests, v1.1.0). What remains needs you physically present with the Creator Micro 2: recovering the GPIO pinout (possibly by opening the case), and being there if a flash goes wrong. Bootloader mode itself no longer needs you — OpenMicro asks the firmware to reboot into it over HID.
 
 ## Step 1 — Get the GPIO pinout (one-time)
 The MCU is confirmed **ESP32-S3**, but no GPIO pin numbers are public (see `creator-micro-2-pinout-research.md`). Pick one:
 
-- **A. Read-flash + disassemble (no case opening):** put the device in bootloader mode (hold the small boot button on the bottom while plugging in USB — it enumerates as `303a:1001`), then:
+- **A. Read-flash + disassemble (no case opening):** put the device in bootloader mode (run `openmicro`, **Device → Reboot into bootloader mode**; it then enumerates as `303a:1001`), then:
   ```
   esptool --chip esp32s3 read_flash 0x0 0x400000 stock-firmware.bin
   ```
@@ -16,18 +16,18 @@ Fill the results into `firmware/src/pins.rs` (every unknown is a grouped `// TOD
 
 ## Steps 2 and 3 — just run the wizard
 ```
-openmicro setup
+openmicro
 ```
-The TUI now drives the rest end to end. It shows the custom-firmware warning (including that reverting is possible **only** from a backup you take first), watches USB and Bluetooth with a spinner until it finds the device, tells you exactly what to do next based on what it found — swap to a USB cable if it is only on Bluetooth, hold the power/boot button while replugging if it is cabled but running — and moves on by itself the moment the device shows up in bootloader mode.
+Pick **Set up my macropad**. The TUI drives the rest end to end. It shows the custom-firmware warning (including that reverting is possible **only** from a backup you take first), watches USB and Bluetooth with a spinner until it finds the device, tells you exactly what to do next based on what it found — swap to a USB cable if it is only on Bluetooth, or reboot it into bootloader mode for you (no button — it sends the firmware a `sys.bootloader` RPC) — and moves on by itself the moment the device shows up in bootloader mode.
 
 Its firmware menu then does the remaining work, greying out anything it cannot do yet and saying why:
 
-- **Back up the stock firmware** — do this first. (`openmicro backup` from the CLI.) It dumps all 4 MiB to `~/.local/share/openmicro/stock-firmware.bin` and is the only route back (`openmicro restore`).
-- **Build firmware from source** — needs the Xtensa toolchain (`cargo install espup && espup install`; details in `firmware/README.md`). Equivalent to `openmicro firmware build`. Read "Where the firmware build stands" below first.
-- **Download prebuilt firmware** — opens a picker listing every published version (`openmicro firmware list` / `openmicro firmware download [--version vX.Y.Z]` from the shell). The images come from `.github/workflows/firmware.yml`, which builds the firmware and attaches `openmicro-fw.bin` whenever you publish a release. No release exists yet, so this stays empty until you cut one — trigger the workflow manually ("Run workflow") first to see whether the firmware actually compiles.
+- **Back up the stock firmware** — do this first. It dumps all 4 MiB to `~/.local/share/openmicro/stock-firmware.bin` and is the only route back (**Firmware → Restore the stock firmware**).
+- **Build firmware from source** — needs the Xtensa toolchain (`cargo install espup && espup install`; details in `firmware/README.md`). Read "Where the firmware build stands" below first.
+- **Download prebuilt firmware** — opens a picker listing every published version. The images come from `.github/workflows/firmware.yml`, which builds the firmware and attaches `openmicro-fw.bin` whenever you publish a release. No release exists yet, so this stays empty until you cut one — trigger the workflow manually ("Run workflow") first to see whether the firmware actually compiles.
 - **Flash the device** — picks the right tool for the image: `espflash` for a from-source ELF, `esptool` for a merged release `.bin`.
 
-Finally it asks which coding agents to wire up, detecting what is installed on this machine and merging the hooks into each agent's own config (backing the previous file up first). `openmicro agents` and `openmicro install-agent --all` do the same from the CLI.
+Finally it asks which coding agents to wire up, detecting what is installed on this machine and merging the hooks into each agent's own config (backing the previous file up first).
 
 After flashing, reset the device, set `transport = "ble"` in `~/.config/openmicro/config.toml`, and start the daemon (`systemctl --user enable --now openmicrod`). Your agent keys should then light up with live state.
 
