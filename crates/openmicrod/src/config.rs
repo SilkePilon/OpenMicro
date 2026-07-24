@@ -17,11 +17,22 @@ pub struct Config {
     pub transport: Transport,
     #[serde(default)]
     pub colors: StateColors,
+    #[serde(default = "default_sleep_minutes")]
+    pub sleep_minutes: u32,
+}
+
+fn default_sleep_minutes() -> u32 {
+    3
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { brightness: 200, transport: Transport::Mock, colors: StateColors::default() }
+        Self {
+            brightness: 200,
+            transport: Transport::Mock,
+            colors: StateColors::default(),
+            sleep_minutes: default_sleep_minutes(),
+        }
     }
 }
 
@@ -124,6 +135,20 @@ mod tests {
         assert_eq!(back.brightness, 55);
         assert_eq!(back.colors.thinking, Rgb { r: 9, g: 8, b: 7 });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sleep_minutes_defaults_to_three() {
+        assert_eq!(Config::from_toml_str("").sleep_minutes, 3);
+        assert_eq!(Config::from_toml_str("brightness = 80").sleep_minutes, 3);
+    }
+
+    #[test]
+    fn sleep_minutes_parses_and_roundtrips() {
+        assert_eq!(Config::from_toml_str("sleep_minutes = 10").sleep_minutes, 10);
+        let cfg = Config { sleep_minutes: 7, ..Default::default() };
+        let back = Config::from_toml_str(&toml::to_string(&cfg).unwrap());
+        assert_eq!(back.sleep_minutes, 7);
     }
 
     #[test]

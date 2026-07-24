@@ -31,11 +31,13 @@ use tokio::sync::Mutex;
 
 use crate::device::DeviceLink;
 use crate::engine::Engine;
+use crate::sleeper::ActivityClock;
 
 pub async fn serve(
     path: std::path::PathBuf,
     engine: Arc<Mutex<Engine>>,
     device: Arc<Mutex<dyn DeviceLink + Send>>,
+    clock: ActivityClock,
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -49,10 +51,12 @@ pub async fn serve(
         };
         let engine = engine.clone();
         let device = device.clone();
+        let clock = clock.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some((agent, session, state)) = parse_line(&line) {
+                    clock.touch();
                     let mut eng = engine.lock().await;
                     let mut dev = device.lock().await;
                     eng.on_event(&agent, &session, state, &mut *dev).await;

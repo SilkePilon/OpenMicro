@@ -61,6 +61,7 @@ impl StateColors {
 pub enum Command {
     SetBrightness(u8),
     SetStateColor { state: AgentState, rgb: Rgb },
+    SetSleepMinutes(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +158,10 @@ mod tests {
         let b = Command::SetBrightness(42);
         let back2: Command = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert_eq!(b, back2);
+
+        let s = Command::SetSleepMinutes(5);
+        let back3: Command = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(s, back3);
     }
 
     #[test]

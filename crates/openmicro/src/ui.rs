@@ -12,17 +12,23 @@ pub const PANEL_STATES: [AgentState; 4] = [
     AgentState::AwaitingApproval,
 ];
 
-/// Local-echo state for the config panel (brightness + per-state color index).
+/// Row index of the sleep-minutes control: after brightness (0) and the four
+/// per-state color rows (1..=4).
+pub const SLEEP_ROW: usize = PANEL_STATES.len() + 1;
+
+/// Local-echo state for the config panel (brightness + per-state color index
+/// + idle-sleep minutes).
 pub struct ConfigUiState {
     pub open: bool,
-    pub selected: usize, // 0 = brightness, 1..=4 = PANEL_STATES
+    pub selected: usize, // 0 = brightness, 1..=4 = PANEL_STATES, 5 = sleep
     pub brightness: u8,
     pub color_idx: [usize; 4],
+    pub sleep_minutes: u32,
 }
 
 impl ConfigUiState {
     pub fn new(brightness: u8) -> Self {
-        Self { open: false, selected: 0, brightness, color_idx: [0; 4] }
+        Self { open: false, selected: 0, brightness, color_idx: [0; 4], sleep_minutes: 3 }
     }
 
     pub fn select_prev(&mut self) {
@@ -32,9 +38,17 @@ impl ConfigUiState {
     }
 
     pub fn select_next(&mut self) {
-        if self.selected < PANEL_STATES.len() {
+        if self.selected < SLEEP_ROW {
             self.selected += 1;
         }
+    }
+}
+
+/// Compact battery label for the dashboard title. `None` renders as an em dash.
+pub fn battery_label(pct: Option<u8>, charging: bool) -> String {
+    match pct {
+        Some(p) => format!("bat {}%{}", p, if charging { "+" } else { "" }),
+        None => "bat \u{2014}".to_string(),
     }
 }
 
@@ -66,7 +80,9 @@ pub fn render(frame: &mut Frame, snap: &SnapshotDto, connected: bool, cfg: &Conf
         .collect();
 
     let hint = if cfg.open { "" } else { "  [c] config  [q] quit" };
-    let title = format!(" OpenMicro — agents  {}{} ", status_label(connected), hint);
+    let bat = battery_label(snap.battery, snap.charging);
+    let title =
+        format!(" OpenMicro — agents  {}  {}{} ", status_label(connected), bat, hint);
     let table = Table::new(rows, [Constraint::Length(4), Constraint::Length(12), Constraint::Min(10)])
         .header(Row::new(vec!["slot", "agent", "state"]).style(Style::default().add_modifier(Modifier::UNDERLINED)))
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -90,7 +106,7 @@ fn state_label(s: AgentState) -> &'static str {
 fn render_config(frame: &mut Frame, cfg: &ConfigUiState) {
     let area = frame.area();
     let w = 44u16.min(area.width.saturating_sub(2));
-    let h = 9u16.min(area.height.saturating_sub(2));
+    let h = 10u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect { x, y, width: w, height: h };
@@ -122,6 +138,11 @@ fn render_config(frame: &mut Frame, cfg: &ConfigUiState) {
             Span::styled(format!(" {},{},{}", rgb.r, rgb.g, rgb.b), sel(i + 1)),
         ]));
     }
+    // Sleep row (index SLEEP_ROW): idle minutes before LED sleep (0 disables).
+    lines.push(Line::styled(
+        format!("{}Sleep (min): {}", marker(SLEEP_ROW), cfg.sleep_minutes),
+        sel(SLEEP_ROW),
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -150,8 +171,15 @@ mod tests {
         for _ in 0..10 {
             c.select_next();
         }
-        assert_eq!(c.selected, PANEL_STATES.len()); // clamped at bottom (4)
+        assert_eq!(c.selected, SLEEP_ROW); // clamped at bottom (sleep row = 5)
         c.select_prev();
-        assert_eq!(c.selected, PANEL_STATES.len() - 1);
+        assert_eq!(c.selected, SLEEP_ROW - 1);
+    }
+
+    #[test]
+    fn battery_label_formats() {
+        assert_eq!(battery_label(Some(84), false), "bat 84%");
+        assert_eq!(battery_label(Some(84), true), "bat 84%+");
+        assert_eq!(battery_label(None, false), "bat \u{2014}");
     }
 }
