@@ -1,6 +1,7 @@
-use serde::Deserialize;
+use openmicro_proto::StateColors;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     #[default]
@@ -8,23 +9,43 @@ pub enum Transport {
     Ble,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub brightness: u8,
     #[serde(default)]
     pub transport: Transport,
+    #[serde(default)]
+    pub colors: StateColors,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { brightness: 200, transport: Transport::Mock }
+        Self { brightness: 200, transport: Transport::Mock, colors: StateColors::default() }
     }
 }
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Config {
         toml::from_str(s).unwrap_or_default()
+    }
+
+    /// Serialize to TOML and write atomically: write to a temp file in the same
+    /// directory, then rename over the target (rename is atomic on the same fs).
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(&default_path())
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let body = toml::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, body.as_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 
@@ -70,6 +91,35 @@ mod tests {
     fn transport_defaults_to_mock() {
         assert_eq!(Config::from_toml_str("").transport, Transport::Mock);
         assert_eq!(Config::from_toml_str("brightness = 80").transport, Transport::Mock);
+    }
+
+    #[test]
+    fn config_with_colors_roundtrips() {
+        use openmicro_proto::Rgb;
+        let mut cfg = Config::default();
+        cfg.brightness = 77;
+        cfg.colors.working = Rgb { r: 1, g: 2, b: 3 };
+        let toml = toml::to_string(&cfg).unwrap();
+        let back = Config::from_toml_str(&toml);
+        assert_eq!(back.brightness, 77);
+        assert_eq!(back.colors.working, Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(back.colors.idle, cfg.colors.idle);
+    }
+
+    #[test]
+    fn save_to_writes_file() {
+        use openmicro_proto::Rgb;
+        let dir = std::env::temp_dir().join(format!("omtest-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config::default();
+        cfg.brightness = 55;
+        cfg.colors.thinking = Rgb { r: 9, g: 8, b: 7 };
+        cfg.save_to(&path).unwrap();
+        let back = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(back.brightness, 55);
+        assert_eq!(back.colors.thinking, Rgb { r: 9, g: 8, b: 7 });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
