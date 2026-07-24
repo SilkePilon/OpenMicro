@@ -21,3 +21,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.28"
 crossterm = "0.28"
+async-trait = "0.1"

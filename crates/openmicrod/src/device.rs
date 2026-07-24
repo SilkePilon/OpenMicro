@@ -1,7 +1,9 @@
+use async_trait::async_trait;
 use openmicro_proto::LedFrame;
 
+#[async_trait]
 pub trait DeviceLink: Send {
-    fn set_leds(&mut self, frame: &LedFrame);
+    async fn set_leds(&mut self, frame: &LedFrame);
     fn last_frame(&self) -> LedFrame;
 }
 
@@ -17,8 +19,9 @@ impl MockDevice {
     }
 }
 
+#[async_trait]
 impl DeviceLink for MockDevice {
-    fn set_leds(&mut self, frame: &LedFrame) {
+    async fn set_leds(&mut self, frame: &LedFrame) {
         self.last = *frame;
         self.writes += 1;
     }

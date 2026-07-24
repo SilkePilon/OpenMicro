@@ -44,7 +44,7 @@ impl Engine {
         }
     }
 
-    pub fn on_event(
+    pub async fn on_event(
         &mut self,
         agent: &str,
         session: &str,
@@ -53,10 +53,10 @@ impl Engine {
     ) {
         let key = self.store.update(agent, session, state);
         self.mapping.assign(&key);
-        self.rerender(device);
+        self.rerender(device).await;
     }
 
-    fn rerender(&self, device: &mut dyn DeviceLink) {
+    async fn rerender(&self, device: &mut dyn DeviceLink) {
         // v1: each mapped agent has its own key, so every mapped slot is lit
         // with its own state. Focus/owner drives input routing + TUI highlight
         // (see control.rs), not which keys light.
@@ -67,7 +67,7 @@ impl Engine {
             }
         }
         let frame = render_frame(&slots, self.brightness);
-        device.set_leds(&frame);
+        device.set_leds(&frame).await;
     }
 }
 
@@ -77,23 +77,23 @@ mod tests {
     use crate::device::MockDevice;
     use openmicro_proto::Rgb;
 
-    #[test]
-    fn hook_event_lights_the_assigned_slot() {
+    #[tokio::test]
+    async fn hook_event_lights_the_assigned_slot() {
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
-        engine.on_event("claude", "s1", AgentState::Working, &mut dev);
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
         // claude:s1 got slot 0.
         assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 });
         assert_eq!(dev.writes, 1);
     }
 
-    #[test]
-    fn two_agents_get_distinct_slots() {
+    #[tokio::test]
+    async fn two_agents_get_distinct_slots() {
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
-        engine.on_event("claude", "s1", AgentState::Working, &mut dev);
-        engine.on_event("codex", "s2", AgentState::Thinking, &mut dev);
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        engine.on_event("codex", "s2", AgentState::Thinking, &mut dev).await;
         let frame = dev.last_frame();
         assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 }); // working
         assert_eq!(frame.slots[1].color, Rgb { r: 40, g: 90, b: 255 }); // thinking

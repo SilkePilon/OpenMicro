@@ -49,7 +49,7 @@ pub async fn serve(
                 if let Some((agent, session, state)) = parse_line(&line) {
                     let mut eng = engine.lock().await;
                     let mut dev = device.lock().await;
-                    eng.on_event(&agent, &session, state, &mut *dev);
+                    eng.on_event(&agent, &session, state, &mut *dev).await;
                 }
             }
         });

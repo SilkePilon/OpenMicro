@@ -50,11 +50,11 @@ mod tests {
     use crate::device::MockDevice;
     use openmicro_proto::AgentState;
 
-    #[test]
-    fn snapshot_reflects_engine() {
+    #[tokio::test]
+    async fn snapshot_reflects_engine() {
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
-        engine.on_event("claude", "s1", AgentState::AwaitingApproval, &mut dev);
+        engine.on_event("claude", "s1", AgentState::AwaitingApproval, &mut dev).await;
         let snap = snapshot(&engine);
         assert_eq!(snap.sessions.len(), 1);
         assert_eq!(snap.sessions[0].agent, "claude");
