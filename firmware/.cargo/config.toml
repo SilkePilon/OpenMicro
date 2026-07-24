@@ -1,10 +1,15 @@
 # ESP32-S3 is Xtensa, not RISC-V, so it needs the espup-installed Xtensa
-# Rust fork (see ../README.md) rather than upstream rustc. This file is
-# structural only — it has never been exercised by an actual build here
-# (no toolchain installed).
+# Rust fork (see ../README.md) rather than upstream rustc.
 
 [build]
 target = "xtensa-esp32s3-none-elf"
+
+# The espup toolchain ships `rust-src` but no *precompiled* core/alloc for the
+# Xtensa targets — its lib/rustlib holds only the host triple — so both are
+# built from source. Without this, every build dies at the first `no_std`
+# dependency with "error[E0463]: can't find crate for `core`".
+[unstable]
+build-std = ["core", "alloc"]
 
 [target.xtensa-esp32s3-none-elf]
 # `espflash` doubles as both the cargo runner (flash + open a serial
