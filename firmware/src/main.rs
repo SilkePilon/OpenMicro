@@ -83,8 +83,15 @@ static BATTERY_CHANNEL: Channel<CriticalSectionRawMutex, Battery, 1> = Channel::
 /// once real memory pressure is measured on hardware.
 const HEAP_SIZE: usize = 64 * 1024;
 
-/// Adapts esp-hal's blocking SPI master to `leds::SpiOut`.
-struct SpiWriter(esp_hal::spi::master::Spi<'static, esp_hal::Blocking>);
+/// Adapts esp-hal's DMA-backed SPI master to `leds::SpiOut`.
+///
+/// DMA is not an optimisation here, it is a correctness requirement. Without
+/// it the transfer is capped at the SPI FIFO (64 bytes on the S3) and a frame
+/// of 137 bytes is split into chunks; the gaps between chunks interrupt the
+/// continuous bitstream WS2812 needs, and the strip either latches mid-frame
+/// or ignores the lot. The vendor firmware sets `flags.with_dma = 1` on both
+/// chains for the same reason.
+struct SpiWriter(esp_hal::spi::master::SpiDmaBus<'static, esp_hal::Blocking>);
 
 impl leds::SpiOut for SpiWriter {
     fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
@@ -111,7 +118,14 @@ impl leds::SpiOut for SpiWriter {
 /// No MISO, no chip select: a WS2812 chain is write-only and has no select
 /// line — the data pin is the entire bus.
 macro_rules! ws2812_spi {
-    ($peri:expr, $pin:expr) => {
+    ($peri:expr, $pin:expr, $dma:expr) => {{
+        // Both directions sized: a zero-length RX buffer is rejected at
+        // construction, and the resulting panic looks exactly like the
+        // firmware never booting.
+        let (rx_buf, rx_desc, tx_buf, tx_desc) =
+            esp_hal::dma_buffers!(openmicro_effects::ws2812::buffer_len(pins::LED_COUNT));
+        let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_desc, rx_buf).expect("dma rx");
+        let dma_tx = esp_hal::dma::DmaTxBuf::new(tx_desc, tx_buf).expect("dma tx");
         SpiWriter(
             esp_hal::spi::master::Spi::new(
                 $peri,
@@ -122,9 +136,11 @@ macro_rules! ws2812_spi {
                     .with_mode(esp_hal::spi::Mode::_0),
             )
             .expect("SPI init")
-            .with_mosi($pin),
+            .with_mosi($pin)
+            .with_dma($dma)
+            .with_buffers(dma_rx, dma_tx),
         )
-    };
+    }};
 }
 
 #[esp_rtos::main]
@@ -180,8 +196,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
     spawner.spawn(
         led_render_task(
-            ws2812_spi!(peripherals.SPI2, peripherals.GPIO7),
-            ws2812_spi!(peripherals.SPI3, peripherals.GPIO6),
+            ws2812_spi!(peripherals.SPI2, peripherals.GPIO7, peripherals.DMA_CH0),
+            ws2812_spi!(peripherals.SPI3, peripherals.GPIO6, peripherals.DMA_CH1),
         )
         .expect("led_render_task token"),
     );
