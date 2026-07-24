@@ -55,6 +55,17 @@ jobs:
       - name: Install espflash
         run: cargo install espflash --locked
 
+      # Printed on every run: when a build fails with "can't find crate for
+      # `core`", this is the difference between a missing target and a wrong
+      # toolchain, and it costs a second.
+      - name: Toolchain report
+        working-directory: firmware
+        run: |
+          rustup toolchain list
+          rustup show
+          rustc --print target-list | grep xtensa || echo "NO XTENSA TARGETS"
+          ls ~/.rustup/toolchains/esp/lib/rustlib/ || true
+
       - name: Build firmware
         working-directory: firmware
         run: cargo build --release

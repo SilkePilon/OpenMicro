@@ -24,10 +24,10 @@ coding agent  ──hook──▶  openmicro-hook  ──▶  openmicrod  ──
 
 Three binaries:
 
-| | |
-| --- | --- |
-| `openmicrod` | The daemon. Tracks session state, drives the LEDs, routes key presses back. |
-| `openmicro` | What you run. No arguments opens the TUI; with a subcommand it's a CLI. |
+|                    |                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------ |
+| `openmicrod`     | The daemon. Tracks session state, drives the LEDs, routes key presses back.                      |
+| `openmicro`      | What you run. No arguments opens the TUI; with a subcommand it's a CLI.                          |
 | `openmicro-hook` | A tiny shim your agent calls on each state change. Always exits 0, so it can't break your agent. |
 
 Four states, and that's the whole vocabulary: `idle`, `thinking`, `working`,
@@ -80,22 +80,22 @@ partway through. Every step is skippable, and `openmicro setup` reopens it.
 Run `openmicro` for the dashboard: one row per live session, the focused one in
 yellow, battery in the title bar.
 
-| Key | |
-| --- | --- |
+| Key   |                                                                                                    |
+| ----- | -------------------------------------------------------------------------------------------------- |
 | `c` | Config panel: brightness, per-state colours, idle-sleep timeout. Changes apply live and are saved. |
-| `f` | Flash screen. |
-| `s` | Reopen the setup wizard. |
-| `q` | Quit. |
+| `f` | Flash screen.                                                                                      |
+| `s` | Reopen the setup wizard.                                                                           |
+| `q` | Quit.                                                                                              |
 
 ## Agents
 
 Each supported agent has an adapter in [`adapters/`](adapters/).
 
-| Agent | Mechanism |
-| --- | --- |
+| Agent                                         | Mechanism                            |
+| --------------------------------------------- | ------------------------------------ |
 | [Claude Code](adapters/claude-code/install.md) | Lifecycle hooks, event JSON on stdin |
-| [Codex CLI](adapters/codex/install.md) | The `notify` program |
-| [Grok Code](adapters/grok-code/install.md) | Claude-compatible hooks |
+| [Codex CLI](adapters/codex/install.md)         | The`notify` program                |
+| [Grok Code](adapters/grok-code/install.md)     | Claude-compatible hooks              |
 
 The wizard installs them, or from the shell:
 
@@ -130,7 +130,7 @@ and encoder and joystick scanning.
 Two things are still outstanding. Every physical pin is a `// TODO(pinout):`
 placeholder, because the Creator Micro 2's GPIO assignments aren't public — see
 [the research notes](docs/hardware/creator-micro-2-pinout-research.md) and
-[what's left](docs/hardware/NEXT-STEPS.md). And it has never been compiled, so
+[what&#39;s left](docs/hardware/NEXT-STEPS.md). And it has never been compiled, so
 expect the first build to need fixes in the hardware glue. The LED effect code
 ([`crates/openmicro-effects`](crates/openmicro-effects)) is shared with the host
 and is already tested, so that part isn't where the bugs will be.
