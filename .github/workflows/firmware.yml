@@ -19,10 +19,17 @@ on:
 permissions:
   contents: write # needed to attach assets to the release
 
+# Editing a release re-fires `published`; without this, two runs would race to
+# upload the same asset.
+concurrency:
+  group: firmware-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build and attach openmicro-fw.bin
     runs-on: ubuntu-latest
+    timeout-minutes: 45 # a cold Xtensa toolchain install is slow, but not this slow
 
     steps:
       - uses: actions/checkout@v4
