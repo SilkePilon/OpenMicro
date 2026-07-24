@@ -300,3 +300,53 @@ value/string it points at. The vendor left full assert strings in
 (`gpio_isr_handler_add(static_cast<gpio_num_t>(PIN_ENC_A), …)`), so each pin's
 `gpio_config` bitmask sits a few instructions away from an assert that names the
 exact `PIN_*` macro — turning raw immediates into labelled, high-confidence pins.
+
+---
+
+## Bring-up log: the LEDs (2026-07-25)
+
+A closed-loop rig was used for this: flash, capture a webcam frame, measure the
+mean RGB of the keypad region, repeat. It removes the "does it look lit?"
+ambiguity entirely.
+
+**Control experiment — the vendor firmware on the same board, same camera:**
+
+| Firmware | Keypad region mean RGB |
+| --- | --- |
+| Work Louder v0.6.0-rc.6 | ~(95, 92, 104) — bright, visibly cycling |
+| OpenMicro (SPI + DMA) | ~(12, 11, 12) — flat across 8 frames, no change |
+
+So the LEDs, the chains, the power gate and the wiring are all fine. Whatever is
+wrong is in our output path, not the hardware. That is worth stating plainly,
+because three earlier hypotheses were about the hardware and all three were
+wrong.
+
+**What has been fixed and verified along the way**
+
+- The upper PCB is power-gated behind GPIO36/37/38, and the vendor drives them
+  `37=1, 36=0, 38=1` — *not* all high. Without this the chains have no supply.
+- The encoding now matches ESP-IDF's `led_strip` SPI backend exactly (2.5 MHz,
+  three SPI bits per LED bit, `100`/`110`), rather than an invented in-spec one.
+- The vendor sets `flags.with_dma = 1`; without DMA a 137-byte frame exceeds the
+  64-byte SPI FIFO and is chunked, breaking the continuous bitstream.
+- Colour order is GRB with three components, decoded from their
+  `led_color_component_format_t`. This we already had right.
+
+**Still not lighting, and what is ruled out**
+
+The render loop runs (a 2 s serial heartbeat proves it), the SPI writes return
+`Ok` (failures are now reported rather than swallowed), and the frame content is
+correct (host-tested). So the fault is between the SPI peripheral and the LED
+data pin.
+
+**Next thing to try: RMT instead of SPI.** RMT is the peripheral built for this
+and states its timing in nanoseconds rather than smuggling it through a clock
+divider and a bit pattern. An attempt was started and reverted — esp-hal 1.1's
+`Channel` type parameters and the `TxChannelCreator` trait import did not match
+the doc example, and guessing at the API blind was not converging. Worth 20
+minutes with the real rustdoc for esp-hal 1.1.1 open.
+
+Failing that, the remaining SPI-side suspects are the clock source (the vendor
+passes `clk_src = 4`, which may not be what esp-hal's default resolves to, so
+the real output rate may not be 2.5 MHz) and whether esp-hal drives MOSI at all
+without an assigned SCK pin.
