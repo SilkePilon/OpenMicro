@@ -42,11 +42,11 @@ pub const UNDERGLOW_BUF_LEN: usize = ws2812::buffer_len(pins::UNDERGLOW_LED_COUN
 /// Abstracted so the render logic does not name esp-hal's SPI type, which is
 /// parameterised by peripheral instance and DMA channel. `main.rs` supplies
 /// the real implementation for each of the two hosts.
-pub trait SpiOut {
-    /// Write every byte. Errors are dropped by callers: a lost LED frame is
+pub trait PixelOut {
+    /// Push a whole frame. Errors are dropped by callers: a lost frame is
     /// replaced by the next one 16 ms later, and there is nothing useful to do
     /// about it on a device with no display.
-    fn write(&mut self, bytes: &[u8]) -> Result<(), ()>;
+    fn write_pixels(&mut self, pixels: &[Rgb]) -> Result<(), ()>;
 }
 
 /// Which physical LED in the per-key chain shows a given agent slot.
@@ -62,17 +62,15 @@ fn slot_to_chain_index(slot: usize) -> usize {
 
 /// The per-key chain: agent state, one LED per key.
 pub struct PerKeyChain<S> {
-    spi: S,
+    out: S,
     pixels: [Rgb; pins::PER_KEY_LED_COUNT],
-    encoded: [u8; PER_KEY_BUF_LEN],
 }
 
-impl<S: SpiOut> PerKeyChain<S> {
-    pub fn new(spi: S) -> Self {
+impl<S: PixelOut> PerKeyChain<S> {
+    pub fn new(out: S) -> Self {
         Self {
-            spi,
+            out,
             pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT],
-            encoded: [0; PER_KEY_BUF_LEN],
         }
     }
 
@@ -89,9 +87,7 @@ impl<S: SpiOut> PerKeyChain<S> {
 
     /// Encode the current pixels and write them.
     fn flush(&mut self) {
-        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
-            let _ = self.spi.write(&self.encoded);
-        }
+        let _ = self.out.write_pixels(&self.pixels);
     }
 
     /// Draw one frame of the boot animation.
@@ -112,26 +108,22 @@ impl<S: SpiOut> PerKeyChain<S> {
 /// Separate type rather than a generic over length, because it is a different
 /// SPI host and a different concept — it shows device state, not agent state.
 pub struct UnderglowChain<S> {
-    spi: S,
+    out: S,
     pixels: [Rgb; pins::UNDERGLOW_LED_COUNT],
-    encoded: [u8; UNDERGLOW_BUF_LEN],
 }
 
-impl<S: SpiOut> UnderglowChain<S> {
-    pub fn new(spi: S) -> Self {
+impl<S: PixelOut> UnderglowChain<S> {
+    pub fn new(out: S) -> Self {
         Self {
-            spi,
+            out,
             pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::UNDERGLOW_LED_COUNT],
-            encoded: [0; UNDERGLOW_BUF_LEN],
         }
     }
 
     /// Paint the whole chain one colour.
     pub fn set(&mut self, colour: Rgb) {
         self.pixels = [colour; pins::UNDERGLOW_LED_COUNT];
-        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
-            let _ = self.spi.write(&self.encoded);
-        }
+        let _ = self.out.write_pixels(&self.pixels);
     }
 
     pub fn blank(&mut self) {
@@ -141,9 +133,7 @@ impl<S: SpiOut> UnderglowChain<S> {
     /// Draw one frame of the boot animation.
     pub fn render_startup(&mut self, t_ms: u32) {
         openmicro_effects::startup::frame(t_ms, &mut self.pixels);
-        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
-            let _ = self.spi.write(&self.encoded);
-        }
+        let _ = self.out.write_pixels(&self.pixels);
     }
 
     /// A slow breath, shown once the boot animation is over.

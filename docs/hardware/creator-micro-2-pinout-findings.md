@@ -350,3 +350,37 @@ Failing that, the remaining SPI-side suspects are the clock source (the vendor
 passes `clk_src = 4`, which may not be what esp-hal's default resolves to, so
 the real output rate may not be 2.5 MHz) and whether esp-hal drives MOSI at all
 without an assigned SCK pin.
+
+### Elimination log — still not lighting
+
+Measured with the webcam rig (keypad-region mean RGB): vendor ~(95,92,104),
+ours ~(13,12,13) flat.
+
+Ruled out, each with evidence:
+
+| Hypothesis | Why it is not the cause |
+| --- | --- |
+| Firmware not running | 2 s serial heartbeat from inside the render loop |
+| Frame content wrong | encoder is host-tested; matches IDF byte-for-byte |
+| Encoding scheme wrong | IDF's `__led_strip_spi_bit` decoded from source: MSB-first, 3 SPI bits per colour bit, `100`/`110`. Identical to ours (a zero byte is `0x92,0x49,0x24` in both) |
+| Clock wrong | vendor image stores `0x2625A0` = 2 500 000 Hz; we request the same |
+| Missing DMA | added; vendor sets `flags.with_dma = 1` |
+| Colour order | GRB, decoded from their `led_color_component_format_t` |
+| SPI peripheral misconfigured | **RMT was tried as a completely independent path and is equally dark** |
+| Power-gate pins released when `main` returns | `Output` guards now leaked with `mem::forget`; still dark |
+
+That RMT and SPI fail identically is the most informative result: two unrelated
+peripherals cannot both be generating a bad waveform, so the signal almost
+certainly never reaches the LEDs.
+
+**Where to look next**, in order:
+
+1. Something else in the vendor's init enables the LED rail. `init_charge_enable_gpio`
+   (GPIO44, inferred) and the top-board sequencing are untested; there may also be
+   a load switch behind the MAX77972 on I2C.
+2. Whether GPIO7/GPIO6 are the data lines on *this* board revision. They are
+   CONFIRMED from the image, but confirming against the PCB with a scope would
+   settle it — probe GPIO7 while running, and compare with the vendor firmware
+   running. If the vendor toggles it and we do not, the pin is not being driven;
+   if both toggle, the fault is downstream.
+3. Whether the vendor's `make_strip` runs *after* something that we do first.

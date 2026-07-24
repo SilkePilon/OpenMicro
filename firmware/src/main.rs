@@ -55,8 +55,10 @@ mod pins;
 use esp_backtrace as _;
 
 use embassy_executor::Spawner;
+use esp_hal::rmt::TxChannelCreator;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use openmicro_effects::Rgb;
 use openmicro_proto::{Battery, InputEvent, LedFrame};
 use static_cell::StaticCell;
 
@@ -83,65 +85,92 @@ static BATTERY_CHANNEL: Channel<CriticalSectionRawMutex, Battery, 1> = Channel::
 /// once real memory pressure is measured on hardware.
 const HEAP_SIZE: usize = 64 * 1024;
 
-/// Adapts esp-hal's DMA-backed SPI master to `leds::SpiOut`.
+/// Drives one WS2812 chain from an RMT channel.
 ///
-/// DMA is not an optimisation here, it is a correctness requirement. Without
-/// it the transfer is capped at the SPI FIFO (64 bytes on the S3) and a frame
-/// of 137 bytes is split into chunks; the gaps between chunks interrupt the
-/// continuous bitstream WS2812 needs, and the strip either latches mid-frame
-/// or ignores the lot. The vendor firmware sets `flags.with_dma = 1` on both
-/// chains for the same reason.
-struct SpiWriter(esp_hal::spi::master::SpiDmaBus<'static, esp_hal::Blocking>);
+/// RMT rather than SPI. The SPI path was matched to ESP-IDF's `led_strip`
+/// backend exactly — same 2.5 MHz clock, same three-SPI-bits-per-LED-bit
+/// `100`/`110` encoding, same GRB order, same DMA — and it accepted every
+/// transfer without error while lighting nothing, on a board where the vendor
+/// firmware lights the same chains happily. RMT is the peripheral built for
+/// this: the timing is stated in nanoseconds rather than smuggled through a
+/// clock divider and a bit pattern.
+struct RmtWriter<const N: usize> {
+    channel: Option<esp_hal::rmt::Channel<'static, esp_hal::Blocking, esp_hal::rmt::Tx>>,
+    codes: [esp_hal::rmt::PulseCode; N],
+}
 
-impl leds::SpiOut for SpiWriter {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        match embedded_hal::spi::SpiBus::write(&mut self.0, bytes) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Loudly, and only once: a silently dropped write is
-                // indistinguishable from LEDs that are not wired up, and that
-                // ambiguity has already cost an evening.
-                use core::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED: AtomicBool = AtomicBool::new(false);
-                if !REPORTED.swap(true, Ordering::Relaxed) {
-                    esp_println::println!("SPI write failed: {:?} ({} bytes)", e, bytes.len());
+/// RMT ticks for a duration in nanoseconds, at 80 MHz with divider 1 (12.5 ns
+/// per tick). Written as a divide so the constants below stay in nanoseconds.
+const fn ticks(ns: u32) -> u16 {
+    (ns * 8 / 100) as u16
+}
+
+// WS2812B datasheet intervals.
+const T0H: u16 = ticks(400);
+const T0L: u16 = ticks(850);
+const T1H: u16 = ticks(800);
+const T1L: u16 = ticks(450);
+
+impl<const N: usize> RmtWriter<N> {
+    fn new(channel: esp_hal::rmt::Channel<'static, esp_hal::Blocking, esp_hal::rmt::Tx>) -> Self {
+        Self {
+            channel: Some(channel),
+            codes: [esp_hal::rmt::PulseCode(0); N],
+        }
+    }
+}
+
+impl<const N: usize> leds::PixelOut for RmtWriter<N> {
+    fn write_pixels(&mut self, pixels: &[Rgb]) -> Result<(), ()> {
+        use esp_hal::gpio::Level;
+        use esp_hal::rmt::PulseCode;
+
+        let needed = pixels.len() * 24 + 1;
+        if needed > N {
+            return Err(());
+        }
+        let mut at = 0;
+        for px in pixels {
+            // Wire order is green, red, blue.
+            for byte in [px.g, px.r, px.b] {
+                for bit in (0..8).rev() {
+                    self.codes[at] = if (byte >> bit) & 1 == 1 {
+                        PulseCode::new(Level::High, T1H, Level::Low, T1L)
+                    } else {
+                        PulseCode::new(Level::High, T0H, Level::Low, T0L)
+                    };
+                    at += 1;
                 }
+            }
+        }
+        // An all-zero code ends the sequence; the channel is configured to idle
+        // low, so the line then holds down and that is the inter-frame latch.
+        self.codes[at] = PulseCode(0);
+
+        let channel = self.channel.take().ok_or(())?;
+        match channel.transmit(&self.codes[..=at]) {
+            Ok(tx) => match tx.wait() {
+                Ok(ch) => {
+                    self.channel = Some(ch);
+                    Ok(())
+                }
+                Err((_, ch)) => {
+                    self.channel = Some(ch);
+                    Err(())
+                }
+            },
+            Err((_, ch)) => {
+                self.channel = Some(ch);
                 Err(())
             }
         }
     }
 }
 
-/// Build one WS2812 SPI host: MOSI is the LED data line, and the clock is
-/// fixed by the bit encoding (see `openmicro_effects::ws2812`).
-///
-/// No MISO, no chip select: a WS2812 chain is write-only and has no select
-/// line — the data pin is the entire bus.
-macro_rules! ws2812_spi {
-    ($peri:expr, $pin:expr, $dma:expr) => {{
-        // Both directions sized: a zero-length RX buffer is rejected at
-        // construction, and the resulting panic looks exactly like the
-        // firmware never booting.
-        let (rx_buf, rx_desc, tx_buf, tx_desc) =
-            esp_hal::dma_buffers!(openmicro_effects::ws2812::buffer_len(pins::LED_COUNT));
-        let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_desc, rx_buf).expect("dma rx");
-        let dma_tx = esp_hal::dma::DmaTxBuf::new(tx_desc, tx_buf).expect("dma tx");
-        SpiWriter(
-            esp_hal::spi::master::Spi::new(
-                $peri,
-                esp_hal::spi::master::Config::default()
-                    .with_frequency(esp_hal::time::Rate::from_hz(
-                        openmicro_effects::ws2812::SPI_HZ,
-                    ))
-                    .with_mode(esp_hal::spi::Mode::_0),
-            )
-            .expect("SPI init")
-            .with_mosi($pin)
-            .with_dma($dma)
-            .with_buffers(dma_rx, dma_tx),
-        )
-    }};
-}
+/// Per-key chain pulse-code buffer length.
+const PER_KEY_CODES: usize = pins::PER_KEY_LED_COUNT * 24 + 1;
+/// Underglow chain pulse-code buffer length.
+const UNDERGLOW_CODES: usize = pins::UNDERGLOW_LED_COUNT * 24 + 1;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -188,6 +217,28 @@ async fn main(spawner: Spawner) {
         esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default())
             .expect("BLE controller init");
 
+    // Two RMT channels, one per chain. 80 MHz with divider 1 gives 12.5 ns
+    // ticks, which resolves every WS2812 interval exactly.
+    let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
+        .expect("rmt init");
+    let rmt_cfg = esp_hal::rmt::TxChannelConfig::default()
+        .with_clk_divider(1)
+        .with_idle_output_level(esp_hal::gpio::Level::Low)
+        .with_idle_output(true)
+        .with_carrier_modulation(false);
+    let per_key_leds: RmtWriter<PER_KEY_CODES> = RmtWriter::new(
+        rmt.channel0
+            .configure_tx(&rmt_cfg)
+            .expect("rmt ch0")
+            .with_pin(peripherals.GPIO7),
+    );
+    let underglow_leds: RmtWriter<UNDERGLOW_CODES> = RmtWriter::new(
+        rmt.channel1
+            .configure_tx(&rmt_cfg)
+            .expect("rmt ch1")
+            .with_pin(peripherals.GPIO6),
+    );
+
     // embassy-executor 0.10 reshaped this: `#[task]` functions now return
     // `Result<SpawnToken, SpawnError>` and `Spawner::spawn` takes the token and
     // returns `()`. The only failure is the task's pool being exhausted, which
@@ -196,8 +247,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
     spawner.spawn(
         led_render_task(
-            ws2812_spi!(peripherals.SPI2, peripherals.GPIO7, peripherals.DMA_CH0),
-            ws2812_spi!(peripherals.SPI3, peripherals.GPIO6, peripherals.DMA_CH1),
+            per_key_leds,
+            underglow_leds,
         )
         .expect("led_render_task token"),
     );
@@ -222,7 +273,13 @@ async fn main(spawner: Spawner) {
             esp_hal::gpio::OutputConfig::default(),
         ),
     ];
-    esp_println::println!("top board powered");
+    // Deliberately leaked. `Output` is a guard: dropping it releases the GPIO,
+    // and `main` returns as soon as the tasks are spawned — which would cut
+    // power to the upper board before a single LED frame is drawn. That is
+    // exactly the failure this chased for hours, with both SPI and RMT
+    // faithfully clocking data into an unpowered board.
+    core::mem::forget(_top_board_power);
+    esp_println::println!("top board powered (held)");
 
     // ADC1 specifically: ADC2 is unusable while the radio is running, and this
     // firmware keeps BLE up continuously.
@@ -328,7 +385,7 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
 }
 
 #[embassy_executor::task]
-async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
+async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter<UNDERGLOW_CODES>) {
     log::info!(
         "leds: per-key {} on GPIO{}, underglow {} on GPIO{}",
         pins::PER_KEY_LED_COUNT,
