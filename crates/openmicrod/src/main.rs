@@ -12,6 +12,7 @@ mod sleeper;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use config::Transport;
 use device::MockDevice;
@@ -64,12 +65,19 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
+    // Every long-running background task is collected into one JoinSet so a
+    // panic or early exit in ANY of them — not just ingress/control — is
+    // surfaced (logged) instead of silently vanishing. Each task is tagged
+    // with a name so the log line says which one ended.
+    let mut tasks: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
+
     // Drain battery readings into the shared latest-value cell.
     let battery_store = battery.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(b) = battery_rx.recv().await {
             *battery_store.lock().await = Some(b);
         }
+        ("battery-drain", Ok(()))
     });
 
     // Route device input events into the engine. To respect the engine->device
@@ -79,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let engine_in = engine.clone();
     let device_in = device.clone();
     let clock_in = clock.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(ev) = input_rx.recv().await {
             clock_in.touch();
             let maybe_action = {
@@ -98,23 +106,63 @@ async fn main() -> anyhow::Result<()> {
                 eng.apply_action(act, &mut *dev).await;
             }
         }
+        ("input-routing", Ok(()))
     });
 
     let rt = runtime_dir();
     let hook_path = rt.join("openmicro.sock");
     let ctl_path = rt.join("openmicro-ctl.sock");
 
-    let ingress =
-        tokio::spawn(ingress::serve(hook_path, engine.clone(), device.clone(), clock.clone()));
-    let control =
-        tokio::spawn(control::serve(ctl_path, engine.clone(), device.clone(), battery.clone()));
-    tokio::spawn(sleeper::serve(clock.clone(), engine.clone(), device.clone()));
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let clock = clock.clone();
+        tasks.spawn(async move { ("ingress", ingress::serve(hook_path, engine, device, clock).await) });
+    }
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let battery = battery.clone();
+        tasks.spawn(async move { ("control", control::serve(ctl_path, engine, device, battery).await) });
+    }
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let clock = clock.clone();
+        tasks.spawn(async move {
+            sleeper::serve(clock, engine, device).await;
+            ("sleeper", Ok(()))
+        });
+    }
 
     println!("openmicrod running (transport: {:?}). Ctrl-C to stop.", cfg.transport);
-    tokio::select! {
-        r = ingress => { r??; }
-        r = control => { r??; }
-        _ = tokio::signal::ctrl_c() => {}
+    loop {
+        tokio::select! {
+            res = tasks.join_next() => {
+                match res {
+                    Some(Ok((name, Ok(())))) => {
+                        eprintln!("openmicrod: task '{name}' exited");
+                    }
+                    Some(Ok((name, Err(e)))) => {
+                        eprintln!("openmicrod: task '{name}' exited with error: {e}");
+                    }
+                    Some(Err(join_err)) => {
+                        eprintln!("openmicrod: a background task panicked: {join_err}");
+                    }
+                    None => {
+                        // Every task has now exited (ingress/control never return
+                        // in normal operation, so this means every task hit an
+                        // error/panic already logged above): nothing left to do.
+                        eprintln!("openmicrod: all background tasks have exited; shutting down.");
+                        break;
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("openmicrod: received Ctrl-C, shutting down.");
+                break;
+            }
+        }
     }
     Ok(())
 }
