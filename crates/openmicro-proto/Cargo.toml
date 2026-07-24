@@ -10,3 +10,6 @@ std = ["serde/std", "postcard/use-std"]
 [dependencies]
 serde = { workspace = true }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
