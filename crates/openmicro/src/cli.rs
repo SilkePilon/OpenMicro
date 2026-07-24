@@ -38,8 +38,15 @@ pub enum Commands {
         /// Which agent adapter to set up.
         agent: AgentName,
     },
-    /// Flash device firmware (implemented in P6).
-    Flash,
+    /// Flash device firmware to a Micro 2 in bootloader mode.
+    Flash {
+        /// Path to the flashable image (defaults to the firmware build output).
+        #[arg(long)]
+        image: Option<std::path::PathBuf>,
+        /// Serial port to flash over (e.g. /dev/ttyACM0); auto-detected if omitted.
+        #[arg(long)]
+        port: Option<String>,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,9 +101,22 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Status => run_status(),
         Commands::Service { action } => run_service(action),
         Commands::InstallAgent { agent } => run_install_agent(agent),
-        Commands::Flash => {
-            println!("firmware flashing: see `openmicro flash` in P6 / docs");
+        Commands::Flash { image, port } => run_flash(image.as_deref(), port.as_deref()),
+    }
+}
+
+/// Run the firmware flash. Prints the actionable guidance and exits non-zero on
+/// the common "no image / no esptool / not in bootloader" prerequisites — it
+/// never claims success it did not perform.
+fn run_flash(image: Option<&std::path::Path>, port: Option<&str>) -> anyhow::Result<()> {
+    match crate::flash::flash(image, port) {
+        Ok(()) => {
+            println!("flash complete.");
             Ok(())
+        }
+        Err(msg) => {
+            eprintln!("cannot flash: {msg}");
+            std::process::exit(1);
         }
     }
 }
@@ -217,6 +237,27 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Commands::InstallAgent { agent: AgentName::Claude })
+        );
+    }
+
+    #[test]
+    fn parses_flash_bare() {
+        let cli = Cli::try_parse_from(["openmicro", "flash"]).unwrap();
+        assert_eq!(cli.command, Some(Commands::Flash { image: None, port: None }));
+    }
+
+    #[test]
+    fn parses_flash_with_image_and_port() {
+        let cli = Cli::try_parse_from([
+            "openmicro", "flash", "--image", "/tmp/fw.bin", "--port", "/dev/ttyACM0",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Flash {
+                image: Some(std::path::PathBuf::from("/tmp/fw.bin")),
+                port: Some("/dev/ttyACM0".to_string()),
+            })
         );
     }
 
