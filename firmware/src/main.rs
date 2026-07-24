@@ -141,10 +141,14 @@ async fn ble_task(controller: esp_radio::ble::controller::BleConnector<'static>)
 
 #[embassy_executor::task]
 async fn led_render_task() {
-    // TODO(pinout): construct the real `leds::LedStrip` once LED_DATA_GPIO
-    // and an RMT channel are available; render `LED_FRAME_CHANNEL`'s latest
-    // value every `leds::RENDER_PERIOD_MS` using a free-running embassy
-    // `Instant`-derived `t_ms` fed into `openmicro_effects::resolve`.
+    // NEXT: hand `leds::PerKeyChain` (GPIO7, 13 LEDs) and
+    // `leds::UnderglowChain` (GPIO6, 8 LEDs) an `SpiOut` backed by esp-hal's
+    // SPI master on their two hosts, then render `LED_FRAME_CHANNEL`'s latest
+    // value every `leds::RENDER_PERIOD_MS` with a free-running embassy
+    // `Instant`-derived `t_ms`. The bit encoding is already done and tested
+    // (`openmicro_effects::ws2812`, 3.2 MHz, 4 SPI bits per LED bit); what is
+    // missing is only the HAL plumbing, which cannot be validated without the
+    // board in hand.
     loop {
         embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
     }
@@ -152,9 +156,14 @@ async fn led_render_task() {
 
 #[embassy_executor::task]
 async fn input_task() {
-    // TODO(pinout): drive the key matrix / read encoder & joystick GPIOs,
-    // debounce via `input::MatrixState`, and push resulting `InputEvent`s
-    // onto `INPUT_EVENT_CHANNEL`.
+    // NEXT: drive `pins::MATRIX_DRIVE_PINS` high one at a time and read
+    // `pins::MATRIX_SENSE_PINS` (pull-down; a pressed key reads HIGH — the
+    // opposite of the usual convention), debounce via `input::MatrixState`,
+    // and push `InputEvent`s onto `INPUT_EVENT_CHANNEL`. The encoder is an
+    // any-edge interrupt on `pins::ENCODER_PIN_A`/`B` through
+    // `input::encoder_step`; the joystick is ADC1 on
+    // `pins::JOYSTICK_ADC_X_PIN`/`Y` (invert X per
+    // `pins::JOYSTICK_X_INVERTED`) through `input::joystick_to_sector`.
     loop {
         embassy_time::Timer::after_millis(5).await;
     }
@@ -162,9 +171,16 @@ async fn input_task() {
 
 #[embassy_executor::task]
 async fn battery_task() {
-    // TODO(pinout): sample `pins::BATTERY_ADC_PIN` (or the fuel-gauge I2C
-    // pins, whichever the recovered pinout turns out to use) and push a
-    // `Battery { pct, charging }` onto `BATTERY_CHANNEL` periodically.
+    // There is no analog battery pin to sample: the board carries a Maxim
+    // MAX77972 combined charger and fuel gauge on I2C, and that is where the
+    // host protocol's percentage and charging flag come from.
+    //
+    // BLOCKED: the bus pins are the one thing the vendor firmware would not
+    // give up statically — it reaches the chip through Arduino's `Wire`, whose
+    // `begin(sda, scl, freq)` is dispatched virtually. Candidates are
+    // `pins::BATTERY_I2C_CANDIDATES`; an I2C scan on a real device for
+    // `pins::BATTERY_I2C_ADDR` settles it in minutes. Until then this reports
+    // nothing rather than inventing a reading.
     loop {
         embassy_time::Timer::after_secs(30).await;
     }

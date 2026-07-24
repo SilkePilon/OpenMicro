@@ -1,10 +1,10 @@
 //! Input scanning: key matrix, rotary encoder, joystick.
 //!
-//! Structural skeleton only — see the crate-level docs in `main.rs`. All
-//! GPIOs are `// TODO(pinout):` per `pins.rs`; this module is written
-//! against the shape of `esp-hal`'s (unstable) GPIO/ADC APIs but is
-//! UNVERIFIED (no Xtensa toolchain on this machine, see the firmware
-//! README).
+//! The GPIOs are now real (see `pins.rs`), recovered from the vendor
+//! firmware. The logic here is pure — debounce, quadrature decode, joystick
+//! sectoring — and deliberately takes already-sampled values so it does not
+//! depend on the HAL. What is still unverified is the electrical behaviour on
+//! a real board: nothing in this file has run on hardware.
 
 use openmicro_proto::InputEvent;
 
@@ -16,17 +16,15 @@ pub const DEBOUNCE_MS: u32 = 10;
 
 /// One row/col matrix scan cycle's worth of state, used to debounce.
 pub struct MatrixState {
-    // TODO(pinout): size against the real KEY_MATRIX_ROW_COUNT / COL_COUNT
-    // once the wiring (matrix vs. direct-GPIO) is confirmed.
-    stable: [[bool; pins::KEY_MATRIX_COL_COUNT]; pins::KEY_MATRIX_ROW_COUNT],
-    pending_since_ms: [[u32; pins::KEY_MATRIX_COL_COUNT]; pins::KEY_MATRIX_ROW_COUNT],
+    stable: [[bool; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT],
+    pending_since_ms: [[u32; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT],
 }
 
 impl MatrixState {
     pub fn new() -> Self {
         Self {
-            stable: [[false; pins::KEY_MATRIX_COL_COUNT]; pins::KEY_MATRIX_ROW_COUNT],
-            pending_since_ms: [[0; pins::KEY_MATRIX_COL_COUNT]; pins::KEY_MATRIX_ROW_COUNT],
+            stable: [[false; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT],
+            pending_since_ms: [[0; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT],
         }
     }
 
@@ -34,18 +32,22 @@ impl MatrixState {
     /// yielding any `InputEvent::Key` transitions whose state has been
     /// stable for `DEBOUNCE_MS`.
     ///
-    /// Row/col GPIO drive + read (`// TODO(pinout):` row/col pins) happens
-    /// in the caller (the embassy input task in `main.rs`); this is pure
-    /// software debounce logic so it stays host-testable in spirit even
-    /// though it currently lives in the embedded crate.
+    /// Driving and reading the GPIOs happens in the caller (the embassy input
+    /// task in `main.rs`); this is pure software debounce, so it stays
+    /// testable in spirit even though it lives in the embedded crate.
+    ///
+    /// Note the polarity: the sense lines carry internal pull-**downs** and a
+    /// pressed key pulls them **up** toward the asserted drive line, which is
+    /// the opposite of the usual keyboard convention. `raw[d][s] == true`
+    /// therefore means "sense line s read high while drive line d was high".
     pub fn debounce(
         &mut self,
-        raw: &[[bool; pins::KEY_MATRIX_COL_COUNT]; pins::KEY_MATRIX_ROW_COUNT],
+        raw: &[[bool; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT],
         now_ms: u32,
         mut emit: impl FnMut(InputEvent),
     ) {
-        for row in 0..pins::KEY_MATRIX_ROW_COUNT {
-            for col in 0..pins::KEY_MATRIX_COL_COUNT {
+        for row in 0..pins::MATRIX_DRIVE_COUNT {
+            for col in 0..pins::MATRIX_SENSE_COUNT {
                 let raw_pressed = raw[row][col];
                 if raw_pressed != self.stable[row][col] {
                     if self.pending_since_ms[row][col] == 0 {
@@ -53,10 +55,12 @@ impl MatrixState {
                     } else if now_ms.wrapping_sub(self.pending_since_ms[row][col]) >= DEBOUNCE_MS {
                         self.stable[row][col] = raw_pressed;
                         self.pending_since_ms[row][col] = 0;
-                        // TODO(pinout): key id mapping (row,col) -> logical
-                        // key id (0..13) is unconfirmed; identity-ish
-                        // placeholder below.
-                        let id = (row * pins::KEY_MATRIX_COL_COUNT + col) as u8;
+                        // Which physical key sits at each intersection is
+                        // still unknown — the vendor's keymap table was not
+                        // decoded — so the flattened coordinate is reported as
+                        // the id. Pressing keys on a real device and watching
+                        // which pair fires is what settles it.
+                        let id = (row * pins::MATRIX_SENSE_COUNT + col) as u8;
                         emit(InputEvent::Key {
                             id,
                             pressed: raw_pressed,
@@ -79,7 +83,8 @@ impl Default for MatrixState {
 /// Rotary encoder quadrature decode. Call on every A/B edge interrupt (or a
 /// fast poll loop); returns +-1 per detent, 0 for a non-detent edge.
 ///
-/// `// TODO(pinout):` `ENCODER_PIN_A` / `ENCODER_PIN_B`.
+/// Wired to `pins::ENCODER_PIN_A` / `ENCODER_PIN_B`; the stock firmware puts
+/// an any-edge interrupt on both, which is the same shape this expects.
 pub fn encoder_step(prev_ab: u8, now_ab: u8) -> i8 {
     // Standard quadrature transition table (2-bit gray code).
     match (prev_ab, now_ab) {
@@ -97,9 +102,7 @@ pub fn encoder_step(prev_ab: u8, now_ab: u8) -> i8 {
 /// polar angle/distance to a 7-slot radial menu upstream, so `dir` here is
 /// treated as an 8-way sector index (`N, NE, E, SE, S, SW, W, NW`) as a
 /// reasonable firmware-side approximation until the proto is extended to
-/// carry angle+distance directly. `// TODO(pinout):` `JOYSTICK_ADC_X_PIN` /
-/// `JOYSTICK_ADC_Y_PIN`, plus deadzone calibration once real ADC center/
-/// range values are known.
+/// carry angle+distance directly.
 pub fn joystick_to_sector(x: u16, y: u16, center: u16, deadzone: u16) -> Option<InputEvent> {
     let dx = x as i32 - center as i32;
     let dy = y as i32 - center as i32;

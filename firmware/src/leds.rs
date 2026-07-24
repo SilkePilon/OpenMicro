@@ -1,125 +1,134 @@
-//! WS2812 (NeoPixel-style) LED strip render task.
+//! WS2812 LED chains, driven over SPI.
 //!
-//! **Not using `esp-hal-smartled`.** As of this writing `esp-hal-smartled`
-//! 0.17.0 pins its `esp-hal` dependency to `~1.0` (i.e. `>=1.0.0, <1.1.0`,
-//! confirmed from its published `Cargo.toml`), while `esp-radio` 0.18.0 (our
-//! BLE stack, see `ble.rs`) pins `esp-hal` to `~1.1.0-rc.0` (`>=1.1.0-rc.0`).
-//! Those two ranges do not overlap on a real released `esp-hal` version, so
-//! `esp-hal-smartled` cannot currently sit in the same dependency graph as
-//! `esp-radio` on top-of-tree `esp-hal`. Rather than downgrade the whole
-//! firmware to a stale `esp-hal` 1.0.x to keep `esp-hal-smartled`, we drive
-//! the WS2812 chain directly over `esp_hal::rmt` (the same peripheral
-//! `esp-hal-smartled` itself wraps) — it is part of `esp-hal` proper so it
-//! never has an independent version to skew. See the firmware report for
-//! the full version-pinning rationale.
+//! **Not RMT.** The vendor firmware drives both chains from SPI hosts using
+//! ESP-IDF's `led_strip` SPI backend, which the disassembly of their image
+//! makes plain (see `docs/hardware/creator-micro-2-pinout-findings.md`). This
+//! firmware does the same, because SPI is what the board is wired for: each
+//! chain sits on its own host, so the two are independent buses and cannot be
+//! daisy-chained.
 //!
-//! This module is a structural skeleton only (see the crate-level docs in
-//! `main.rs`): it is not compiled here (no Xtensa toolchain on this
-//! machine) and the RMT item-encoding calls below are written to the
-//! documented shape of `esp_hal::rmt` but are UNVERIFIED.
+//! There are two chains:
+//!
+//! | Chain    | GPIO | LEDs | Purpose               |
+//! |----------|------|------|-----------------------|
+//! | Per-key  | 7    | 13   | one per mechanical key |
+//! | Underglow| 6    | 8    | underglow              |
+//!
+//! The bit-level encoding lives in `openmicro_effects::ws2812`, on the host
+//! side of the fence, so it is unit-tested rather than merely asserted. This
+//! module is the thin part: keep a pixel buffer, resolve effects into it, hand
+//! the encoded bytes to SPI.
+//!
+//! Not yet exercised on hardware.
 
-use openmicro_effects::resolve;
-use openmicro_proto::{LedFrame, Rgb};
+use openmicro_effects::ws2812;
+use openmicro_effects::{resolve, Rgb};
+use openmicro_proto::LedFrame;
 
 use crate::pins;
 
-/// Render tick period. ~60 Hz gives a visibly smooth Breath/Pulse/Rainbow
-/// without saturating the RMT peripheral or the BLE link.
+/// Render tick period. ~60 Hz is smooth for Breath/Pulse/Rainbow without
+/// saturating the SPI bus or the BLE link.
 pub const RENDER_PERIOD_MS: u64 = 16;
 
-/// WS2812 bit timings (T0H/T0L/T1H/T1L), nanoseconds, per the common
-/// WS2812B datasheet figures. `// TODO(pinout):` also covers "confirm the
-/// LED chip is actually WS2812 and not SK6812" — the research doc could not
-/// confirm the chip type, so these timings are a best-effort default.
-mod ws2812_timing {
-    pub const T0H_NS: u32 = 400;
-    pub const T0L_NS: u32 = 850;
-    pub const T1H_NS: u32 = 800;
-    pub const T1L_NS: u32 = 450;
-    pub const RESET_LOW_NS: u32 = 50_000;
-}
+/// Encoded-byte buffer size for the per-key chain.
+pub const PER_KEY_BUF_LEN: usize = ws2812::buffer_len(pins::PER_KEY_LED_COUNT);
 
-/// Maps a logical render slot (0..SLOT_COUNT agent-key slots, then
-/// underglow/other keys) to a position in the physical LED chain.
-/// `// TODO(pinout):` the actual chain order is unconfirmed — this identity
-/// mapping is a placeholder.
-fn slot_to_chain_index(slot: usize) -> usize {
-    slot // TODO(pinout): replace with the real physical chain order.
-}
+/// Encoded-byte buffer size for the underglow chain.
+pub const UNDERGLOW_BUF_LEN: usize = ws2812::buffer_len(pins::UNDERGLOW_LED_COUNT);
 
-/// Owns the RMT TX channel wired to the LED data line and pushes rendered
-/// frames out over it.
+/// Anything that can push a prepared byte buffer out of an SPI host.
 ///
-/// `Tx` is left generic over the concrete `esp-hal` RMT channel type rather
-/// than naming it directly, since that type is parameterized by peripheral
-/// instance/pin in ways that cannot be pinned down without the real
-/// `LED_DATA_GPIO` from `pins.rs`.
-pub struct LedStrip<Tx> {
-    channel: Tx,
-    buf: [Rgb; pins::LED_COUNT],
+/// Abstracted so the render logic does not name esp-hal's SPI type, which is
+/// parameterised by peripheral instance and DMA channel. `main.rs` supplies
+/// the real implementation for each of the two hosts.
+pub trait SpiOut {
+    /// Write every byte. Errors are dropped by callers: a lost LED frame is
+    /// replaced by the next one 16 ms later, and there is nothing useful to do
+    /// about it on a device with no display.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ()>;
 }
 
-impl<Tx> LedStrip<Tx>
-where
-    // TODO: once `pins::LED_DATA_GPIO` is known, replace this bound with
-    // the concrete `esp_hal::rmt::TxChannel` (or channel-creator) type for
-    // that GPIO, per the esp-hal-smartled `hello_rgb.rs` example shape.
-    Tx: Ws2812TxChannel,
-{
-    pub fn new(channel: Tx) -> Self {
+/// Which physical LED in the per-key chain shows a given agent slot.
+///
+/// The protocol has `SLOT_COUNT` agent slots and the board has 13 per-key
+/// LEDs. Which physical key each slot should light is a product decision that
+/// depends on the key-ID map, and that map is still unknown — so this is the
+/// identity mapping for now, and slots beyond the chain are dropped rather
+/// than wrapping onto an arbitrary key.
+fn slot_to_chain_index(slot: usize) -> usize {
+    slot
+}
+
+/// The per-key chain: agent state, one LED per key.
+pub struct PerKeyChain<S> {
+    spi: S,
+    pixels: [Rgb; pins::PER_KEY_LED_COUNT],
+    encoded: [u8; PER_KEY_BUF_LEN],
+}
+
+impl<S: SpiOut> PerKeyChain<S> {
+    pub fn new(spi: S) -> Self {
         Self {
-            channel,
-            buf: [Rgb { r: 0, g: 0, b: 0 }; pins::LED_COUNT],
+            spi,
+            pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT],
+            encoded: [0; PER_KEY_BUF_LEN],
         }
     }
 
-    /// One render tick: resolve every slot's `Effect` at time `t_ms` and
-    /// push the resulting colors out over RMT.
+    /// One render tick: resolve every slot's effect at `t_ms` and push it out.
     pub fn render(&mut self, frame: &LedFrame, t_ms: u32) {
         for (slot_idx, slot) in frame.slots.iter().enumerate() {
             let idx = slot_to_chain_index(slot_idx);
-            if idx < self.buf.len() {
-                self.buf[idx] = resolve(slot, t_ms);
+            if idx < self.pixels.len() {
+                self.pixels[idx] = resolve(slot, t_ms);
             }
         }
-        // Underglow / remaining non-agent keys: left dark until the pinout
-        // and a richer per-key LedFrame are available.
-        // TODO(pinout): extend LedFrame (or add a second frame type) once
-        // underglow / per-mechanical-key control is wired up.
+        self.flush();
+    }
 
-        self.channel.write_ws2812(&self.buf);
+    /// Encode the current pixels and write them.
+    fn flush(&mut self) {
+        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
+            let _ = self.spi.write(&self.encoded);
+        }
+    }
+
+    /// Turn every per-key LED off (idle sleep).
+    pub fn blank(&mut self) {
+        self.pixels = [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT];
+        self.flush();
     }
 }
 
-/// Narrow seam around the actual `esp_hal::rmt` TX API so `LedStrip` doesn't
-/// need to name esp-hal's real (pin/peripheral-parameterized) channel type
-/// in this skeleton. The real implementation encodes each `Rgb` as 24 RMT
-/// items (GRB bit order, matching WS2812) followed by a >=50us reset gap,
-/// using the timings in `ws2812_timing`.
-pub trait Ws2812TxChannel {
-    fn write_ws2812(&mut self, pixels: &[Rgb]);
+/// The underglow chain: one solid colour across all 8 LEDs.
+///
+/// Separate type rather than a generic over length, because it is a different
+/// SPI host and a different concept — it shows device state, not agent state.
+pub struct UnderglowChain<S> {
+    spi: S,
+    pixels: [Rgb; pins::UNDERGLOW_LED_COUNT],
+    encoded: [u8; UNDERGLOW_BUF_LEN],
 }
 
-// TODO: real impl once esp-hal's RMT channel type for LED_DATA_GPIO is
-// known, roughly:
-//
-// impl Ws2812TxChannel for esp_hal::rmt::Channel<'_, Blocking, 0> {
-//     fn write_ws2812(&mut self, pixels: &[Rgb]) {
-//         let mut items: heapless::Vec<PulseCode, { pins::LED_COUNT * 24 + 1 }> = ...;
-//         for px in pixels {
-//             // WS2812 wire order is G, R, B (not R, G, B).
-//             for byte in [px.g, px.r, px.b] {
-//                 for bit in (0..8).rev() {
-//                     let one = (byte >> bit) & 1 == 1;
-//                     items.push(if one {
-//                         PulseCode::new(Level::High, T1H_TICKS, Level::Low, T1L_TICKS)
-//                     } else {
-//                         PulseCode::new(Level::High, T0H_TICKS, Level::Low, T0L_TICKS)
-//                     });
-//                 }
-//             }
-//         }
-//         items.push(PulseCode::new(Level::Low, RESET_LOW_TICKS, Level::Low, 0));
-//         self.transmit(&items).wait().unwrap();
-//     }
-// }
+impl<S: SpiOut> UnderglowChain<S> {
+    pub fn new(spi: S) -> Self {
+        Self {
+            spi,
+            pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::UNDERGLOW_LED_COUNT],
+            encoded: [0; UNDERGLOW_BUF_LEN],
+        }
+    }
+
+    /// Paint the whole chain one colour.
+    pub fn set(&mut self, colour: Rgb) {
+        self.pixels = [colour; pins::UNDERGLOW_LED_COUNT];
+        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
+            let _ = self.spi.write(&self.encoded);
+        }
+    }
+
+    pub fn blank(&mut self) {
+        self.set(Rgb { r: 0, g: 0, b: 0 });
+    }
+}
