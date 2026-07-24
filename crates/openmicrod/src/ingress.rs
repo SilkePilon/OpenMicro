@@ -40,7 +40,13 @@ pub async fn serve(
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("openmicrod: accept error on socket: {e}");
+                continue;
+            }
+        };
         let engine = engine.clone();
         let device = device.clone();
         tokio::spawn(async move {

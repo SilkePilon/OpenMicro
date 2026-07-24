@@ -73,7 +73,13 @@ pub async fn serve(path: std::path::PathBuf, engine: Arc<Mutex<Engine>>) -> anyh
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("openmicrod: accept error on socket: {e}");
+                continue;
+            }
+        };
         let engine = engine.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(1));
