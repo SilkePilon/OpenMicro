@@ -176,7 +176,11 @@ pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path, major: Option<
     args.push("--before".to_string());
     args.push("usb-reset".to_string());
     args.push("--after".to_string());
-    args.push("watchdog-reset".to_string());
+    // Stay put: entering the bootloader via `sys.bootloader` set the
+    // force-download bit, and it survives a reset. Resetting here would just
+    // land back in download mode. The caller clears the bit and resets — see
+    // `wldevice::exit_bootloader`.
+    args.push("no-reset".to_string());
     args.push(subcommand("write_flash", major));
     args.push("0x0".to_string());
     args.push(image.display().to_string());
@@ -666,7 +670,7 @@ mod tests {
                 "--before",
                 "usb-reset",
                 "--after",
-                "watchdog-reset",
+                "no-reset",
                 "write_flash",
                 "0x0",
                 "/tmp/fw.bin"
@@ -688,7 +692,7 @@ mod tests {
                 "--before",
                 "usb-reset",
                 "--after",
-                "watchdog-reset",
+                "no-reset",
                 "write_flash",
                 "0x0",
                 "/tmp/fw.bin"

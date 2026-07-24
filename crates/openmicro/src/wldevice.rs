@@ -341,8 +341,8 @@ fn send_rpc(request: &str) -> Result<(), String> {
 /// straps on USB-Serial-JTAG, and this board exposes no DTR/RTS lines for the
 /// classic auto-reset, so `--after watchdog-reset` is the only thing that works.
 pub fn exit_bootloader(port: Option<&str>) -> Result<Vec<String>, String> {
-    if usb_mode() != UsbMode::Bootloader {
-        return Ok(vec!["device is not in bootloader mode; nothing to do.".to_string()]);
+    if usb_mode() == UsbMode::Absent {
+        return Ok(vec!["no device on USB; nothing to do.".to_string()]);
     }
     let esptool = crate::flash::esptool_path().ok_or_else(|| {
         "leaving bootloader mode needs esptool. Install it: pip install esptool.".to_string()

@@ -123,8 +123,16 @@ pub const TOUCH_ACTIVE_LOW: bool = true;
 pub const REAR_BUTTON_PIN: u8 = 2;
 /// VBUS-present detect.
 pub const USB_DETECT_PIN: u8 = 42;
-/// Power gate for the upper PCB; all three must be driven to use the top board.
-pub const TOP_BOARD_POWER_PINS: [u8; 3] = [36, 37, 38];
+/// Power gate for the upper PCB, with the levels the vendor firmware drives.
+///
+/// Read out of `wl_io::init_top_board_power_gpio` in the stock image: it
+/// configures 36/37/38 as outputs (pin mask high word `0x70`) and then calls a
+/// setter with `(37 = 1, 36 = 0, 38 = 1)`. Note that they are **not** all high
+/// — driving 36 high would have been the obvious guess and is wrong.
+///
+/// Without this the upper board has no power, which is exactly what "the LEDs
+/// never light up" looks like.
+pub const TOP_BOARD_POWER: [(u8, bool); 3] = [(36, false), (37, true), (38, true)];
 
 /// Charge enable. INFERRED (medium) — the store alignment around it was noisy
 /// in the disassembly, so verify before driving it.

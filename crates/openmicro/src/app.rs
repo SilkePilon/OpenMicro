@@ -324,11 +324,14 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     if !run_job(ui, "Flashing", "Firmware written", || flash::flash_capture(None, None)) {
         return Ok(());
     }
-    // No explicit restart: the flash already ends with `--after
-    // watchdog-reset`, so the device has rebooted into the new firmware by the
-    // time we get here. Asking esptool to reset it again only finds a device
-    // that is no longer listening.
-    ui.info("The device has restarted into the new firmware.");
+    // The write deliberately leaves the device in the bootloader: entering it
+    // set the force-download bit, which survives a reset, so a device that
+    // simply rebooted here would come straight back to download mode and never
+    // run the firmware that was just written. Clearing the bit and resetting is
+    // what actually starts it.
+    run_job(ui, "Starting the new firmware", "Device restarted", || {
+        wldevice::exit_bootloader(None)
+    });
 
     finish_setup(ui)
 }
@@ -525,8 +528,14 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                     flash::flash_capture(None, None)
                 })
             {
-                // The flash's own `--after watchdog-reset` already rebooted it.
-                ui.info("The device has restarted into the new firmware.");
+    // The write deliberately leaves the device in the bootloader: entering it
+    // set the force-download bit, which survives a reset, so a device that
+    // simply rebooted here would come straight back to download mode and never
+    // run the firmware that was just written. Clearing the bit and resetting is
+    // what actually starts it.
+                run_job(ui, "Starting the new firmware", "Device restarted", || {
+                    wldevice::exit_bootloader(None)
+                });
             }
         }
         "backup" => {
@@ -592,7 +601,9 @@ fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
     if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", move || {
         flash::restore(Some(&image_for_job), None)
     }) {
-        ui.info("The device has restarted into the vendor firmware.");
+        run_job(ui, "Starting the vendor firmware", "Device restarted", || {
+            wldevice::exit_bootloader(None)
+        });
     }
     Ok(())
 }

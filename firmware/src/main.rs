@@ -116,13 +116,18 @@ macro_rules! ws2812_spi {
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    esp_println::logger::init_logger_from_env();
+    // Fixed level rather than `init_logger_from_env`: that reads ESP_LOG at
+    // compile time, and a missing or mis-plumbed value silently filters every
+    // message, which is indistinguishable from the firmware being dead.
+    esp_println::logger::init_logger(log::LevelFilter::Info);
+    esp_println::println!("openmicro-fw boot");
 
     // Clear the force-download-boot bit first thing. It survives a reset — and
     // on the Pro, whose RTC domain is battery-backed, it survives losing USB
     // power too — so a device that was put into download mode once would
     // otherwise keep going back there on every boot.
     bootloader::clear_force_download();
+    log::info!("openmicro-fw {} starting", env!("CARGO_PKG_VERSION"));
 
     // esp-hal 1.x peripheral init. `esp_hal::init` hands back the
     // peripheral singletons used to construct every driver below.
@@ -167,6 +172,29 @@ async fn main(spawner: Spawner) {
         )
         .expect("led_render_task token"),
     );
+    // Power the upper PCB before anything tries to drive it. The LEDs live up
+    // there; until this runs they have no supply, and the SPI writes go
+    // nowhere visible. Levels are the vendor's, not a guess — see
+    // `pins::TOP_BOARD_POWER`.
+    let _top_board_power = [
+        esp_hal::gpio::Output::new(
+            peripherals.GPIO36,
+            level_of(pins::TOP_BOARD_POWER[0].1),
+            esp_hal::gpio::OutputConfig::default(),
+        ),
+        esp_hal::gpio::Output::new(
+            peripherals.GPIO37,
+            level_of(pins::TOP_BOARD_POWER[1].1),
+            esp_hal::gpio::OutputConfig::default(),
+        ),
+        esp_hal::gpio::Output::new(
+            peripherals.GPIO38,
+            level_of(pins::TOP_BOARD_POWER[2].1),
+            esp_hal::gpio::OutputConfig::default(),
+        ),
+    ];
+    esp_println::println!("top board powered");
+
     // ADC1 specifically: ADC2 is unusable while the radio is running, and this
     // firmware keeps BLE up continuously.
     let joystick_adc = {
@@ -272,9 +300,17 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
 
 #[embassy_executor::task]
 async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
+    log::info!(
+        "leds: per-key {} on GPIO{}, underglow {} on GPIO{}",
+        pins::PER_KEY_LED_COUNT,
+        pins::PER_KEY_LED_GPIO,
+        pins::UNDERGLOW_LED_COUNT,
+        pins::UNDERGLOW_LED_GPIO
+    );
     let mut keys = leds::PerKeyChain::new(per_key);
     let mut glow = leds::UnderglowChain::new(underglow);
     let start = embassy_time::Instant::now();
+    let mut last_beat_ms = 0u32;
 
     loop {
         let t_ms = start.elapsed().as_millis() as u32;
@@ -293,7 +329,25 @@ async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
             glow.render_idle(t_ms);
         }
 
+        // Heartbeat. USB-Serial-JTAG throws away anything written while no
+        // host is listening, so a one-shot boot message is invisible unless a
+        // monitor happened to be attached at exactly the right moment. A
+        // periodic line makes "is it alive?" answerable at any time.
+        if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
+            last_beat_ms = t_ms;
+            esp_println::println!("alive t={}ms", t_ms);
+        }
+
         embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+    }
+}
+
+/// `bool` to esp-hal's pin level.
+fn level_of(high: bool) -> esp_hal::gpio::Level {
+    if high {
+        esp_hal::gpio::Level::High
+    } else {
+        esp_hal::gpio::Level::Low
     }
 }
 
@@ -355,6 +409,10 @@ async fn input_task(mut io: InputPins) {
             drive.set_low();
         }
         matrix.debounce(&raw, now_ms, |event| {
+            // Logged as well as queued: until the BLE link exists, the serial
+            // console is the only way to see that a key press was detected —
+            // and it is what identifies the key-ID map.
+            log::info!("input: {:?}", event);
             let _ = INPUT_EVENT_CHANNEL.try_send(event);
         });
 
