@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
     let mut engine_init = Engine::new(cfg.brightness);
     engine_init.colors = cfg.colors;
+    engine_init.sleep_minutes = cfg.sleep_minutes;
     let engine = Arc::new(Mutex::new(engine_init));
 
     // Channel for device->host input events. In P1 the daemon just drains it;

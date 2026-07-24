@@ -59,10 +59,11 @@ pub fn snapshot(engine: &Engine) -> Snapshot {
 /// so it must NOT be called while any engine/device lock is held. Callers
 /// capture the fields to persist, drop their guards, and then invoke this.
 /// Best-effort: errors are logged, not propagated.
-fn persist(brightness: u8, colors: openmicro_proto::StateColors) {
+fn persist(brightness: u8, colors: openmicro_proto::StateColors, sleep_minutes: u32) {
     let mut cfg = crate::config::load();
     cfg.brightness = brightness;
     cfg.colors = colors;
+    cfg.sleep_minutes = sleep_minutes;
     if let Err(e) = cfg.save() {
         eprintln!("openmicrod: failed to persist config: {e}");
     }
@@ -118,7 +119,7 @@ pub async fn serve(
                 // drop both guards BEFORE doing any blocking filesystem I/O so
                 // other tasks (snapshot writer, ingress hook events) aren't
                 // stalled waiting on the engine lock.
-                let (brightness, colors) = {
+                let (brightness, colors, sleep_minutes) = {
                     let mut eng = engine_r.lock().await;
                     let mut dev = device_r.lock().await;
                     eng.apply_command(cmd, &mut *dev).await;
@@ -129,7 +130,10 @@ pub async fn serve(
                 };
                 // No engine/device lock is held here: run the sync read/write
                 // /rename off the async runtime so it can't block other tasks.
-                let _ = tokio::task::spawn_blocking(move || persist(brightness, colors)).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist(brightness, colors, sleep_minutes)
+                })
+                .await;
             }
         });
     }
