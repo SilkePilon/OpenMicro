@@ -529,9 +529,20 @@ mod tests {
         assert_eq!(args[out_at + 1], "/tmp/fw.part");
     }
 
+    /// Environment variables are process-wide, but `cargo test` runs tests on
+    /// parallel threads: every test that sets one must hold this, or another
+    /// test will observe it. (Without it, `fetch_releases_parses_a_local_file_url`
+    /// and this test raced over `OPENMICRO_RELEASES_URL`.) Poison-tolerant, so
+    /// one failing test does not cascade into the rest.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn firmware_url_honors_the_env_override() {
-        // Serialized implicitly: this is the only test touching these vars.
+        let _guard = lock_env();
         std::env::set_var(FIRMWARE_URL_ENV, "https://elsewhere/fw.bin");
         assert_eq!(forced_url().as_deref(), Some("https://elsewhere/fw.bin"));
         std::env::set_var(FIRMWARE_URL_ENV, "   ");
@@ -656,6 +667,7 @@ mod tests {
     fn fetch_releases_parses_a_local_file_url() {
         // End-to-end through curl, without touching the network: curl reads
         // file:// URLs, so this exercises the real fetch + parse path.
+        let _guard = lock_env();
         let path = std::env::temp_dir()
             .join(format!("openmicro-releases-{}.json", std::process::id()));
         std::fs::write(&path, RELEASES_JSON).unwrap();
