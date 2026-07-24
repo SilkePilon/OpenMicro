@@ -1,4 +1,4 @@
-# openmicro-firmware (ESP32-S3, Creator Micro 2)
+# openmicro-fw (ESP32-S3, Creator Micro 2)
 
 **Status: skeleton, UNVERIFIED against a compiler.** This crate has never
 been built. There is no Xtensa Rust toolchain installed in the environment

@@ -8,14 +8,14 @@
 members = ["."]
 
 [package]
-name = "openmicro-firmware"
+name = "openmicro-fw"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
 
 [[bin]]
-name = "openmicro-firmware"
+name = "openmicro-fw"
 path = "src/main.rs"
 test = false
 doctest = false
