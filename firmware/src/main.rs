@@ -6,18 +6,23 @@
 //! (`.github/workflows/firmware.yml`), against the version set pinned in
 //! `Cargo.toml` (esp-hal 1.1.1 + esp-rtos 0.3.0 + esp-radio 0.18.0 +
 //! trouble-host 0.6.0 — the same set as the upstream `esp-hal-v1.1.1`
-//! `bas_peripheral` BLE example). Compiling is all it is proven to do: it
-//! has never been flashed to or run on a device, and every GPIO is still a
-//! `// TODO(pinout):` placeholder, so it cannot drive the real hardware
-//! yet. `openmicro-effects`/`openmicro-proto` (the shared pieces this crate
-//! calls into) are host-tested in the root workspace.
+//! `bas_peripheral` BLE example). Compiling is all it is proven to do: it has
+//! never been flashed to or run on a device.
 //!
-//! # Why the GPIO pins are all placeholders
+//! The GPIO map in `pins.rs` is real, recovered from Work Louder's own
+//! published firmware (`docs/hardware/creator-micro-2-pinout-findings.md`).
+//! What is still missing is the HAL plumbing in the task bodies below.
 //!
-//! See `pins.rs` and `docs/hardware/creator-micro-2-pinout-research.md`:
-//! the Creator Micro 2's physical wiring is not publicly documented and the
-//! host-side protocol never surfaces it, so every pin here is a
-//! `// TODO(pinout):` constant.
+//! # Keeping the vendor's behaviour
+//!
+//! Two things about the stock firmware are worth preserving, and are:
+//! - the **power button** — short press wakes, ~2 s turns off (see
+//!   `openmicro_effects::power`, which also adds a long hold as a
+//!   bootloader escape hatch);
+//! - **entering and leaving the ROM bootloader on command** (`bootloader.rs`).
+//!   Unlike the vendor's, this firmware exposes USB-Serial-JTAG, so the host
+//!   can also reset it into download mode with esptool directly — that path
+//!   keeps working even if this firmware is wedged.
 //!
 //! # Task layout
 //!
@@ -30,13 +35,15 @@
 //!   core) and pushes it out over RMT (`leds.rs`).
 //! - `input_task`: scans the key matrix / encoder / joystick (`input.rs`)
 //!   and pushes `InputEvent`s to the BLE task.
-//! - `battery_task`: samples battery state and updates the Battery Service
-//!   characteristic via the BLE task.
+//! - `battery_task`: reads the MAX77972 fuel gauge over I2C and updates the
+//!   Battery Service characteristic via the BLE task.
+//! - `power_task`: debounces the rear power button and acts on the gesture.
 
 #![no_std]
 #![no_main]
 
 mod ble;
+mod bootloader;
 mod input;
 mod leds;
 mod pins;
@@ -79,6 +86,12 @@ const HEAP_SIZE: usize = 64 * 1024;
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
+
+    // Clear the force-download-boot bit first thing. It survives a reset — and
+    // on the Pro, whose RTC domain is battery-backed, it survives losing USB
+    // power too — so a device that was put into download mode once would
+    // otherwise keep going back there on every boot.
+    bootloader::clear_force_download();
 
     // esp-hal 1.x peripheral init. `esp_hal::init` hands back the
     // peripheral singletons used to construct every driver below.
@@ -123,6 +136,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(led_render_task().expect("led_render_task token"));
     spawner.spawn(input_task().expect("input_task token"));
     spawner.spawn(battery_task().expect("battery_task token"));
+    spawner.spawn(power_task().expect("power_task token"));
 }
 
 #[embassy_executor::task]
@@ -139,8 +153,42 @@ async fn ble_task(controller: esp_radio::ble::controller::BleConnector<'static>)
     }
 }
 
+/// The rear power button: short press wakes, ~2 s powers off, a long hold is
+/// the bootloader escape hatch.
+///
+/// The gesture recognition is host-tested in `openmicro_effects::power`; all
+/// this task owes it is a debounced level and a clock.
+#[embassy_executor::task]
+async fn power_task() {
+    use openmicro_effects::power::{PowerAction, PowerButton};
+
+    let mut button = PowerButton::new();
+    loop {
+        // NEXT: read `pins::REAR_BUTTON_PIN` here. Until the HAL plumbing
+        // lands the button always reads released, so no action ever fires —
+        // which is the safe direction to be wrong in for something that can
+        // power the device off.
+        let pressed = false;
+        let now_ms = embassy_time::Instant::now().as_millis() as u32;
+
+        match button.update(pressed, now_ms) {
+            PowerAction::EnterBootloader => bootloader::reboot_to_bootloader(),
+            PowerAction::PowerOff => {
+                // NEXT: blank both LED chains, then enter deep sleep with the
+                // button as the wake source.
+            }
+            PowerAction::Wake | PowerAction::None => {}
+        }
+        embassy_time::Timer::after_millis(10).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn led_render_task() {
+    // The boot animation runs first, straight from `openmicro_effects::startup`
+    // (host-tested): it doubles as a check that the chain length and colour
+    // order are right, which a static colour would hide.
+    //
     // NEXT: hand `leds::PerKeyChain` (GPIO7, 13 LEDs) and
     // `leds::UnderglowChain` (GPIO6, 8 LEDs) an `SpiOut` backed by esp-hal's
     // SPI master on their two hosts, then render `LED_FRAME_CHANNEL`'s latest

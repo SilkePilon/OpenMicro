@@ -10,6 +10,8 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod power;
+pub mod startup;
 pub mod ws2812;
 
 pub use openmicro_proto::{Effect, LedSlot, Rgb};
