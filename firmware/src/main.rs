@@ -88,7 +88,20 @@ struct SpiWriter(esp_hal::spi::master::Spi<'static, esp_hal::Blocking>);
 
 impl leds::SpiOut for SpiWriter {
     fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        embedded_hal::spi::SpiBus::write(&mut self.0, bytes).map_err(|_| ())
+        match embedded_hal::spi::SpiBus::write(&mut self.0, bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Loudly, and only once: a silently dropped write is
+                // indistinguishable from LEDs that are not wired up, and that
+                // ambiguity has already cost an evening.
+                use core::sync::atomic::{AtomicBool, Ordering};
+                static REPORTED: AtomicBool = AtomicBool::new(false);
+                if !REPORTED.swap(true, Ordering::Relaxed) {
+                    esp_println::println!("SPI write failed: {:?} ({} bytes)", e, bytes.len());
+                }
+                Err(())
+            }
+        }
     }
 }
 
@@ -321,6 +334,13 @@ async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
             // colour would hide all three.
             keys.render_startup(t_ms);
             glow.render_startup(t_ms);
+            if t_ms < 40 {
+                esp_println::println!(
+                    "led: first frame pushed ({} + {} bytes)",
+                    leds::PER_KEY_BUF_LEN,
+                    leds::UNDERGLOW_BUF_LEN
+                );
+            }
         } else {
             // NEXT: render the latest `LedFrame` from the BLE task here. Until
             // that channel is wired, the keys stay dark and the underglow

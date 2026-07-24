@@ -7,17 +7,22 @@
 //! SPI bits whose high time encodes the value:
 //!
 //! ```text
-//! SPI clock 3.2 MHz  ->  one SPI bit = 312.5 ns
-//! WS2812 bit         =  4 SPI bits  = 1.25 us   (the WS2812 bit period)
+//! SPI clock 2.5 MHz  ->  one SPI bit = 400 ns
+//! WS2812 bit         =  3 SPI bits  = 1.2 us
 //!
-//! '0' -> 1000   312.5 ns high, 937.5 ns low
-//! '1' -> 1110   937.5 ns high, 312.5 ns low
+//! '0' -> 100    400 ns high,  800 ns low
+//! '1' -> 110    800 ns high,  400 ns low
 //! ```
 //!
-//! Both high times land inside the WS2812B datasheet windows (T0H 250–550 ns,
-//! T1H 650–950 ns), which is why this clock and this pattern go together —
-//! changing one without the other silently produces wrong colours or nothing
-//! at all.
+//! This is deliberately the same scheme ESP-IDF's `led_strip` SPI backend
+//! uses, because that is what the vendor firmware drives these exact chains
+//! with — a known-good configuration on this board beats a merely in-spec one.
+//! Both high times sit comfortably mid-window (T0H 250–550 ns, T1H 650–950 ns)
+//! rather than near the edges, and three bits per LED bit means each colour
+//! byte lands on exactly three whole SPI bytes.
+//!
+//! Changing the clock without changing the pattern silently produces wrong
+//! colours, or nothing at all.
 //!
 //! This lives here, rather than in the firmware crate, because it is pure
 //! byte-shuffling and therefore the one part of the LED path that can be
@@ -27,39 +32,44 @@ use crate::Rgb;
 
 /// SPI clock this encoding assumes. Driving the bus at any other rate breaks
 /// the timings above.
-pub const SPI_HZ: u32 = 3_200_000;
+pub const SPI_HZ: u32 = 2_500_000;
 
 /// SPI bits emitted per WS2812 bit.
-pub const SPI_BITS_PER_BIT: usize = 4;
+pub const SPI_BITS_PER_BIT: usize = 3;
 
 /// One WS2812 bit's worth of SPI bits, for a zero and for a one.
-const PATTERN_ZERO: u8 = 0b1000;
-const PATTERN_ONE: u8 = 0b1110;
+const PATTERN_ZERO: u32 = 0b100;
+const PATTERN_ONE: u32 = 0b110;
 
-/// Encoded bytes per pixel: 24 colour bits x 4 SPI bits = 96 bits.
+/// Encoded bytes per pixel: 24 colour bits x 3 SPI bits = 72 bits = 9 bytes.
 pub const BYTES_PER_PIXEL: usize = 24 * SPI_BITS_PER_BIT / 8;
 
 /// Trailing low bytes that make up the inter-frame reset.
 ///
-/// WS2812 latches when the line is held low for >= 50 us. At 3.2 MHz one byte
-/// of zeros is 2.5 us, so 24 bytes is 60 us — comfortably over, and cheap.
-pub const RESET_BYTES: usize = 24;
+/// WS2812 latches when the line is held low for >= 50 us. At 2.5 MHz one byte
+/// of zeros is 3.2 us, so 20 bytes is 64 us — comfortably over, and cheap.
+pub const RESET_BYTES: usize = 20;
 
 /// Buffer size needed to encode `pixel_count` pixels plus the reset gap.
 pub const fn buffer_len(pixel_count: usize) -> usize {
     pixel_count * BYTES_PER_PIXEL + RESET_BYTES
 }
 
-/// Encode one colour byte into four SPI bytes (two WS2812 bits per SPI byte).
-fn encode_byte(value: u8, out: &mut [u8; 4]) {
-    for (i, chunk) in out.iter_mut().enumerate() {
-        // Most significant bit first, two colour bits per output byte.
-        let hi_bit = (value >> (7 - i * 2)) & 1;
-        let lo_bit = (value >> (6 - i * 2)) & 1;
-        let hi = if hi_bit == 1 { PATTERN_ONE } else { PATTERN_ZERO };
-        let lo = if lo_bit == 1 { PATTERN_ONE } else { PATTERN_ZERO };
-        *chunk = (hi << 4) | lo;
+/// Encode one colour byte into exactly three SPI bytes.
+///
+/// Eight colour bits at three SPI bits each is 24 bits, so the patterns are
+/// accumulated into a 24-bit word MSB-first and then split into bytes — which
+/// is simpler, and less error-prone, than trying to place bit triples that
+/// straddle byte boundaries by hand.
+fn encode_byte(value: u8, out: &mut [u8; 3]) {
+    let mut word: u32 = 0;
+    for bit in (0..8).rev() {
+        let pattern = if (value >> bit) & 1 == 1 { PATTERN_ONE } else { PATTERN_ZERO };
+        word = (word << 3) | pattern;
     }
+    out[0] = (word >> 16) as u8;
+    out[1] = (word >> 8) as u8;
+    out[2] = word as u8;
 }
 
 /// Encode `pixels` into `out`, returning how many bytes were written.
@@ -80,10 +90,10 @@ pub fn encode(pixels: &[Rgb], out: &mut [u8]) -> Option<usize> {
     for px in pixels {
         // Wire order is green, red, blue — not RGB.
         for value in [px.g, px.r, px.b] {
-            let mut chunk = [0u8; 4];
+            let mut chunk = [0u8; 3];
             encode_byte(value, &mut chunk);
-            out[at..at + 4].copy_from_slice(&chunk);
-            at += 4;
+            out[at..at + 3].copy_from_slice(&chunk);
+            at += 3;
         }
     }
     for byte in &mut out[at..at + RESET_BYTES] {
@@ -111,26 +121,26 @@ mod tests {
 
     #[test]
     fn a_zero_bit_is_short_high_and_a_one_bit_is_long_high() {
-        let mut out = [0u8; 4];
+        let mut out = [0u8; 3];
         encode_byte(0b0000_0000, &mut out);
-        assert_eq!(spi_bits(&out)[..4], [1, 0, 0, 0], "a zero is one high SPI bit");
+        assert_eq!(spi_bits(&out)[..3], [1, 0, 0], "a zero is one high SPI bit");
 
         encode_byte(0b1111_1111, &mut out);
-        assert_eq!(spi_bits(&out)[..4], [1, 1, 1, 0], "a one is three high SPI bits");
+        assert_eq!(spi_bits(&out)[..3], [1, 1, 0], "a one is two high SPI bits");
     }
 
     #[test]
     fn colour_bits_are_emitted_most_significant_first() {
-        let mut out = [0u8; 4];
+        let mut out = [0u8; 3];
         encode_byte(0b1000_0000, &mut out);
         let bits = spi_bits(&out);
-        assert_eq!(&bits[0..4], &[1, 1, 1, 0], "the MSB is the first bit on the wire");
-        assert_eq!(&bits[4..8], &[1, 0, 0, 0], "the next bit is a zero");
+        assert_eq!(&bits[0..3], &[1, 1, 0], "the MSB is the first bit on the wire");
+        assert_eq!(&bits[3..6], &[1, 0, 0], "the next bit is a zero");
 
         encode_byte(0b0000_0001, &mut out);
         let bits = spi_bits(&out);
-        assert_eq!(&bits[0..4], &[1, 0, 0, 0]);
-        assert_eq!(&bits[28..32], &[1, 1, 1, 0], "the LSB is the last bit on the wire");
+        assert_eq!(&bits[0..3], &[1, 0, 0]);
+        assert_eq!(&bits[21..24], &[1, 1, 0], "the LSB is the last bit on the wire");
     }
 
     #[test]
@@ -140,12 +150,13 @@ mod tests {
         let mut buf = [0u8; buffer_len(1)];
         encode(&[red], &mut buf).unwrap();
 
-        let green_group = &buf[0..4];
-        let red_group = &buf[4..8];
-        let blue_group = &buf[8..12];
-        assert!(green_group.iter().all(|b| *b == 0x88), "green is zero: {green_group:?}");
-        assert!(red_group.iter().all(|b| *b == 0xEE), "red is full: {red_group:?}");
-        assert!(blue_group.iter().all(|b| *b == 0x88), "blue is zero: {blue_group:?}");
+        let green_group = &buf[0..3];
+        let red_group = &buf[3..6];
+        let blue_group = &buf[6..9];
+        // 0b100 repeated eight times, and 0b110 repeated eight times.
+        assert_eq!(green_group, &[0x92, 0x49, 0x24], "green is zero: {green_group:?}");
+        assert_eq!(red_group, &[0xDB, 0x6D, 0xB6], "red is full: {red_group:?}");
+        assert_eq!(blue_group, &[0x92, 0x49, 0x24], "blue is zero: {blue_group:?}");
     }
 
     #[test]
@@ -166,11 +177,11 @@ mod tests {
         // This is the check that stops someone "optimising" the clock later.
         let bit_ns = 1_000_000_000 / SPI_HZ as u64;
         let t0h = bit_ns; // one high SPI bit
-        let t1h = bit_ns * 3; // three high SPI bits
+        let t1h = bit_ns * 2; // two high SPI bits
         let period = bit_ns * SPI_BITS_PER_BIT as u64;
         assert!((250..=550).contains(&t0h), "T0H {t0h} ns outside 250..550");
         assert!((650..=950).contains(&t1h), "T1H {t1h} ns outside 650..950");
-        assert!((1150..=1350).contains(&period), "bit period {period} ns off 1.25us");
+        assert!((1100..=1350).contains(&period), "bit period {period} ns off 1.25us");
     }
 
     #[test]
