@@ -2,3 +2,6 @@
 
 # SDD scratch (briefs, reports, review packages, ledger)
 .superpowers/
+
+# Claude Code scratch (worktrees, session state)
+/.claude/
