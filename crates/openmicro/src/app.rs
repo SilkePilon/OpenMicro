@@ -251,9 +251,11 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         "OpenMicro replaces the firmware on your macropad with its own build.\n\
          \n\
          This is not something the vendor supports, and it may void your warranty.\n\
-         Going back to the stock firmware is possible, but only from a backup of\n\
-         your own device — which this wizard will offer to take first. There is no\n\
-         published stock image to fall back on.",
+         \n\
+         Going back is straightforward: Work Louder publish their firmware openly,\n\
+         and Firmware > Restore the stock firmware downloads and writes it. Taking\n\
+         a backup first is still offered, since that keeps your exact current image\n\
+         rather than a stock one.",
     );
     if !ui.confirm("Understood — continue?", false)? {
         return Ok(());
@@ -304,7 +306,7 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     let backup = flash::backup_path();
     if backup.is_file() {
         ui.step(&format!("Stock firmware already backed up to {}", short_path(&backup)));
-    } else if ui.confirm("Back up the stock firmware first? (strongly recommended)", true)?
+    } else if ui.confirm("Back up your current firmware first? (optional)", false)?
         && port_is_clear(ui)?
     {
         run_job(ui, "Reading the stock firmware", "Stock firmware saved", || {
@@ -493,12 +495,12 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
             "will reboot into bootloader mode first".to_string()
         }),
         SelectOption::new("backup", "Back up the stock firmware")
-            .with_hint("the only way back to the vendor firmware"),
+            .with_hint("optional — keeps your exact current image"),
         SelectOption::new("restore", "Restore the stock firmware")
             .with_hint(if flash::backup_path().is_file() {
-                "from your saved backup"
+                "download Work Louder's, or use your backup"
             } else {
-                "no backup saved"
+                "downloads Work Louder's published firmware"
             }),
         SelectOption::new("back", "Back"),
     ];
@@ -534,28 +536,115 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                 flash::backup(None, None).map(|(_, lines)| lines)
             });
         }
-        "restore" => {
-            if !flash::backup_path().is_file() {
-                ui.error("No stock-firmware backup saved — there is nothing to restore from.");
-                return Ok(());
-            }
-            if !ui.confirm("Overwrite the device with your saved stock firmware?", false)? {
-                return Ok(());
-            }
-            if !ensure_bootloader(ui)? || !port_is_clear(ui)? {
-                return Ok(());
-            }
-            if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", || {
-                flash::restore(None, None)
-            }) {
-                run_job(ui, "Restarting the device", "Device restarted", || {
-                    wldevice::exit_bootloader(None)
-                });
-            }
-        }
+        "restore" => restore_stock(ui)?,
         _ => {}
     }
     Ok(())
+}
+
+/// Put the vendor's firmware back on the device.
+///
+/// Work Louder publish unencrypted merged images to a public GitHub repo, so
+/// going back no longer depends on having taken a backup first — that was the
+/// single scariest thing about installing OpenMicro. A backup, if one exists,
+/// is still offered because it is the user's *exact* image including their
+/// settings, which a stock release is not.
+fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
+    let backup = flash::backup_path();
+    let mut options = vec![SelectOption::new(
+        "official",
+        "Download Work Louder's firmware",
+    )
+    .with_hint("published releases — no backup needed")];
+    if backup.is_file() {
+        options.push(
+            SelectOption::new("backup", "Use my own backup")
+                .with_hint(short_path(&backup)),
+        );
+    }
+    options.push(SelectOption::new("back", "Back"));
+
+    let image = match ui.select("Which stock firmware?", &options)? {
+        "official" => match download_stock(ui)? {
+            Some(path) => path,
+            None => return Ok(()),
+        },
+        "backup" => backup,
+        _ => return Ok(()),
+    };
+
+    ui.note(
+        "This overwrites OpenMicro",
+        &format!(
+            "The device will be returned to the vendor firmware and will stop \
+             talking to OpenMicro.\n\nWriting: {}",
+            short_path(&image)
+        ),
+    );
+    if !ui.confirm("Overwrite the device with this firmware?", false)? {
+        return Ok(());
+    }
+    if !ensure_bootloader(ui)? || !port_is_clear(ui)? {
+        return Ok(());
+    }
+    let image_for_job = image.clone();
+    if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", move || {
+        flash::restore(Some(&image_for_job), None)
+    }) {
+        run_job(ui, "Restarting the device", "Device restarted", || {
+            wldevice::exit_bootloader(None)
+        });
+    }
+    Ok(())
+}
+
+/// Fetch the vendor's published stock firmware, letting the user pick a version.
+fn download_stock(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
+    let mut spinner = ui.spinner();
+    spinner.start("Fetching Work Louder's firmware releases");
+    let releases = match firmware::fetch_stock_releases() {
+        Ok(r) if r.is_empty() => {
+            spinner.error("No vendor firmware releases found");
+            return Ok(None);
+        }
+        Ok(r) => {
+            spinner.stop(&format!("Found {} vendor release(s)", r.len()));
+            r
+        }
+        Err(e) => {
+            spinner.error("Could not fetch the vendor release list");
+            for line in e.lines() {
+                ui.error(line);
+            }
+            return Ok(None);
+        }
+    };
+
+    let options: Vec<SelectOption<Option<Release>>> = releases
+        .iter()
+        .map(|r| {
+            let hint = match r.blocker() {
+                Some(_) => "no merged image in this release".to_string(),
+                None => format!("{} KiB", r.asset_size / 1024),
+            };
+            SelectOption::new(r.blocker().is_none().then(|| r.clone()), r.label())
+                .with_hint(hint)
+        })
+        .chain(std::iter::once(SelectOption::new(None, "Back")))
+        .collect();
+
+    let Some(release) = ui.select("Which vendor version?", &options)? else {
+        return Ok(None);
+    };
+
+    let mut path = None;
+    run_job(ui, &format!("Downloading {}", release.tag), "Vendor firmware downloaded", || {
+        firmware::download_stock_release(&release).map(|(p, lines)| {
+            path = Some(p);
+            lines
+        })
+    });
+    Ok(path)
 }
 
 /// Warn when another process will fight us for the serial port.
@@ -1106,8 +1195,8 @@ fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
         .map(|f| {
             let detail = if f.target.is_irreversible() {
                 format!(
-                    "CANNOT BE UNDONE. {} Deleting it means you can never put the vendor \
-                     firmware back.",
+                    "Cannot be re-created — it is a dump of this device. {} \
+                     (Work Louder's own firmware can still be downloaded.)",
                     f.detail
                 )
             } else {
@@ -1146,8 +1235,9 @@ fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
     // undone by reinstalling, so a single "remove these?" is not enough consent.
     if targets.contains(&Target::StockBackup) {
         ui.warn(
-            "You chose to delete the stock-firmware backup. That is the only copy of your \
-             device's original firmware — after this, going back is impossible.",
+            "You chose to delete the stock-firmware backup. It is the only copy of this \
+             device's exact original image; Work Louder's published firmware can still be \
+             downloaded, but your own snapshot cannot be re-created.",
         );
         if !ui.confirm("Delete the stock-firmware backup as well?", false)? {
             targets.retain(|t| *t != Target::StockBackup);

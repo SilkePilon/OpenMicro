@@ -64,25 +64,31 @@ pub fn resolve_image(explicit: Option<&Path>) -> Result<PathBuf, String> {
         ));
     }
 
-    for base in candidate_roots() {
+    resolve_default(&candidate_roots(), &crate::firmware::cache_image())
+}
+
+/// Pick the default image from a set of source roots plus the download cache.
+///
+/// Split out and taking its inputs explicitly so the "nothing found" path can
+/// be tested: reading the real cache directory made this depend on whether the
+/// developer had ever downloaded firmware.
+fn resolve_default(roots: &[PathBuf], cached: &Path) -> Result<PathBuf, String> {
+    for base in roots {
         let candidate = base.join(DEFAULT_IMAGE_REL);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
 
-    // A firmware image downloaded by `openmicro firmware download` (or the TUI
-    // setup wizard) is equally flashable, and is the only source available when
-    // running from an installed binary rather than a source checkout.
-    let cached = crate::firmware::cache_image();
+    // A downloaded image is equally flashable, and is the only source available
+    // when running from an installed binary rather than a source checkout.
     if cached.is_file() {
-        return Ok(cached);
+        return Ok(cached.to_path_buf());
     }
 
     Err(format!(
         "no firmware image found (looked for {DEFAULT_IMAGE_REL} and {}). \
-         Get one first: `openmicro firmware build` (needs the Xtensa toolchain — see \
-         firmware/README.md) or `openmicro firmware download`.",
+         Get one first: build it from source, or download a published version.",
         cached.display()
     ))
 }
@@ -397,16 +403,15 @@ pub fn backup(dest: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<S
 
 /// Write a previously saved stock-firmware backup back to the device.
 ///
-/// This is the "undo" for installing custom firmware. It is *not* a supported
-/// use of the hardware by its vendor — it only works because [`backup`] kept a
-/// byte-for-byte copy of the original flash — so it refuses outright when no
-/// backup exists rather than pretending.
+/// This is the "undo" for installing custom firmware. The image is either a
+/// backup [`backup`] took of this device, or one of Work Louder's own published
+/// releases — see `crate::firmware::fetch_stock_releases`.
 pub fn restore(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, String> {
     let path = image.map(|p| p.to_path_buf()).unwrap_or_else(backup_path);
     if !path.is_file() {
         return Err(format!(
-            "no stock-firmware backup at {} — a restore is only possible from a backup taken \
-             BEFORE flashing custom firmware (`openmicro backup`).",
+            "no firmware image at {}. Download one of Work Louder's published \
+             releases, or point this at a backup you took earlier.",
             path.display()
         ));
     }
@@ -583,13 +588,30 @@ mod tests {
     #[test]
     fn resolve_image_none_errs_with_build_hint() {
         // No image is built in this environment, so the default lookup fails.
-        let err = resolve_image(None).unwrap_err();
-        assert!(err.contains("firmware/README.md"), "{err}");
-        // Both ways to get an image are offered, and the download cache is
-        // named so it is obvious where a fetched image would have landed.
-        assert!(err.contains("openmicro firmware build"), "{err}");
-        assert!(err.contains("openmicro firmware download"), "{err}");
-        assert!(err.contains(crate::firmware::CACHE_REL), "{err}");
+        // Hermetic: no source roots, and a cache path that cannot exist. Reading
+        // the developer's real cache made this pass or fail depending on
+        // whether they had ever downloaded firmware.
+        let err = resolve_default(&[], Path::new("/nonexistent/openmicro-fw.bin")).unwrap_err();
+        assert!(err.contains(DEFAULT_IMAGE_REL), "{err}");
+        assert!(err.contains("/nonexistent/openmicro-fw.bin"), "names the cache: {err}");
+        // Both ways to get an image are offered.
+        assert!(err.contains("build it from source"), "{err}");
+        assert!(err.contains("download"), "{err}");
+    }
+
+    #[test]
+    fn resolve_default_prefers_a_source_build_over_the_download_cache() {
+        let dir = std::env::temp_dir().join(format!("openmicro-resolve-{}", std::process::id()));
+        let built = dir.join(DEFAULT_IMAGE_REL);
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"elf").unwrap();
+        let cached = dir.join("cached.bin");
+        std::fs::write(&cached, b"bin").unwrap();
+
+        let picked = resolve_default(std::slice::from_ref(&dir), &cached).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(picked, built, "a local build wins over a stale download");
     }
 
     #[test]
@@ -760,8 +782,8 @@ mod tests {
     #[test]
     fn restore_without_a_backup_refuses() {
         let err = restore(Some(Path::new("/definitely/not/here/stock.bin")), None).unwrap_err();
-        assert!(err.contains("no stock-firmware backup"), "{err}");
-        assert!(err.contains("BEFORE"), "must explain when a backup had to be taken: {err}");
+        assert!(err.contains("no firmware image"), "{err}");
+        assert!(err.contains("Work Louder"), "points at the vendor releases: {err}");
     }
 
     #[test]

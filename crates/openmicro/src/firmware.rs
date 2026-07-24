@@ -25,6 +25,15 @@ pub const RELEASES_URL_ENV: &str = "OPENMICRO_RELEASES_URL";
 /// one specific URL. Useful for a self-hosted or locally built image.
 pub const FIRMWARE_URL_ENV: &str = "OPENMICRO_FIRMWARE_URL";
 
+/// Work Louder publish the **stock** Creator Micro 2 firmware here, as
+/// unencrypted merged flash images. This is what makes going back to the
+/// vendor firmware possible without having taken a backup first.
+pub const STOCK_RELEASES_API: &str =
+    "https://api.github.com/repos/worklouder/cm-v2-fw-releases/releases";
+
+/// Override for [`STOCK_RELEASES_API`] (a fork, a mirror, or a `file://` path).
+pub const STOCK_RELEASES_URL_ENV: &str = "OPENMICRO_STOCK_RELEASES_URL";
+
 /// Sibling file recording which release the cached image came from, so the CLI
 /// and the wizard can say *which version* is sitting in the cache.
 pub const CACHE_VERSION_REL: &str = ".cache/openmicro/firmware/openmicro-fw.version";
@@ -185,6 +194,19 @@ impl Release {
 /// a release with no `.bin` asset is kept but marked uninstallable, which is
 /// more honest than silently omitting a version the user can see on GitHub.
 pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
+    parse_releases_matching(json, is_firmware_asset)
+}
+
+/// Parse the vendor's stock-firmware release list.
+pub fn parse_stock_releases(json: &str) -> Result<Vec<Release>, String> {
+    parse_releases_matching(json, is_stock_asset)
+}
+
+/// Shared release-list parser, differing only in what counts as the image.
+fn parse_releases_matching(
+    json: &str,
+    is_image: fn(&serde_json::Value) -> bool,
+) -> Result<Vec<Release>, String> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("release list is not valid JSON ({e})"))?;
     let items = value.as_array().ok_or_else(|| {
@@ -203,7 +225,7 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
         let asset = item
             .get("assets")
             .and_then(|a| a.as_array())
-            .and_then(|assets| assets.iter().find(|a| is_firmware_asset(a)));
+            .and_then(|assets| assets.iter().find(|a| is_image(a)));
 
         out.push(Release {
             tag: tag.to_string(),
@@ -224,7 +246,7 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
     Ok(out)
 }
 
-/// True for an asset that looks like a flashable firmware image.
+/// True for an asset that looks like one of *our* flashable images.
 fn is_firmware_asset(asset: &serde_json::Value) -> bool {
     asset
         .get("name")
@@ -232,13 +254,63 @@ fn is_firmware_asset(asset: &serde_json::Value) -> bool {
         .is_some_and(|n| n.ends_with(".bin") && n.contains("openmicro"))
 }
 
-/// Fetch and parse the published release list.
+/// True for a vendor **merged** flash image, e.g.
+/// `firmware_v0.6.0-rc.6_merged.bin`.
+///
+/// The "merged" part matters: the vendor also ships per-partition images, and
+/// only the merged one can be written at offset `0x0` the way [`crate::flash`]
+/// does it.
+fn is_stock_asset(asset: &serde_json::Value) -> bool {
+    asset
+        .get("name")
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.ends_with(".bin") && n.contains("merged"))
+}
+
+/// The API endpoint the stock-firmware list is fetched from.
+pub fn stock_releases_url() -> String {
+    std::env::var(STOCK_RELEASES_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| STOCK_RELEASES_API.to_string())
+}
+
+/// Fetch the vendor's published stock-firmware releases, newest first.
+pub fn fetch_stock_releases() -> Result<Vec<Release>, String> {
+    parse_stock_releases(&fetch_release_json(&stock_releases_url())?)
+}
+
+/// Where a downloaded stock image is cached. Kept per-version, and separate
+/// from our own image, so restoring never races with flashing OpenMicro.
+pub fn stock_cache_image(tag: &str) -> PathBuf {
+    let safe: String = tag
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    crate::agents::home().join(".cache/openmicro/firmware").join(format!("stock-{safe}.bin"))
+}
+
+/// Download one vendor stock-firmware release.
+pub fn download_stock_release(release: &Release) -> Result<(PathBuf, Vec<String>), String> {
+    let url = release.asset_url.as_ref().ok_or_else(|| {
+        format!("vendor release {} has no merged image attached.", release.tag)
+    })?;
+    let dest = stock_cache_image(&release.tag);
+    fetch_to(url, &dest, &format!("stock firmware {}", release.tag))
+}
+
+/// Fetch and parse our own published release list.
 pub fn fetch_releases() -> Result<Vec<Release>, String> {
+    parse_releases(&fetch_release_json(&releases_url())?)
+}
+
+/// GET a GitHub release listing and return its body.
+fn fetch_release_json(url: &str) -> Result<String, String> {
     let curl = crate::flash::which(&["curl"])
         .ok_or_else(|| "curl not found — install curl to list firmware releases.".to_string())?;
-    let url = releases_url();
     let output = std::process::Command::new(&curl)
-        .args(release_list_args(&url))
+        .args(release_list_args(url))
         .output()
         .map_err(|e| format!("cannot run curl: {e}"))?;
     if !output.status.success() {
@@ -248,7 +320,7 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_releases(&String::from_utf8_lossy(&output.stdout))
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// `curl` argv for the release list: GitHub's API requires a User-Agent and
@@ -376,9 +448,14 @@ pub fn download_release(release: &Release) -> Result<(PathBuf, Vec<String>), Str
 /// written to a temp path and renamed only after a successful transfer, so a
 /// half-downloaded image can never be flashed.
 fn download_from(url: &str, label: &str) -> Result<(PathBuf, Vec<String>), String> {
+    fetch_to(url, &cache_image(), label)
+}
+
+/// Fetch `url` to `dest`, atomically.
+fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<(PathBuf, Vec<String>), String> {
     let curl = crate::flash::which(&["curl"])
         .ok_or_else(|| "curl not found — install curl, or build the firmware instead.".to_string())?;
-    let dest = cache_image();
+    let dest = dest.to_path_buf();
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;

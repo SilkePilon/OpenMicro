@@ -54,9 +54,10 @@ impl Target {
 
     /// Whether removing this can be undone by reinstalling.
     ///
-    /// Only the stock-firmware backup cannot: it is a dump of the user's own
-    /// device that nobody publishes, so deleting it permanently removes the
-    /// ability to go back to the vendor firmware.
+    /// The stock-firmware backup is the only one that cannot be recreated: it
+    /// is a dump of this particular device. Losing it no longer strands anyone
+    /// on custom firmware — Work Louder publish their images, so a restore is
+    /// still possible — but it is the user's data and nobody else has a copy.
     pub fn is_irreversible(self) -> bool {
         self == Target::StockBackup
     }
@@ -162,10 +163,7 @@ fn survey_one(target: Target, home: &Path) -> Found {
             let present = dir.exists();
             let detail = if backup.is_file() {
                 let size = std::fs::metadata(&backup).map(|m| m.len()).unwrap_or(0);
-                format!(
-                    "{} MiB — the ONLY way back to the vendor firmware",
-                    size / (1024 * 1024)
-                )
+                format!("{} MiB — a dump of this device, not re-creatable", size / (1024 * 1024))
             } else if present {
                 "no backup image inside".to_string()
             } else {
