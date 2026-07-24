@@ -321,6 +321,120 @@ pub fn merge_claude_hooks(existing: &str, agent_flag: Option<&str>) -> Result<St
     Ok(out)
 }
 
+/// Strip OpenMicro's hook entries back out of a Claude Code-style config.
+///
+/// The exact inverse of [`merge_claude_hooks`], and equally conservative: only
+/// groups whose command mentions `openmicro-hook` are dropped, the user's own
+/// hooks for the same events stay, and an event array (or the `hooks` object)
+/// left empty by the removal is deleted so uninstalling leaves the file as it
+/// was found rather than littered with empty scaffolding.
+pub fn remove_claude_hooks(existing: &str) -> Result<String, String> {
+    let mut root: serde_json::Value = serde_json::from_str(blank_to_empty_object(existing))
+        .map_err(|e| format!("config is not valid JSON ({e}) — leaving it alone"))?;
+    let Some(obj) = root.as_object_mut() else {
+        return Err("config is valid JSON but not an object".to_string());
+    };
+    let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(existing.to_string()); // nothing of ours to remove
+    };
+
+    for (event, _) in HOOK_EVENTS {
+        let Some(groups) = hooks.get_mut(event).and_then(|g| g.as_array_mut()) else {
+            continue;
+        };
+        groups.retain(|g| !group_has_openmicro_hook(g));
+    }
+    // Drop keys we emptied, but never one the user had other hooks in.
+    hooks.retain(|_, v| !v.as_array().is_some_and(|a| a.is_empty()));
+    let hooks_empty = hooks.is_empty();
+    if hooks_empty {
+        obj.remove("hooks");
+    }
+
+    if obj.is_empty() {
+        // The file existed only to hold our hooks.
+        return Ok(String::new());
+    }
+    let mut out = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("cannot serialize config: {e}"))?;
+    out.push('\n');
+    Ok(out)
+}
+
+/// Strip OpenMicro's `notify` line (and the comment we wrote above it) out of a
+/// Codex `config.toml`, leaving a `notify` that points anywhere else alone.
+pub fn remove_codex_notify(existing: &str) -> Result<String, String> {
+    let Some((idx, line)) = root_notify_line(existing) else {
+        return Ok(existing.to_string());
+    };
+    if !line.contains(HOOK_MARKER) {
+        return Ok(existing.to_string()); // someone else's notify; not ours to touch
+    }
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut drop_from = idx;
+    // Also drop the comment we wrote immediately above it, and the blank line we
+    // inserted below, so removing leaves no trace.
+    if idx > 0 && lines[idx - 1].trim_start().starts_with("# OpenMicro") {
+        drop_from = idx - 1;
+    }
+    let mut drop_to = idx; // inclusive
+    if lines.get(idx + 1).is_some_and(|l| l.trim().is_empty()) {
+        drop_to = idx + 1;
+    }
+
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i < drop_from || *i > drop_to)
+        .map(|(_, l)| *l)
+        .collect();
+
+    if kept.iter().all(|l| l.trim().is_empty()) {
+        return Ok(String::new());
+    }
+    let mut text = kept.join("\n");
+    text.push('\n');
+    Ok(text)
+}
+
+/// Take OpenMicro's hooks back out of one agent's config.
+///
+/// Mirrors [`install`]: atomic write, and an untouched file when there was
+/// nothing of ours in it. A config that became empty is deleted outright rather
+/// than left as an empty file the agent might not expect.
+pub fn uninstall(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
+    let path = home.join(kind.config_rel());
+    let existing = read_config(kind, home)?;
+    if existing.is_empty() && !path.exists() {
+        return Ok(InstallReport { kind, path, changed: false, backup: None });
+    }
+
+    let stripped = match kind.mechanism() {
+        Mechanism::ClaudeHooks { .. } => remove_claude_hooks(&existing)?,
+        Mechanism::CodexNotify => remove_codex_notify(&existing)?,
+    };
+    if stripped == existing {
+        return Ok(InstallReport { kind, path, changed: false, backup: None });
+    }
+
+    if stripped.trim().is_empty() {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+    } else {
+        let tmp = sibling(&path, ".openmicro.tmp");
+        std::fs::write(&tmp, stripped.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    }
+    // The backup we took at install time has served its purpose.
+    let backup = sibling(&path, ".openmicro.bak");
+    let _ = std::fs::remove_file(&backup);
+
+    Ok(InstallReport { kind, path, changed: true, backup: None })
+}
+
 /// True if a Codex `config.toml` already has a **root** `notify` key pointing at
 /// `openmicro-hook`.
 pub fn codex_notify_installed(existing: &str) -> bool {
@@ -674,6 +788,105 @@ mod tests {
         let text = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
         assert!(text.contains("openmicro-hook"), "{text}");
         assert_eq!(hook_status(AgentKind::Codex, home.path()), HookStatus::Installed);
+    }
+
+    #[test]
+    fn removing_hooks_is_the_exact_inverse_of_installing_them() {
+        let original = r#"{"model":"opus","permissions":{"allow":["Bash"]}}"#;
+        let installed = merge_claude_hooks(original, None).unwrap();
+        let removed = remove_claude_hooks(&installed).unwrap();
+
+        let before: serde_json::Value = serde_json::from_str(original).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&removed).unwrap();
+        assert_eq!(before, after, "uninstall must leave the config as it was found");
+    }
+
+    #[test]
+    fn removing_hooks_keeps_the_users_own_hooks_for_the_same_event() {
+        let original =
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"notify-send done"}]}]}}"#;
+        let installed = merge_claude_hooks(original, None).unwrap();
+        let removed = remove_claude_hooks(&installed).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&removed).unwrap();
+
+        let stop = after["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["hooks"][0]["command"], "notify-send done");
+        // The events where we were the only hook are gone entirely, not left
+        // behind as empty arrays.
+        assert!(after["hooks"].get("PreToolUse").is_none(), "{after}");
+    }
+
+    #[test]
+    fn removing_hooks_from_a_config_that_was_only_ours_empties_it() {
+        let installed = merge_claude_hooks("", None).unwrap();
+        assert_eq!(remove_claude_hooks(&installed).unwrap(), "");
+    }
+
+    #[test]
+    fn removing_hooks_when_there_are_none_changes_nothing() {
+        let original = r#"{"model":"opus"}"#;
+        assert_eq!(remove_claude_hooks(original).unwrap(), original);
+    }
+
+    #[test]
+    fn removing_codex_notify_leaves_the_rest_of_the_file() {
+        let original = "# my codex config\nmodel = \"gpt\"\n\n[tui]\ntheme = \"dark\"\n";
+        let installed = insert_codex_notify(original).unwrap();
+        let removed = remove_codex_notify(&installed).unwrap();
+
+        assert!(!removed.contains("openmicro-hook"), "{removed}");
+        assert!(!removed.contains("# OpenMicro"), "our comment must go too: {removed}");
+        assert!(removed.contains("model = \"gpt\"") && removed.contains("[tui]"), "{removed}");
+        // Still parses as the same config it started as.
+        assert_eq!(removed.trim(), original.trim());
+    }
+
+    #[test]
+    fn removing_codex_notify_leaves_someone_elses_alone() {
+        let other = "notify = [\"my-own-notifier\"]\n[tui]\n";
+        assert_eq!(remove_codex_notify(other).unwrap(), other);
+    }
+
+    #[test]
+    fn uninstall_round_trips_on_disk() {
+        let home = TempHome::new("uninstall");
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\n  \"model\": \"opus\"\n}\n").unwrap();
+
+        install(AgentKind::Claude, home.path()).unwrap();
+        assert_eq!(hook_status(AgentKind::Claude, home.path()), HookStatus::Installed);
+
+        let report = uninstall(AgentKind::Claude, home.path()).unwrap();
+        assert!(report.changed);
+        assert_eq!(hook_status(AgentKind::Claude, home.path()), HookStatus::Missing);
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["model"], "opus");
+        // The install-time backup is cleaned up with it.
+        assert!(!home.path().join(".claude/settings.json.openmicro.bak").exists());
+
+        // Uninstalling twice is a no-op, not an error.
+        assert!(!uninstall(AgentKind::Claude, home.path()).unwrap().changed);
+    }
+
+    #[test]
+    fn uninstall_removes_a_config_that_only_ever_held_our_hooks() {
+        let home = TempHome::new("uninstall-empty");
+        install(AgentKind::Codex, home.path()).unwrap();
+        let path = home.path().join(".codex/config.toml");
+        assert!(path.exists());
+
+        uninstall(AgentKind::Codex, home.path()).unwrap();
+        assert!(!path.exists(), "a file that was only ours should not be left behind empty");
+    }
+
+    #[test]
+    fn uninstall_on_a_machine_without_the_agent_is_a_no_op() {
+        let home = TempHome::new("uninstall-absent");
+        let report = uninstall(AgentKind::Grok, home.path()).unwrap();
+        assert!(!report.changed);
     }
 
     #[test]

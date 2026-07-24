@@ -1,11 +1,15 @@
 mod agents;
 mod cli;
 mod client;
+mod daemon;
 mod firmware;
 mod flash;
 mod onboarding;
 mod probe;
+mod prompt;
 mod ui;
+mod uninstall;
+mod wldevice;
 
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;

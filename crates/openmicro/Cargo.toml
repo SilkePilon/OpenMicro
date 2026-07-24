@@ -20,3 +20,6 @@ clap.workspace = true
 bluer.workspace = true
 futures.workspace = true
 uuid.workspace = true
+# Vendor HID control: asking the firmware to reboot into ROM download mode is
+# the only way into the bootloader on this board (no usable boot button).
+hidapi.workspace = true

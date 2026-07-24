@@ -1,0 +1,406 @@
+//! Work Louder vendor HID control: the software route into and out of the
+//! ESP32-S3 ROM bootloader.
+//!
+//! The Creator Micro 2 has no usable boot-button workflow. Its firmware
+//! enumerates as a composite HID device on its own product id, so the hardware
+//! USB-Serial-JTAG peripheral is not on the bus at all and esptool's usual
+//! reset dance has nothing to talk to. Work Louder's own tooling instead asks
+//! the *firmware* to reboot into download mode, over a vendor HID interface.
+//!
+//! Wire format, matching `@worklouder/wl-device-kit` and independently
+//! confirmed against microbridge's `mb-device` crate, which drives the same
+//! hardware:
+//!
+//! ```text
+//! interface: usage page 0xFF00 on VID 0x303A
+//! report:    [0]=0x06 report id, [1]=channel, [2]=payload len (0..=61), [3..]=UTF-8
+//! payload:   {"method":"sys.bootloader","params":null,"id":<0..999>}
+//! ```
+//!
+//! Coming back out is a different mechanism entirely: once in download mode the
+//! device is a plain CDC serial port speaking the esptool protocol, and the
+//! only reset that works on USB-Serial-JTAG is the RTC watchdog one.
+
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// Espressif's USB vendor id, which Work Louder ships under.
+pub const WL_VID: u16 = 0x303A;
+
+/// Product id of the Codex Micro — the same hardware under ChatGPT branding.
+pub const CODEX_MICRO_PID: u16 = 0x8360;
+
+/// Every product id that means "a supported macropad, running its firmware".
+pub const APP_PIDS: [u16; 3] = [0x8297, 0x8298, CODEX_MICRO_PID];
+
+/// Product id of the ESP32-S3 ROM bootloader (USB JTAG/serial debug unit).
+pub const BOOTLOADER_PID: u16 = 0x1001;
+
+/// Vendor-specific HID usage page carrying the JSON-RPC channel.
+pub const WL_USAGE_PAGE: u16 = 0xFF00;
+
+/// HID report id used for all Work Louder vendor traffic.
+pub const REPORT_ID: u8 = 0x06;
+
+/// Channel byte for the JSON-RPC stream (channel 1 is device debug logging).
+pub const CHANNEL_RPC: u8 = 2;
+
+/// Bytes of payload that fit in one report after the 3-byte header.
+pub const MAX_CHUNK: usize = 61;
+
+/// Size of a full outgoing report, report id included.
+pub const REPORT_SIZE: usize = 64;
+
+/// The RPC method that reboots the device into ROM download mode.
+pub const BOOTLOADER_METHOD: &str = "sys.bootloader";
+
+/// `RTC_CNTL_OPTION1_REG`. Its force-download-boot bit is what `sys.bootloader`
+/// sets, and on the battery-backed Pro model it survives an unplug — so it must
+/// be cleared explicitly, or the device re-enters download mode on every boot.
+pub const RTC_CNTL_OPTION1_REG: u32 = 0x6000_812C;
+
+/// How long to wait for the device to drop off USB and come back as the ROM
+/// bootloader after being asked to reboot.
+pub const BOOTLOADER_APPEAR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// True for a product id that means the macropad is running its firmware.
+pub fn is_app_pid(pid: u16) -> bool {
+    APP_PIDS.contains(&pid)
+}
+
+/// Human label for a product id, for log lines.
+pub fn product_name(pid: u16) -> &'static str {
+    match pid {
+        CODEX_MICRO_PID => "Codex Micro",
+        0x8297 | 0x8298 => "Creator Micro 2",
+        BOOTLOADER_PID => "ESP32-S3 ROM bootloader",
+        _ => "unknown Work Louder device",
+    }
+}
+
+/// Build a JSON-RPC request in the exact shape the firmware expects.
+///
+/// Hand-built rather than serialized from a struct on purpose: the firmware
+/// wants the compact form with **no** `"jsonrpc":"2.0"` member, these keys in
+/// this order, and it rejects ids of 1000 or more.
+pub fn rpc_request(method: &str, id: u16) -> String {
+    format!(r#"{{"method":"{method}","params":null,"id":{}}}"#, id % 1000)
+}
+
+/// Frame a UTF-8 message into 64-byte HID reports on the RPC channel.
+///
+/// Messages longer than [`MAX_CHUNK`] are split across consecutive reports; an
+/// empty message still produces one zero-length report, matching the vendor
+/// implementation.
+pub fn frame_rpc(message: &str) -> Vec<[u8; REPORT_SIZE]> {
+    let bytes = message.as_bytes();
+    if bytes.is_empty() {
+        let mut report = [0u8; REPORT_SIZE];
+        report[0] = REPORT_ID;
+        report[1] = CHANNEL_RPC;
+        return vec![report];
+    }
+    bytes
+        .chunks(MAX_CHUNK)
+        .map(|chunk| {
+            let mut report = [0u8; REPORT_SIZE];
+            report[0] = REPORT_ID;
+            report[1] = CHANNEL_RPC;
+            report[2] = chunk.len() as u8;
+            report[3..3 + chunk.len()].copy_from_slice(chunk);
+            report
+        })
+        .collect()
+}
+
+/// An id for one request. Not random — just varied enough that a reply can be
+/// matched to its request within a session, and always under the firmware's
+/// limit of 1000.
+fn next_id() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static COUNTER: AtomicU16 = AtomicU16::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    (u32::from(std::process::id() as u16).wrapping_add(u32::from(n)) % 1000) as u16
+}
+
+/// What the USB bus says about the macropad right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbMode {
+    /// Running its firmware, so RPC-controllable.
+    App(u16),
+    /// In ROM download mode, so flashable.
+    Bootloader,
+    /// Not on the bus.
+    Absent,
+}
+
+/// Classify the macropad's USB presence from the `(vid, pid)` pairs on the bus.
+///
+/// Bootloader wins if both are somehow seen, since that is the state every
+/// flashing operation cares about.
+pub fn classify(ids: &[(u16, u16)]) -> UsbMode {
+    if ids.contains(&(WL_VID, BOOTLOADER_PID)) {
+        return UsbMode::Bootloader;
+    }
+    for (vid, pid) in ids {
+        if *vid == WL_VID && is_app_pid(*pid) {
+            return UsbMode::App(*pid);
+        }
+    }
+    UsbMode::Absent
+}
+
+/// Current USB mode, read from sysfs.
+pub fn usb_mode() -> UsbMode {
+    classify(&crate::flash::detect_usb())
+}
+
+/// Ask the running firmware to reboot into ROM download mode.
+///
+/// Returns progress lines for the UI. Succeeds when the bootloader actually
+/// shows up on USB — *not* when the write succeeds — because the device
+/// frequently drops off the bus before it can answer, so a write error is not
+/// evidence of failure. This mirrors what Work Louder's own tool does.
+pub fn enter_bootloader() -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+
+    match usb_mode() {
+        UsbMode::Bootloader => {
+            log.push("already in bootloader mode.".to_string());
+            return Ok(log);
+        }
+        UsbMode::Absent => {
+            return Err("no macropad found on USB. Connect it with a data-capable cable \
+                        (a charge-only cable enumerates nothing) and try again."
+                .to_string());
+        }
+        UsbMode::App(pid) => log.push(format!("found {} on USB.", product_name(pid))),
+    }
+
+    let request = rpc_request(BOOTLOADER_METHOD, next_id());
+    log.push(format!("sending {BOOTLOADER_METHOD}"));
+    let write_result = send_rpc(&request);
+
+    log.push("waiting for the device to re-enumerate".to_string());
+    let deadline = Instant::now() + BOOTLOADER_APPEAR_TIMEOUT;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        if usb_mode() == UsbMode::Bootloader {
+            log.push("device is in bootloader mode.".to_string());
+            return Ok(log);
+        }
+    }
+
+    // It never came back, so now the write error (if there was one) is the
+    // useful part of the story.
+    match write_result {
+        Err(e) => Err(format!(
+            "could not put the device into bootloader mode: {e}\n\
+             It stayed on USB in its normal mode."
+        )),
+        Ok(()) => Err(format!(
+            "the device accepted {BOOTLOADER_METHOD} but did not come back as a bootloader \
+             within {}s. Unplug and replug it, then try again.",
+            BOOTLOADER_APPEAR_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Write one framed RPC request to the vendor HID interface.
+///
+/// Tries the interface whose usage page is the vendor one first; if the HID
+/// backend does not report usage pages (which happens on some Linux setups),
+/// falls back to every other interface of a matching device, since writing to
+/// the wrong one merely errors.
+fn send_rpc(request: &str) -> Result<(), String> {
+    let api = hidapi::HidApi::new().map_err(|e| format!("cannot open HID: {e}"))?;
+
+    let mut candidates: Vec<_> = api
+        .device_list()
+        .filter(|d| d.vendor_id() == WL_VID && is_app_pid(d.product_id()))
+        .collect();
+    if candidates.is_empty() {
+        return Err("no Work Louder HID interface found".to_string());
+    }
+    candidates.sort_by_key(|d| u8::from(d.usage_page() != WL_USAGE_PAGE));
+
+    let reports = frame_rpc(request);
+    let mut last_error = "no interface accepted the write".to_string();
+    for info in candidates {
+        let device = match info.open_device(&api) {
+            Ok(d) => d,
+            Err(e) => {
+                last_error =
+                    format!("{e} — check you have permission to open hidraw devices");
+                continue;
+            }
+        };
+        match reports.iter().try_for_each(|r| device.write(r).map(|_| ())) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    Err(last_error)
+}
+
+/// Bring the device back out of download mode, without unplugging it.
+///
+/// Two steps, both required, in one esptool invocation: clear the
+/// battery-backed force-download-boot bit so it does not simply re-enter, then
+/// perform an RTC **watchdog** reset. A plain reset does not re-sample the boot
+/// straps on USB-Serial-JTAG, and this board exposes no DTR/RTS lines for the
+/// classic auto-reset, so `--after watchdog-reset` is the only thing that works.
+pub fn exit_bootloader(port: Option<&str>) -> Result<Vec<String>, String> {
+    if usb_mode() != UsbMode::Bootloader {
+        return Ok(vec!["device is not in bootloader mode; nothing to do.".to_string()]);
+    }
+    let esptool = crate::flash::esptool_path().ok_or_else(|| {
+        "leaving bootloader mode needs esptool. Install it: pip install esptool.".to_string()
+    })?;
+
+    let output = Command::new(&esptool)
+        .args(exit_args(port))
+        .output()
+        .map_err(|e| format!("failed to launch esptool: {e}"))?;
+    let mut lines = crate::flash::combine_output(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        lines.push(format!(
+            "esptool exited with {}.",
+            crate::flash::exit_desc(output.status.code())
+        ));
+        return Err(lines.join("\n"));
+    }
+    lines.push("device reset out of bootloader mode.".to_string());
+    Ok(lines)
+}
+
+/// esptool argv that clears the force-download bit and watchdog-resets.
+///
+/// Pure, so the exact invocation is pinned by a test: getting `--after` wrong
+/// leaves the device stuck re-entering download mode on every boot.
+pub fn exit_args(port: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--chip".to_string(), crate::flash::CHIP.to_string()];
+    if let Some(p) = port {
+        args.push("--port".to_string());
+        args.push(p.to_string());
+    }
+    args.push("--before".to_string());
+    args.push("no-reset".to_string());
+    args.push("--after".to_string());
+    args.push("watchdog-reset".to_string());
+    args.push("write-mem".to_string());
+    args.push(format!("0x{RTC_CNTL_OPTION1_REG:X}"));
+    args.push("0".to_string());
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_request_is_the_compact_form_the_firmware_wants() {
+        // No "jsonrpc" member, this key order, id under 1000.
+        assert_eq!(
+            rpc_request("sys.bootloader", 7),
+            r#"{"method":"sys.bootloader","params":null,"id":7}"#
+        );
+    }
+
+    #[test]
+    fn rpc_ids_are_kept_below_the_firmware_limit() {
+        assert!(rpc_request("sys.version", 1000).ends_with(r#""id":0}"#));
+        assert!(rpc_request("sys.version", 1234).ends_with(r#""id":234}"#));
+        for _ in 0..2000 {
+            assert!(next_id() < 1000);
+        }
+    }
+
+    #[test]
+    fn framing_matches_the_vendor_layout() {
+        let msg = rpc_request(BOOTLOADER_METHOD, 1);
+        let reports = frame_rpc(&msg);
+        assert_eq!(reports.len(), 1, "the bootloader request fits in one report");
+        assert_eq!(reports[0][0], REPORT_ID);
+        assert_eq!(reports[0][1], CHANNEL_RPC);
+        assert_eq!(reports[0][2] as usize, msg.len());
+        assert_eq!(&reports[0][3..3 + msg.len()], msg.as_bytes());
+        assert_eq!(reports[0].len(), REPORT_SIZE);
+        // Trailing bytes are zero-padded, not left as stack garbage.
+        assert!(reports[0][3 + msg.len()..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn framing_splits_long_messages_at_61_bytes() {
+        let reports = frame_rpc(&"x".repeat(130));
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0][2], 61);
+        assert_eq!(reports[1][2], 61);
+        assert_eq!(reports[2][2], 8);
+    }
+
+    #[test]
+    fn framing_an_empty_message_still_sends_one_report() {
+        let reports = frame_rpc("");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0][2], 0);
+    }
+
+    #[test]
+    fn classify_prefers_bootloader_over_the_app() {
+        assert_eq!(classify(&[(WL_VID, BOOTLOADER_PID)]), UsbMode::Bootloader);
+        assert_eq!(
+            classify(&[(WL_VID, 0x8298), (WL_VID, BOOTLOADER_PID)]),
+            UsbMode::Bootloader
+        );
+    }
+
+    #[test]
+    fn classify_recognises_every_supported_product() {
+        for pid in APP_PIDS {
+            assert_eq!(classify(&[(WL_VID, pid)]), UsbMode::App(pid), "pid {pid:#x}");
+        }
+    }
+
+    #[test]
+    fn classify_ignores_unrelated_devices() {
+        assert_eq!(classify(&[(0x1234, 0x5678)]), UsbMode::Absent);
+        assert_eq!(classify(&[]), UsbMode::Absent);
+        // Same vendor id, but not one of ours — Espressif ships a lot of things.
+        assert_eq!(classify(&[(WL_VID, 0x4001)]), UsbMode::Absent);
+    }
+
+    #[test]
+    fn exit_args_clear_the_force_download_bit_and_watchdog_reset() {
+        let args = exit_args(None);
+        // `--before no-reset`: the device is already in download mode, and
+        // resetting first would drop us straight back out of it.
+        assert!(args.windows(2).any(|w| w == ["--before", "no-reset"]), "{args:?}");
+        // A plain hard reset does NOT work on USB-Serial-JTAG.
+        assert!(args.windows(2).any(|w| w == ["--after", "watchdog-reset"]), "{args:?}");
+        assert!(args.contains(&"write-mem".to_string()));
+        assert!(args.contains(&"0x6000812C".to_string()), "{args:?}");
+        assert_eq!(args.last().unwrap(), "0", "the register is cleared, not set");
+    }
+
+    #[test]
+    fn exit_args_pass_an_explicit_port_through() {
+        let args = exit_args(Some("/dev/ttyACM0"));
+        assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]));
+    }
+
+    #[test]
+    fn product_names_cover_every_id_we_advertise() {
+        for pid in APP_PIDS {
+            assert!(!product_name(pid).contains("unknown"), "pid {pid:#x}");
+        }
+        assert!(product_name(BOOTLOADER_PID).contains("bootloader"));
+        assert!(product_name(0x0000).contains("unknown"));
+    }
+
+    #[test]
+    fn usb_mode_does_not_panic_without_hardware() {
+        // No macropad attached in CI; this must still return a value.
+        let _ = usb_mode();
+    }
+}

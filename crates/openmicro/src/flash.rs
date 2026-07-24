@@ -14,13 +14,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// USB VID:PID the Micro 2 enumerates as in ROM bootloader / download mode
-/// (Espressif USB JTAG/serial debug unit).
-pub const BOOTLOADER_VID_PID: (u16, u16) = (0x303a, 0x1001);
-
-/// USB VID:PID the Micro 2 enumerates as running the stock/OpenMicro app.
-pub const NORMAL_VID_PID: (u16, u16) = (0x303a, 0x8298);
-
 /// Default flashable-image path produced by `cargo build --release` in
 /// `firmware/`, relative to the repo root (or the current directory).
 pub const DEFAULT_IMAGE_REL: &str =
@@ -111,14 +104,15 @@ fn candidate_roots() -> Vec<PathBuf> {
 }
 
 /// Classify the Micro 2's USB presence from a list of `(vid, pid)` pairs.
-/// Bootloader takes priority over the normal device if both are somehow seen.
+///
+/// Delegates the product-id table to [`crate::wldevice`], which knows every id
+/// the hardware ships under (two Creator Micro 2 revisions plus the Codex
+/// Micro) rather than only the one this module originally hardcoded.
 pub fn classify_usb(ids: &[(u16, u16)]) -> DeviceState {
-    if ids.contains(&BOOTLOADER_VID_PID) {
-        DeviceState::Bootloader
-    } else if ids.contains(&NORMAL_VID_PID) {
-        DeviceState::NormalDevice
-    } else {
-        DeviceState::Absent
+    match crate::wldevice::classify(ids) {
+        crate::wldevice::UsbMode::Bootloader => DeviceState::Bootloader,
+        crate::wldevice::UsbMode::App(_) => DeviceState::NormalDevice,
+        crate::wldevice::UsbMode::Absent => DeviceState::Absent,
     }
 }
 
@@ -154,12 +148,22 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
 /// Layout: a single merged image written at offset `0x0` (bootloader `0x0`,
 /// partition table `0x8000`, app `0x10000` are all inside it) per the flash
 /// layout in `docs/hardware/creator-micro-2-pinout-research.md`.
+///
+/// The reset options are not incidental. `--before no-reset` is required
+/// because the device is already in download mode and esptool's usual reset
+/// would knock it out; `--after watchdog-reset` is the only reset that works on
+/// this board, which has native USB-Serial-JTAG and therefore no DTR/RTS lines
+/// for the classic auto-reset. See [`crate::wldevice`].
 pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String> {
     let mut args = vec!["--chip".to_string(), chip.to_string()];
     if let Some(p) = port {
         args.push("--port".to_string());
         args.push(p.to_string());
     }
+    args.push("--before".to_string());
+    args.push("no-reset".to_string());
+    args.push("--after".to_string());
+    args.push("watchdog-reset".to_string());
     args.push("write_flash".to_string());
     args.push("0x0".to_string());
     args.push(image.display().to_string());
@@ -384,7 +388,7 @@ pub fn restore(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, 
 }
 
 /// Merge a child process's stdout and stderr into display lines.
-fn combine_output(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+pub fn combine_output(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(stdout)
         .lines()
         .chain(String::from_utf8_lossy(stderr).lines())
@@ -581,12 +585,12 @@ mod tests {
 
     #[test]
     fn classify_usb_bootloader() {
-        assert_eq!(classify_usb(&[BOOTLOADER_VID_PID]), DeviceState::Bootloader);
+        assert_eq!(classify_usb(&[(crate::wldevice::WL_VID, crate::wldevice::BOOTLOADER_PID)]), DeviceState::Bootloader);
     }
 
     #[test]
     fn classify_usb_normal_device() {
-        assert_eq!(classify_usb(&[NORMAL_VID_PID]), DeviceState::NormalDevice);
+        assert_eq!(classify_usb(&[(crate::wldevice::WL_VID, crate::wldevice::APP_PIDS[1])]), DeviceState::NormalDevice);
     }
 
     #[test]
@@ -597,7 +601,10 @@ mod tests {
 
     #[test]
     fn classify_usb_bootloader_wins_over_normal() {
-        let ids = [NORMAL_VID_PID, BOOTLOADER_VID_PID];
+        let ids = [
+            (crate::wldevice::WL_VID, crate::wldevice::APP_PIDS[1]),
+            (crate::wldevice::WL_VID, crate::wldevice::BOOTLOADER_PID),
+        ];
         assert_eq!(classify_usb(&ids), DeviceState::Bootloader);
     }
 
@@ -607,7 +614,17 @@ mod tests {
         let args = esptool_args("esp32s3", None, &img);
         assert_eq!(
             args,
-            vec!["--chip", "esp32s3", "write_flash", "0x0", "/tmp/fw.bin"]
+            vec![
+                "--chip",
+                "esp32s3",
+                "--before",
+                "no-reset",
+                "--after",
+                "watchdog-reset",
+                "write_flash",
+                "0x0",
+                "/tmp/fw.bin"
+            ]
         );
     }
 
@@ -622,6 +639,10 @@ mod tests {
                 "esp32s3",
                 "--port",
                 "/dev/ttyACM0",
+                "--before",
+                "no-reset",
+                "--after",
+                "watchdog-reset",
                 "write_flash",
                 "0x0",
                 "/tmp/fw.bin"
