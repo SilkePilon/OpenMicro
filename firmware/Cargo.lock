@@ -1461,6 +1461,7 @@ dependencies = [
  "embassy-futures",
  "embassy-sync 0.7.2",
  "embassy-time",
+ "embedded-hal 1.0.0",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",

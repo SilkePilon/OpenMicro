@@ -80,6 +80,14 @@ pub const LAYER_LED_PINS: [u8; 3] = [35, 45, 48];
 // ---------------------------------------------------------------------
 // 4. Rotary encoder — CONFIRMED
 // ---------------------------------------------------------------------
+/// Key id reported for a dial press.
+///
+/// The wire protocol has `Key`, `Encoder` and `Joystick` events but no
+/// dedicated dial-press variant, and adding one would ripple through the
+/// daemon's action router for an input whose behaviour is not designed yet. A
+/// reserved id well clear of the 13 real keys carries it in the meantime.
+pub const ENCODER_PRESS_KEY_ID: u8 = 0xFE;
+
 pub const ENCODER_PIN_A: u8 = 12;
 pub const ENCODER_PIN_B: u8 = 11;
 pub const ENCODER_SWITCH_PIN: u8 = 4;

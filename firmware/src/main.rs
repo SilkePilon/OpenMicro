@@ -154,10 +154,6 @@ async fn main(spawner: Spawner) {
         esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default())
             .expect("BLE controller init");
 
-    // TODO(pinout): LED RMT channel + LED_DATA_GPIO (see pins.rs / leds.rs).
-    // TODO(pinout): key matrix row/col GPIOs, encoder A/B/press GPIOs,
-    // joystick ADC X/Y GPIOs, battery sense pin (see pins.rs / input.rs).
-
     // embassy-executor 0.10 reshaped this: `#[task]` functions now return
     // `Result<SpawnToken, SpawnError>` and `Spawner::spawn` takes the token and
     // returns `()`. The only failure is the task's pool being exhausted, which
@@ -171,9 +167,62 @@ async fn main(spawner: Spawner) {
         )
         .expect("led_render_task token"),
     );
-    spawner.spawn(input_task().expect("input_task token"));
+    // ADC1 specifically: ADC2 is unusable while the radio is running, and this
+    // firmware keeps BLE up continuously.
+    let joystick_adc = {
+        let mut cfg = esp_hal::analog::adc::AdcConfig::new();
+        let x = cfg.enable_pin(peripherals.GPIO9, esp_hal::analog::adc::Attenuation::_11dB);
+        let y = cfg.enable_pin(peripherals.GPIO10, esp_hal::analog::adc::Attenuation::_11dB);
+        (esp_hal::analog::adc::Adc::new(peripherals.ADC1, cfg), x, y)
+    };
+
+    spawner.spawn(
+        input_task(InputPins {
+            adc: joystick_adc.0,
+            joy_x: joystick_adc.1,
+            joy_y: joystick_adc.2,
+            // Drive lines idle low; a scan asserts one at a time.
+            drive: [
+                esp_hal::gpio::Output::new(
+                    peripherals.GPIO46,
+                    esp_hal::gpio::Level::Low,
+                    esp_hal::gpio::OutputConfig::default(),
+                ),
+                esp_hal::gpio::Output::new(
+                    peripherals.GPIO17,
+                    esp_hal::gpio::Level::Low,
+                    esp_hal::gpio::OutputConfig::default(),
+                ),
+                esp_hal::gpio::Output::new(
+                    peripherals.GPIO40,
+                    esp_hal::gpio::Level::Low,
+                    esp_hal::gpio::OutputConfig::default(),
+                ),
+                esp_hal::gpio::Output::new(
+                    peripherals.GPIO47,
+                    esp_hal::gpio::Level::Low,
+                    esp_hal::gpio::OutputConfig::default(),
+                ),
+            ],
+            // Sense lines: pull-DOWN, per the vendor firmware. A pressed key
+            // pulls them up toward the asserted drive line.
+            sense: [
+                input_pin(peripherals.GPIO13, esp_hal::gpio::Pull::Down),
+                input_pin(peripherals.GPIO5, esp_hal::gpio::Pull::Down),
+                input_pin(peripherals.GPIO21, esp_hal::gpio::Pull::Down),
+                input_pin(peripherals.GPIO1, esp_hal::gpio::Pull::Down),
+            ],
+            encoder_a: input_pin(peripherals.GPIO12, esp_hal::gpio::Pull::Up),
+            encoder_b: input_pin(peripherals.GPIO11, esp_hal::gpio::Pull::Up),
+            encoder_sw: input_pin(peripherals.GPIO4, esp_hal::gpio::Pull::Up),
+        })
+        .expect("input_task token"),
+    );
     spawner.spawn(battery_task().expect("battery_task token"));
-    spawner.spawn(power_task().expect("power_task token"));
+    spawner.spawn(
+        power_task(input_pin(peripherals.GPIO2, esp_hal::gpio::Pull::Up))
+            .expect("power_task token"),
+    );
 }
 
 #[embassy_executor::task]
@@ -196,19 +245,20 @@ async fn ble_task(controller: esp_radio::ble::controller::BleConnector<'static>)
 /// The gesture recognition is host-tested in `openmicro_effects::power`; all
 /// this task owes it is a debounced level and a clock.
 #[embassy_executor::task]
-async fn power_task() {
+async fn power_task(button: esp_hal::gpio::Input<'static>) {
     use openmicro_effects::power::{PowerAction, PowerButton};
 
-    let mut button = PowerButton::new();
+    let mut gesture = PowerButton::new();
+    let start = embassy_time::Instant::now();
     loop {
-        // NEXT: read `pins::REAR_BUTTON_PIN` here. Until the HAL plumbing
-        // lands the button always reads released, so no action ever fires —
-        // which is the safe direction to be wrong in for something that can
-        // power the device off.
-        let pressed = false;
-        let now_ms = embassy_time::Instant::now().as_millis() as u32;
+        // Active low: the button shorts a pulled-up line to ground. INFERRED —
+        // the vendor firmware only tells us the pin is an any-edge input, not
+        // its rest level, so if the device powers itself off the instant it
+        // boots, this is the polarity to flip.
+        let pressed = button.is_low();
+        let now_ms = start.elapsed().as_millis() as u32;
 
-        match button.update(pressed, now_ms) {
+        match gesture.update(pressed, now_ms) {
             PowerAction::EnterBootloader => bootloader::reboot_to_bootloader(),
             PowerAction::PowerOff => {
                 // NEXT: blank both LED chains, then enter deep sleep with the
@@ -247,19 +297,125 @@ async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
     }
 }
 
+/// Configure one GPIO as an input with the given pull.
+fn input_pin<'d>(
+    pin: impl esp_hal::gpio::InputPin + 'd,
+    pull: esp_hal::gpio::Pull,
+) -> esp_hal::gpio::Input<'d> {
+    esp_hal::gpio::Input::new(pin, esp_hal::gpio::InputConfig::default().with_pull(pull))
+}
+
+/// Everything `input_task` drives, moved in at spawn time.
+///
+/// Grouped into one struct because embassy tasks take their arguments by
+/// value and eleven separate parameters would be unreadable.
+struct InputPins {
+    adc: esp_hal::analog::adc::Adc<'static, esp_hal::peripherals::ADC1<'static>, esp_hal::Blocking>,
+    joy_x: esp_hal::analog::adc::AdcPin<
+        esp_hal::peripherals::GPIO9<'static>,
+        esp_hal::peripherals::ADC1<'static>,
+    >,
+    joy_y: esp_hal::analog::adc::AdcPin<
+        esp_hal::peripherals::GPIO10<'static>,
+        esp_hal::peripherals::ADC1<'static>,
+    >,
+    drive: [esp_hal::gpio::Output<'static>; pins::MATRIX_DRIVE_COUNT],
+    sense: [esp_hal::gpio::Input<'static>; pins::MATRIX_SENSE_COUNT],
+    encoder_a: esp_hal::gpio::Input<'static>,
+    encoder_b: esp_hal::gpio::Input<'static>,
+    encoder_sw: esp_hal::gpio::Input<'static>,
+}
+
 #[embassy_executor::task]
-async fn input_task() {
-    // NEXT: drive `pins::MATRIX_DRIVE_PINS` high one at a time and read
-    // `pins::MATRIX_SENSE_PINS` (pull-down; a pressed key reads HIGH — the
-    // opposite of the usual convention), debounce via `input::MatrixState`,
-    // and push `InputEvent`s onto `INPUT_EVENT_CHANNEL`. The encoder is an
-    // any-edge interrupt on `pins::ENCODER_PIN_A`/`B` through
-    // `input::encoder_step`; the joystick is ADC1 on
-    // `pins::JOYSTICK_ADC_X_PIN`/`Y` (invert X per
-    // `pins::JOYSTICK_X_INVERTED`) through `input::joystick_to_sector`.
+async fn input_task(mut io: InputPins) {
+    let mut matrix = input::MatrixState::new();
+    let start = embassy_time::Instant::now();
+    // Quadrature state, packed as (A << 1) | B, seeded from the pins so the
+    // first real edge is not read as a phantom step.
+    let mut prev_ab = ab_state(&io.encoder_a, &io.encoder_b);
+    let mut sw_was_down = io.encoder_sw.is_low();
+    let mut last_joystick_ms = 0u32;
+
     loop {
-        embassy_time::Timer::after_millis(5).await;
+        let now_ms = start.elapsed().as_millis() as u32;
+
+        // Scan: assert one drive line at a time and read every sense line.
+        // The polarity is the vendor's, and it is backwards from the usual
+        // keyboard convention — sense lines are pulled DOWN, so a pressed key
+        // reads HIGH while its drive line is high.
+        let mut raw = [[false; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT];
+        for (d, drive) in io.drive.iter_mut().enumerate() {
+            drive.set_high();
+            // Let the line settle before sampling: with a pull-down and any
+            // trace capacitance the first read after a transition is a lie.
+            embassy_time::Timer::after_micros(20).await;
+            for (s, sense) in io.sense.iter().enumerate() {
+                raw[d][s] = sense.is_high() == pins::MATRIX_ACTIVE_HIGH;
+            }
+            drive.set_low();
+        }
+        matrix.debounce(&raw, now_ms, |event| {
+            let _ = INPUT_EVENT_CHANNEL.try_send(event);
+        });
+
+        // Encoder: decode every quadrature transition, not just detents, so a
+        // fast twist does not drop steps.
+        let ab = ab_state(&io.encoder_a, &io.encoder_b);
+        if ab != prev_ab {
+            let step = input::encoder_step(prev_ab, ab);
+            prev_ab = ab;
+            if step != 0 {
+                let _ = INPUT_EVENT_CHANNEL.try_send(InputEvent::Encoder { delta: step });
+            }
+        }
+
+        // Encoder press. Active low: the pin carries a pull-up and the switch
+        // shorts it to ground.
+        let sw_down = io.encoder_sw.is_low();
+        if sw_down != sw_was_down {
+            sw_was_down = sw_down;
+            let _ = INPUT_EVENT_CHANNEL.try_send(InputEvent::Key {
+                id: pins::ENCODER_PRESS_KEY_ID,
+                pressed: sw_down,
+            });
+        }
+
+        // Joystick, sampled once every few scans — it is a menu selector, not
+        // a pointer, so there is nothing to gain from 500 Hz.
+        if now_ms.wrapping_sub(last_joystick_ms) >= JOYSTICK_PERIOD_MS {
+            last_joystick_ms = now_ms;
+            let x_raw = io.adc.read_blocking(&mut io.joy_x);
+            let y_raw = io.adc.read_blocking(&mut io.joy_y);
+            // The vendor firmware reports X inverted; match it so the host sees
+            // the same orientation whichever firmware is running.
+            let x = if pins::JOYSTICK_X_INVERTED {
+                ADC_MAX.saturating_sub(x_raw)
+            } else {
+                x_raw
+            };
+            if let Some(event) = input::joystick_to_sector(x, y_raw, ADC_CENTRE, JOYSTICK_DEADZONE)
+            {
+                let _ = INPUT_EVENT_CHANNEL.try_send(event);
+            }
+        }
+
+        embassy_time::Timer::after_millis(2).await;
     }
+}
+
+/// 12-bit ADC full scale, and the nominal centre of an un-deflected stick.
+const ADC_MAX: u16 = 4095;
+const ADC_CENTRE: u16 = 2048;
+/// Deflection required before a direction is reported. Not calibrated against
+/// a real stick — this is a first guess and wants tuning on hardware.
+const JOYSTICK_DEADZONE: u16 = 700;
+/// How often the stick is sampled.
+const JOYSTICK_PERIOD_MS: u32 = 40;
+
+/// Pack the encoder's two phases into the 2-bit code `input::encoder_step`
+/// expects.
+fn ab_state(a: &esp_hal::gpio::Input<'static>, b: &esp_hal::gpio::Input<'static>) -> u8 {
+    ((a.is_high() as u8) << 1) | (b.is_high() as u8)
 }
 
 #[embassy_executor::task]
