@@ -96,6 +96,12 @@ impl<S: PixelOut> PerKeyChain<S> {
         self.flush();
     }
 
+    /// Paint every key the same colour. Bring-up aid.
+    pub fn set_all(&mut self, colour: Rgb) {
+        self.pixels = [colour; pins::PER_KEY_LED_COUNT];
+        self.flush();
+    }
+
     /// Turn every per-key LED off (idle sleep).
     pub fn blank(&mut self) {
         self.pixels = [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT];

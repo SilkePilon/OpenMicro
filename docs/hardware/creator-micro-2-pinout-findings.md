@@ -351,7 +351,37 @@ passes `clk_src = 4`, which may not be what esp-hal's default resolves to, so
 the real output rate may not be 2.5 MHz) and whether esp-hal drives MOSI at all
 without an assigned SCK pin.
 
-### Elimination log — still not lighting
+### SOLVED (2026-07-25): the power-gate pins were inverted
+
+**The LEDs work.** The cause was a misread of the vendor's top-board power
+setter. Its arguments map `a3 -> GPIO36, a4 -> GPIO37, a5 -> GPIO38`, but they
+were first read as `37/36/38`, so the values recovered from
+`init_top_board_power_gpio` were applied to the wrong pins — driving the exact
+inverse of the enable. Every LED write then landed on an unpowered board: the
+peripheral reported success and nothing lit, which is indistinguishable from a
+broken driver.
+
+Found by sweeping all eight combinations on the real device while clocking out
+full-white frames and measuring with a camera:
+
+| combo | 36 | 37 | 38 | keypad brightness |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 0 | 0 | ~25 (dark) |
+| **1** | **1** | **0** | **0** | **107, 97, 91 (lit)** |
+| 2 | 0 | 1 | 0 | ~23 (dark) |
+
+Colour cycling then confirmed GRB: red frames read (96,47,50), green (46,82,62),
+blue (39,49,111).
+
+The lesson worth keeping: three separate output paths (SPI+DMA, RMT, and
+hand-bit-banged GPIO) were all "wrong" for the same reason, and none of them
+were wrong at all. When several independent implementations fail identically,
+suspect their shared precondition rather than the implementations.
+
+The elimination log below is kept because everything in it is still true, and
+because it is what eventually forced the question "what do all three share?".
+
+### Elimination log — chasing the wrong layer
 
 Measured with the webcam rig (keypad-region mean RGB): vendor ~(95,92,104),
 ours ~(13,12,13) flat.

@@ -125,14 +125,20 @@ pub const REAR_BUTTON_PIN: u8 = 2;
 pub const USB_DETECT_PIN: u8 = 42;
 /// Power gate for the upper PCB, with the levels the vendor firmware drives.
 ///
-/// Read out of `wl_io::init_top_board_power_gpio` in the stock image: it
-/// configures 36/37/38 as outputs (pin mask high word `0x70`) and then calls a
-/// setter with `(37 = 1, 36 = 0, 38 = 1)`. Note that they are **not** all high
-/// — driving 36 high would have been the obvious guess and is wrong.
+/// Determined empirically, by sweeping all eight combinations on the real
+/// device while clocking out full-white frames and measuring the result with a
+/// camera. `36 = 1, 37 = 0, 38 = 0` lights both chains; the other combinations
+/// leave them dark.
 ///
-/// Without this the upper board has no power, which is exactly what "the LEDs
-/// never light up" looks like.
-pub const TOP_BOARD_POWER: [(u8, bool); 3] = [(36, false), (37, true), (38, true)];
+/// This corrects an earlier misreading of the vendor's setter. Its arguments
+/// map `a3 -> GPIO36, a4 -> GPIO37, a5 -> GPIO38`, not `37/36/38` as first
+/// assumed, so the values recovered from `init_top_board_power_gpio` were
+/// applied to the wrong pins — driving the exact inverse of the enable.
+///
+/// Without this the upper board has no power, and every LED write lands on an
+/// unpowered board: the peripheral reports success and nothing lights, which is
+/// indistinguishable from a broken driver.
+pub const TOP_BOARD_POWER: [(u8, bool); 3] = [(36, true), (37, false), (38, false)];
 
 /// Charge enable. INFERRED (medium) — the store alignment around it was noisy
 /// in the disassembly, so verify before driving it.

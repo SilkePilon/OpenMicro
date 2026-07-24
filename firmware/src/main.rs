@@ -378,7 +378,8 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
                 // NEXT: blank both LED chains, then enter deep sleep with the
                 // button as the wake source.
             }
-            PowerAction::Wake | PowerAction::None => {}
+            PowerAction::Wake => touch_activity(now_ms),
+            PowerAction::None => {}
         }
         embassy_time::Timer::after_millis(10).await;
     }
@@ -397,9 +398,28 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
     let mut glow = leds::UnderglowChain::new(underglow);
     let start = embassy_time::Instant::now();
     let mut last_beat_ms = 0u32;
+    let mut asleep = false;
 
     loop {
         let t_ms = start.elapsed().as_millis() as u32;
+
+        if DIAGNOSTIC_COLOURS {
+            let phase = (t_ms / 2000) % 4;
+            let colour = match phase {
+                0 => Rgb { r: 255, g: 0, b: 0 },
+                1 => Rgb { r: 0, g: 255, b: 0 },
+                2 => Rgb { r: 0, g: 0, b: 255 },
+                _ => Rgb { r: 255, g: 255, b: 255 },
+            };
+            keys.set_all(colour);
+            glow.set(colour);
+            if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
+                last_beat_ms = t_ms;
+                esp_println::println!("diag t={}ms phase={}", t_ms, phase);
+            }
+            embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+            continue;
+        }
 
         if openmicro_effects::startup::is_running(t_ms) {
             // The boot animation doubles as a wiring test: a sweep makes a
@@ -414,7 +434,23 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
                     leds::UNDERGLOW_BUF_LEN
                 );
             }
+        } else if t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed))
+            >= LED_SLEEP_MS
+        {
+            // Asleep: hold everything dark until something happens. Blanking
+            // repeatedly is harmless — each frame is identical — and it keeps
+            // the wake path a single comparison.
+            if !asleep {
+                asleep = true;
+                esp_println::println!("leds: sleeping after {} ms idle", LED_SLEEP_MS);
+            }
+            keys.blank();
+            glow.blank();
         } else {
+            if asleep {
+                asleep = false;
+                esp_println::println!("leds: awake");
+            }
             // NEXT: render the latest `LedFrame` from the BLE task here. Until
             // that channel is wired, the keys stay dark and the underglow
             // breathes — which is at least honest about the device being alive
@@ -434,6 +470,24 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
         embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
     }
 }
+
+/// How long the device may sit untouched before the LEDs are blanked.
+///
+/// WS2812s held at a constant colour for days is how panels develop uneven
+/// ageing, and this is a device that lives on a desk. Any input wakes it.
+const LED_SLEEP_MS: u32 = 5 * 60 * 1000;
+
+/// Milliseconds since boot when the device was last touched. Written by the
+/// input and power tasks, read by the render loop.
+static LAST_ACTIVITY_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Record activity, waking the LEDs.
+fn touch_activity(now_ms: u32) {
+    LAST_ACTIVITY_MS.store(now_ms, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bring-up aid: hold every LED at a solid primary, cycling.
+const DIAGNOSTIC_COLOURS: bool = false;
 
 /// `bool` to esp-hal's pin level.
 fn level_of(high: bool) -> esp_hal::gpio::Level {
@@ -502,6 +556,9 @@ async fn input_task(mut io: InputPins) {
             drive.set_low();
         }
         matrix.debounce(&raw, now_ms, |event| {
+            // Only real events count as activity; the scan itself runs
+            // continuously and would otherwise keep the LEDs awake forever.
+            touch_activity(now_ms);
             // Logged as well as queued: until the BLE link exists, the serial
             // console is the only way to see that a key press was detected —
             // and it is what identifies the key-ID map.
@@ -516,6 +573,7 @@ async fn input_task(mut io: InputPins) {
             let step = input::encoder_step(prev_ab, ab);
             prev_ab = ab;
             if step != 0 {
+                touch_activity(now_ms);
                 let _ = INPUT_EVENT_CHANNEL.try_send(InputEvent::Encoder { delta: step });
             }
         }
@@ -525,6 +583,7 @@ async fn input_task(mut io: InputPins) {
         let sw_down = io.encoder_sw.is_low();
         if sw_down != sw_was_down {
             sw_was_down = sw_down;
+            touch_activity(now_ms);
             let _ = INPUT_EVENT_CHANNEL.try_send(InputEvent::Key {
                 id: pins::ENCODER_PRESS_KEY_ID,
                 pressed: sw_down,
@@ -546,6 +605,7 @@ async fn input_task(mut io: InputPins) {
             };
             if let Some(event) = input::joystick_to_sector(x, y_raw, ADC_CENTRE, JOYSTICK_DEADZONE)
             {
+                touch_activity(now_ms);
                 let _ = INPUT_EVENT_CHANNEL.try_send(event);
             }
         }
