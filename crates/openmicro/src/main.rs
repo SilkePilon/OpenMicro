@@ -16,7 +16,7 @@ use openmicro_proto::Command;
 use ratatui::prelude::*;
 
 use client::{adjust_brightness, step_preset, SnapshotDto, PALETTE};
-use ui::{ConfigUiState, PANEL_STATES, SLEEP_ROW};
+use ui::{ConfigUiState, InstallerUiState, PANEL_STATES, SLEEP_ROW};
 
 /// Shared write handle for sending `Command`s to the daemon. `None` when
 /// disconnected. Populated by the reader thread on each successful connect.
@@ -122,15 +122,24 @@ fn run(
     writer: &Writer,
 ) -> anyhow::Result<()> {
     let mut cfg = ConfigUiState::new(200);
+    let mut installer = InstallerUiState::new();
     loop {
         {
             let snap = snap.lock().unwrap();
             let is_connected = connected.load(Ordering::Relaxed);
-            terminal.draw(|f| ui::render(f, &snap, is_connected, &cfg))?;
+            terminal.draw(|f| ui::render(f, &snap, is_connected, &cfg, &installer))?;
         }
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
-                if cfg.open {
+                if installer.open {
+                    match k.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('f') | KeyCode::Esc => installer.open = false,
+                        KeyCode::Char('r') => installer.refresh(),
+                        KeyCode::Enter => run_installer_flash(&mut installer),
+                        _ => {}
+                    }
+                } else if cfg.open {
                     match k.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') | KeyCode::Esc => cfg.open = false,
@@ -144,6 +153,10 @@ fn run(
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') => cfg.open = true,
+                        KeyCode::Char('f') => {
+                            installer.open = true;
+                            installer.refresh();
+                        }
                         _ => {}
                     }
                 }
@@ -152,6 +165,30 @@ fn run(
     }
 
     Ok(())
+}
+
+/// Attempt a real flash from the installer screen, capturing esptool's output
+/// into the scrollable area. Only proceeds when every prerequisite passes; it
+/// never fabricates success — a failure surfaces esptool's actual error.
+fn run_installer_flash(installer: &mut InstallerUiState) {
+    if !installer.ready {
+        installer.output = vec![
+            "not ready: resolve the ✗ items above (refresh with `r`).".to_string(),
+        ];
+        return;
+    }
+    installer.output = vec!["flashing…".to_string()];
+    match flash::flash_capture(None, None) {
+        Ok(out) => {
+            installer.output = out;
+            installer.output.push("flash complete.".to_string());
+        }
+        Err(msg) => {
+            installer.output = msg.lines().map(|l| l.to_string()).collect();
+        }
+    }
+    // Re-derive the checklist after a flash attempt (device may re-enumerate).
+    installer.refresh();
 }
 
 /// Apply a left/right adjustment on the selected config row and send the

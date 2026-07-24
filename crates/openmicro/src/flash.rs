@@ -10,11 +10,6 @@
 //! unattended, so [`flash`] is *designed* to stop with a clear, actionable
 //! error at the first missing prerequisite. It NEVER reports a successful
 //! flash it did not perform — the real write is the user's on-hardware step.
-//
-// NOTE: this `#![allow(dead_code)]` covers the interval between landing the
-// engine (this commit) and wiring its callers in the `openmicro flash` CLI and
-// the TUI installer screen. It is removed once both call sites exist.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -248,6 +243,57 @@ pub fn ready(items: &[ChecklistItem]) -> bool {
 /// esptool, device not in bootloader mode) and NEVER fabricates success. The
 /// end-to-end write is only ever exercised by the user on real hardware.
 pub fn flash(image: Option<&Path>, port: Option<&str>) -> Result<(), String> {
+    let (esptool, args) = prepare(image, port)?;
+    println!("flashing: {} {}", esptool.display(), args.join(" "));
+
+    let status = Command::new(&esptool)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "esptool exited with {} — see its output above.",
+            exit_desc(status.code())
+        ))
+    }
+}
+
+/// Like [`flash`], but captures esptool's combined stdout/stderr and returns it
+/// as lines (for the TUI's scrollable output area) instead of streaming to the
+/// terminal. Same prerequisite checks; same honesty contract.
+pub fn flash_capture(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, String> {
+    let (esptool, args) = prepare(image, port)?;
+
+    let output = Command::new(&esptool)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&output.stderr).lines())
+        .map(|l| l.to_string())
+        .collect();
+
+    if output.status.success() {
+        Ok(lines)
+    } else {
+        lines.push(format!(
+            "esptool exited with {}.",
+            exit_desc(output.status.code())
+        ));
+        Err(lines.join("\n"))
+    }
+}
+
+/// Resolve and validate all flash prerequisites (image, esptool, bootloader-mode
+/// device) and return the esptool executable plus its argv. Returns an
+/// actionable `Err` at the first missing prerequisite; shared by [`flash`] and
+/// [`flash_capture`] so both stay honest and consistent.
+fn prepare(image: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
     let image = resolve_image(image)?;
 
     let esptool = esptool_path().ok_or_else(|| {
@@ -276,25 +322,13 @@ pub fn flash(image: Option<&Path>, port: Option<&str>) -> Result<(), String> {
         }
     }
 
-    let args = esptool_args(CHIP, port, &image);
-    println!("flashing: {} {}", esptool.display(), args.join(" "));
+    Ok((esptool, esptool_args(CHIP, port, &image)))
+}
 
-    let status = Command::new(&esptool)
-        .args(&args)
-        .status()
-        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "esptool exited with {} — see its output above.",
-            status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "a signal".to_string())
-        ))
-    }
+/// Human-readable description of a process exit code (or a signal if none).
+fn exit_desc(code: Option<i32>) -> String {
+    code.map(|c| c.to_string())
+        .unwrap_or_else(|| "a signal".to_string())
 }
 
 #[cfg(test)]
