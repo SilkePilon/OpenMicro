@@ -16,7 +16,7 @@ use openmicro_proto::Command;
 use ratatui::prelude::*;
 
 use client::{adjust_brightness, step_preset, SnapshotDto, PALETTE};
-use ui::{ConfigUiState, InstallerUiState, PANEL_STATES, SLEEP_ROW};
+use ui::{ConfigUiState, InstallerUiState, MAX_SLEEP_MINUTES, PANEL_STATES, SLEEP_ROW};
 
 /// Shared write handle for sending `Command`s to the daemon. `None` when
 /// disconnected. Populated by the reader thread on each successful connect.
@@ -152,7 +152,13 @@ fn run(
                 } else {
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') => cfg.open = true,
+                        KeyCode::Char('c') => {
+                            // Seed from the daemon's latest snapshot on open, so
+                            // the panel starts from the real live config instead
+                            // of a stale/hardcoded UI default (Fix 1).
+                            cfg.seed_from_snapshot(&snap.lock().unwrap());
+                            cfg.open = true;
+                        }
                         KeyCode::Char('f') => {
                             installer.open = true;
                             installer.refresh();
@@ -198,12 +204,17 @@ fn adjust(cfg: &mut ConfigUiState, dir: i32, writer: &Writer) {
         cfg.brightness = adjust_brightness(cfg.brightness, dir * 8);
         send_command(writer, &Command::SetBrightness(cfg.brightness));
     } else if cfg.selected == SLEEP_ROW {
-        cfg.sleep_minutes = (cfg.sleep_minutes as i32 + dir).max(0) as u32;
+        // Clamp mirrors the daemon's own clamp on `SetSleepMinutes` (Fix 5): a
+        // stuck key can't drive this arbitrarily high even before the command
+        // round-trips.
+        cfg.sleep_minutes =
+            ((cfg.sleep_minutes as i32 + dir).max(0) as u32).min(MAX_SLEEP_MINUTES);
         send_command(writer, &Command::SetSleepMinutes(cfg.sleep_minutes));
     } else {
         let i = cfg.selected - 1;
         cfg.color_idx[i] = step_preset(cfg.color_idx[i], dir);
         let rgb = PALETTE[cfg.color_idx[i]];
+        cfg.colors[i] = rgb;
         send_command(writer, &Command::SetStateColor { state: PANEL_STATES[i], rgb });
     }
 }

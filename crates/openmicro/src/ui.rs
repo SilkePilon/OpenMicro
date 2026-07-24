@@ -5,6 +5,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap};
 use crate::client::{SnapshotDto, PALETTE};
 use crate::flash::{self, ChecklistItem};
 
+/// Upper bound on `sleep_minutes`: 1440 minutes = 24 hours. Mirrors the same
+/// clamp in `openmicrod::engine` so a stuck key (or a bogus seeded value) can
+/// never drive the idle-sleep threshold arbitrarily high.
+pub const MAX_SLEEP_MINUTES: u32 = 1440;
+
 /// The four editable states, in panel row order.
 pub const PANEL_STATES: [AgentState; 4] = [
     AgentState::Idle,
@@ -23,13 +28,27 @@ pub struct ConfigUiState {
     pub open: bool,
     pub selected: usize, // 0 = brightness, 1..=4 = PANEL_STATES, 5 = sleep
     pub brightness: u8,
+    /// Preset index used as the starting point for further ←/→ cycling per
+    /// state. Only meaningful as a *cycling cursor*; the swatch actually
+    /// shown is `colors[i]` (see [`Self::seed_from_snapshot`]).
     pub color_idx: [usize; 4],
+    /// Displayed per-state color (panel row order, matching `PANEL_STATES`).
+    /// Seeded from the daemon's live config, so it can be the device's true
+    /// current color even when that color isn't one of the `PALETTE` presets.
+    pub colors: [Rgb; 4],
     pub sleep_minutes: u32,
 }
 
 impl ConfigUiState {
     pub fn new(brightness: u8) -> Self {
-        Self { open: false, selected: 0, brightness, color_idx: [0; 4], sleep_minutes: 3 }
+        Self {
+            open: false,
+            selected: 0,
+            brightness,
+            color_idx: [0; 4],
+            colors: [PALETTE[0]; 4],
+            sleep_minutes: 3,
+        }
     }
 
     pub fn select_prev(&mut self) {
@@ -41,6 +60,31 @@ impl ConfigUiState {
     pub fn select_next(&mut self) {
         if self.selected < SLEEP_ROW {
             self.selected += 1;
+        }
+    }
+
+    /// Seed the panel's displayed brightness/colors/sleep from the daemon's
+    /// latest snapshot, replacing whatever hardcoded UI defaults (or stale
+    /// prior state) were showing. Called when the panel transitions from
+    /// closed to open, so the baseline for the first adjustment is the real
+    /// live config rather than a UI-side constant (final-branch review Fix 1:
+    /// opening `[c]` used to show the wrong values and the first bump would
+    /// clobber live state with them).
+    pub fn seed_from_snapshot(&mut self, snap: &SnapshotDto) {
+        self.brightness = snap.brightness;
+        self.sleep_minutes = snap.sleep_minutes.min(MAX_SLEEP_MINUTES);
+        for (i, state) in PANEL_STATES.iter().enumerate() {
+            let rgb = snap.colors.for_state(*state);
+            self.colors[i] = rgb;
+            // Best-effort: if the live color happens to match a palette
+            // preset exactly, seed the cycling cursor there too, so the next
+            // ←/→ press continues from it instead of jumping back to preset 0.
+            // When it doesn't match any preset, leave the cursor as-is — the
+            // swatch still shows the true live color; the first press then
+            // starts cycling presets from wherever the cursor was.
+            if let Some(idx) = PALETTE.iter().position(|p| *p == rgb) {
+                self.color_idx[i] = idx;
+            }
         }
     }
 }
@@ -231,7 +275,7 @@ fn render_config(frame: &mut Frame, cfg: &ConfigUiState) {
         sel(0),
     ));
     for (i, st) in PANEL_STATES.iter().enumerate() {
-        let rgb: Rgb = PALETTE[cfg.color_idx[i]];
+        let rgb: Rgb = cfg.colors[i];
         let swatch = Span::styled(
             "  ",
             Style::default().bg(Color::Rgb(rgb.r, rgb.g, rgb.b)),
@@ -267,6 +311,40 @@ mod tests {
     fn status_label_reflects_connection_state() {
         assert_eq!(status_label(true), "[\u{25cf} connected]");
         assert_eq!(status_label(false), "[\u{25cb} disconnected — retrying]");
+    }
+
+    #[test]
+    fn seed_from_snapshot_replaces_ui_defaults() {
+        // Fix 1: opening the config panel used to show hardcoded UI defaults
+        // (brightness 200, sleep 3, PALETTE[0] colors) instead of the daemon's
+        // real config, so the first adjustment clobbered live state. Seeding
+        // from the snapshot must pull in the real values.
+        let mut cfg = ConfigUiState::new(200);
+        let mut snap = SnapshotDto { brightness: 77, sleep_minutes: 42, ..Default::default() };
+        snap.colors.working = Rgb { r: 9, g: 8, b: 7 }; // not a PALETTE preset
+        snap.colors.idle = PALETTE[2]; // matches a preset exactly
+
+        cfg.seed_from_snapshot(&snap);
+
+        assert_eq!(cfg.brightness, 77);
+        assert_eq!(cfg.sleep_minutes, 42);
+        // Working (panel row 3, PANEL_STATES[2]) shows the true live color even
+        // though it doesn't match any preset.
+        assert_eq!(cfg.colors[2], Rgb { r: 9, g: 8, b: 7 });
+        // Idle (panel row 1, PANEL_STATES[0]) matches PALETTE[2] exactly, so the
+        // preset index used for further ←/→ cycling is seeded to match.
+        assert_eq!(cfg.colors[0], PALETTE[2]);
+        assert_eq!(cfg.color_idx[0], 2);
+    }
+
+    #[test]
+    fn seed_from_snapshot_clamps_sleep_minutes() {
+        // Defense in depth alongside the TUI adjust()/engine clamp: even a
+        // daemon reporting a stale/out-of-range value never shows unbounded.
+        let mut cfg = ConfigUiState::new(200);
+        let snap = SnapshotDto { sleep_minutes: 999_999, ..Default::default() };
+        cfg.seed_from_snapshot(&snap);
+        assert_eq!(cfg.sleep_minutes, 1440);
     }
 
     #[test]

@@ -28,6 +28,15 @@ pub struct Snapshot {
     /// Whether the device reports charging. Often unknown over plain BLE
     /// Battery Service, in which case it is false.
     pub charging: bool,
+    /// Live LED brightness (0..=255). Carried so the TUI config panel can seed
+    /// itself from the daemon's real config instead of a hardcoded UI default
+    /// (Fix 1 of the final-branch review: opening `[c]` used to show/clobber
+    /// the wrong values).
+    pub brightness: u8,
+    /// Live per-state LED colors, for the same reason.
+    pub colors: openmicro_proto::StateColors,
+    /// Live idle-sleep threshold in minutes (0 disables), for the same reason.
+    pub sleep_minutes: u32,
 }
 
 fn state_name(state: openmicro_proto::AgentState) -> &'static str {
@@ -54,11 +63,15 @@ pub fn snapshot(engine: &Engine, battery: Option<openmicro_proto::Battery>) -> S
         })
         .collect();
     sessions.sort_by_key(|s| s.slot);
+    let (brightness, colors, sleep_minutes) = engine.to_config_fields();
     Snapshot {
         sessions,
         owner,
         battery: battery.map(|b| b.pct),
         charging: battery.map(|b| b.charging).unwrap_or(false),
+        brightness,
+        colors,
+        sleep_minutes,
     }
 }
 
@@ -168,6 +181,30 @@ mod tests {
         assert_eq!(snap.sessions[0].agent, "claude");
         assert_eq!(snap.sessions[0].state, "awaiting_approval");
         assert_eq!(snap.owner.as_deref(), Some("claude:s1"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_live_config() {
+        // Fix 1: the snapshot must reflect the engine's real brightness/colors/
+        // sleep_minutes, not a UI-side default, so the TUI config panel can seed
+        // itself from the daemon instead of hardcoded constants.
+        let mut engine = Engine::new(77);
+        let mut dev = MockDevice::new();
+        engine
+            .apply_command(
+                openmicro_proto::Command::SetStateColor {
+                    state: AgentState::Working,
+                    rgb: openmicro_proto::Rgb { r: 9, g: 8, b: 7 },
+                },
+                &mut dev,
+            )
+            .await;
+        engine.apply_command(openmicro_proto::Command::SetSleepMinutes(42), &mut dev).await;
+
+        let snap = snapshot(&engine, None);
+        assert_eq!(snap.brightness, 77);
+        assert_eq!(snap.colors.working, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
+        assert_eq!(snap.sleep_minutes, 42);
     }
 
     #[tokio::test]
