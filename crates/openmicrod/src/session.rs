@@ -45,6 +45,8 @@ impl SessionStore {
         key
     }
 
+    /// Used by tests; part of the store's read API.
+    #[allow(dead_code)]
     pub fn get(&self, key: &SessionKey) -> Option<&Session> {
         self.sessions.get(key)
     }
