@@ -48,6 +48,12 @@ pub enum DeviceState {
 /// If nothing is found, returns an `Err` pointing at the build instructions.
 pub fn resolve_image(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
+        if p.is_dir() {
+            return Err(format!(
+                "firmware image is not a file: {} is a directory (check the --image path)",
+                p.display()
+            ));
+        }
         if p.exists() {
             return Ok(p.to_path_buf());
         }
@@ -345,14 +351,26 @@ mod tests {
 
     #[test]
     fn resolve_image_explicit_existing_ok() {
-        // Any existing file works; use this source file itself.
-        let this = PathBuf::from(file!());
+        // Any existing file works. `CARGO_MANIFEST_DIR`/Cargo.toml is portable
+        // across every machine that can even run this test (cargo guarantees
+        // it), unlike the previous fallback to `/etc/hostname` (Linux-only,
+        // and not guaranteed to exist on minimal/container images).
         let base = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let abs = PathBuf::from(base).join("..").join("..").join(this);
-        // Fall back to a guaranteed-existing path if layout differs.
-        let existing = if abs.exists() { abs } else { PathBuf::from("/etc/hostname") };
+        let existing = PathBuf::from(base).join("Cargo.toml");
         assert!(existing.exists(), "test precondition: {} exists", existing.display());
         assert_eq!(resolve_image(Some(&existing)).unwrap(), existing);
+    }
+
+    #[test]
+    fn resolve_image_explicit_directory_errs() {
+        // A directory technically "exists" but is never a valid flashable
+        // image; `--image <a directory>` must fail with a clear message
+        // rather than being handed to esptool as-is.
+        let base = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let dir = PathBuf::from(base); // the crate root: exists, is a directory
+        assert!(dir.is_dir(), "test precondition: {} is a directory", dir.display());
+        let err = resolve_image(Some(&dir)).unwrap_err();
+        assert!(err.contains("not a file") || err.contains("directory"), "{err}");
     }
 
     #[test]

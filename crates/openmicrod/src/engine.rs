@@ -8,6 +8,9 @@ use crate::focus::pick_owner;
 use crate::render::render_frame;
 use crate::session::{SessionKey, SessionStore};
 
+/// Upper bound on `sleep_minutes` (24h). Mirrored in the TUI's `adjust()`.
+const MAX_SLEEP_MINUTES: u32 = 1440;
+
 /// Assigns each session key a stable slot index, first-come-first-served.
 #[derive(Debug, Default)]
 pub struct Mapping {
@@ -100,7 +103,9 @@ impl Engine {
                 self.rerender(device).await;
             }
             Command::SetSleepMinutes(m) => {
-                self.sleep_minutes = m;
+                // Clamp to 24h: a stuck key (or a bogus Command) can't drive
+                // this arbitrarily high. Mirrored in the TUI's own adjust().
+                self.sleep_minutes = m.min(MAX_SLEEP_MINUTES);
                 self.rerender(device).await;
             }
         }
@@ -349,6 +354,16 @@ mod tests {
         engine.apply_command(Command::SetSleepMinutes(12), &mut dev).await;
         assert_eq!(engine.sleep_minutes, 12);
         assert_eq!(engine.to_config_fields().2, 12);
+    }
+
+    #[tokio::test]
+    async fn set_sleep_minutes_clamps_to_24h() {
+        // Fix 5: a stuck key (or a bogus Command) can't drive sleep_minutes
+        // arbitrarily high.
+        let mut engine = Engine::new(255);
+        let mut dev = MockDevice::new();
+        engine.apply_command(Command::SetSleepMinutes(u32::MAX), &mut dev).await;
+        assert_eq!(engine.sleep_minutes, 1440);
     }
 
     #[tokio::test]
