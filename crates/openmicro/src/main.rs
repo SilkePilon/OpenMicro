@@ -2,6 +2,7 @@ mod client;
 mod ui;
 
 use std::io::{self, BufRead};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{self, Event, KeyCode};
@@ -33,17 +34,28 @@ fn main() -> anyhow::Result<()> {
     let path = format!("{rt}/openmicro-ctl.sock");
 
     let snap = Arc::new(Mutex::new(SnapshotDto::default()));
+    let connected = Arc::new(AtomicBool::new(false));
     {
         let snap = snap.clone();
-        std::thread::spawn(move || {
-            if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
-                let reader = std::io::BufReader::new(stream);
-                for line in reader.lines().map_while(Result::ok) {
-                    if let Some(parsed) = client::parse_snapshot(&line) {
-                        *snap.lock().unwrap() = parsed;
+        let connected = connected.clone();
+        std::thread::spawn(move || loop {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => {
+                    connected.store(true, Ordering::Relaxed);
+                    let reader = std::io::BufReader::new(stream);
+                    for line in reader.lines().map_while(Result::ok) {
+                        if let Some(parsed) = client::parse_snapshot(&line) {
+                            *snap.lock().unwrap() = parsed;
+                        }
                     }
+                    // stream ended => daemon closed/restarted
+                    connected.store(false, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    connected.store(false, Ordering::Relaxed);
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         });
     }
 
@@ -59,17 +71,19 @@ fn main() -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    run(&mut terminal, &snap)
+    run(&mut terminal, &snap, &connected)
 }
 
 fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     snap: &Arc<Mutex<SnapshotDto>>,
+    connected: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     loop {
         {
             let snap = snap.lock().unwrap();
-            terminal.draw(|f| ui::render(f, &snap))?;
+            let is_connected = connected.load(Ordering::Relaxed);
+            terminal.draw(|f| ui::render(f, &snap, is_connected))?;
         }
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
