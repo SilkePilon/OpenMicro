@@ -1,0 +1,12 @@
+[package]
+name = "openmicro-proto"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+std = ["serde/std", "postcard/use-std"]
+
+[dependencies]
+serde = { workspace = true }
+postcard = { version = "1", default-features = false, features = ["alloc"] }

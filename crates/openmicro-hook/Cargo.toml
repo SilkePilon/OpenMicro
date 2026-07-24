@@ -1,0 +1,9 @@
+[package]
+name = "openmicro-hook"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
