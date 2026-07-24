@@ -1,3 +1,4 @@
+mod cli;
 mod client;
 mod ui;
 
@@ -6,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use clap::Parser;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
@@ -46,6 +48,19 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+    match cli.command {
+        // No subcommand: launch the interactive TUI exactly as before.
+        None => run_tui(),
+        // A subcommand: run it and exit (some arms exit the process directly).
+        Some(command) => cli::run(command),
+    }
+}
+
+/// Launch the interactive TUI: spawn the control-socket reader thread, install
+/// the terminal guard, and run the render/input loop. This is the historical
+/// `main` body, unchanged in behavior, reached only when no subcommand is given.
+fn run_tui() -> anyhow::Result<()> {
     let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let path = format!("{rt}/openmicro-ctl.sock");
 
