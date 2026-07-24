@@ -9,7 +9,7 @@ use crate::render::render_frame;
 use crate::session::{SessionKey, SessionStore};
 
 /// Upper bound on `sleep_minutes` (24h). Mirrored in the TUI's `adjust()`.
-const MAX_SLEEP_MINUTES: u32 = 1440;
+pub(crate) const MAX_SLEEP_MINUTES: u32 = 1440;
 
 /// Assigns each session key a stable slot index, first-come-first-served.
 #[derive(Debug, Default)]

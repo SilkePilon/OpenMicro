@@ -29,7 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
     let mut engine_init = Engine::new(cfg.brightness);
     engine_init.colors = cfg.colors;
-    engine_init.sleep_minutes = cfg.sleep_minutes;
+    // Clamp here too: `set_sleep_minutes` clamps commands at runtime, but a
+    // hand-edited config file bypasses that and would otherwise seed the
+    // engine directly with an out-of-range value.
+    engine_init.sleep_minutes = cfg.sleep_minutes.min(engine::MAX_SLEEP_MINUTES);
     let engine = Arc::new(Mutex::new(engine_init));
 
     // Shared last-activity clock: touched by every processed hook event and
