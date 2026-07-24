@@ -53,7 +53,7 @@ subcommands are:
 | `openmicro status` | Print a one-shot summary of the daemon's state (agents, states, owner, battery). Exits non-zero with `daemon not running` if the daemon is down. |
 | `openmicro service <start\|stop\|restart\|status\|enable\|disable>` | Wrapper around `systemctl --user <action> openmicrod.service`. |
 | `openmicro install-agent <claude\|codex\|grok\|t3>` | Print setup instructions for an agent adapter. |
-| `openmicro flash` | Firmware flashing (arrives with the firmware work; currently a pointer). |
+| `openmicro flash [--image <path>] [--port <path>]` | Flash firmware to a Micro 2 in bootloader mode via `esptool` (see [Flash the firmware](#flash-the-firmware)). Stops with clear guidance and a non-zero exit if the image isn't built, `esptool` is missing, or the device isn't in bootloader mode. |
 
 ## Agent setup
 
@@ -90,6 +90,46 @@ hardware pinout confirmation and a build. What's done:
 Until firmware is built, flashed, and the pinout is filled in, the daemon runs
 against a mock device (and can talk to a real device over BLE where
 available). The hardware investigation lives in
-[`docs/hardware/creator-micro-2-pinout-research.md`](docs/hardware/creator-micro-2-pinout-research.md);
-`openmicro flash` is a placeholder that will perform flashing once firmware is
-ready.
+[`docs/hardware/creator-micro-2-pinout-research.md`](docs/hardware/creator-micro-2-pinout-research.md).
+
+## Flash the firmware
+
+Once the firmware is built, OpenMicro can flash it to the device. There are two
+front-ends over the same engine: the `openmicro flash` CLI and the TUI
+installer screen (press `f`). Both are honest about prerequisites — they will
+**not** pretend to flash if something is missing.
+
+Three things must be true before a flash can happen:
+
+1. **The firmware image is built.** It is not built in this repo (there is no
+   Xtensa toolchain here). Build it first:
+   ```sh
+   cd firmware && cargo build --release   # needs the Espressif Xtensa toolchain
+   ```
+   See [`firmware/README.md`](firmware/README.md) for the `espup` toolchain
+   setup. The default image path is
+   `firmware/target/xtensa-esp32s3-none-elf/release/openmicro-fw`; pass a
+   different one with `--image`.
+2. **`esptool` is installed** and on your `PATH` (or in `~/.local/bin`):
+   ```sh
+   pip install esptool     # or: uv tool install esptool
+   ```
+3. **The device is in bootloader mode.** The Micro 2 uses native
+   USB-Serial-JTAG with **no auto-reset**, so you must enter download mode by
+   hand: **hold the boot button while plugging in the USB cable**, then release
+   once it re-enumerates. (In bootloader mode it shows up as USB `303a:1001`;
+   running normally it is `303a:8298`.)
+
+Then flash from the CLI:
+
+```sh
+openmicro flash                 # auto-detects the image and device
+openmicro flash --image path/to/fw.bin --port /dev/ttyACM0
+```
+
+or open the TUI (`openmicro`), press `f`, and follow the checklist — each item
+shows ✓ or ✗ with what to fix, and once all three pass you can press Enter to
+flash. The merged image is written at flash offset `0x0`.
+
+If a prerequisite is missing, both front-ends print exactly what to do and exit
+non-zero; nothing is written to the device.

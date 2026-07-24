@@ -1,8 +1,9 @@
 use openmicro_proto::{AgentState, Rgb};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::client::{SnapshotDto, PALETTE};
+use crate::flash::{self, ChecklistItem};
 
 /// The four editable states, in panel row order.
 pub const PANEL_STATES: [AgentState; 4] = [
@@ -44,6 +45,36 @@ impl ConfigUiState {
     }
 }
 
+/// State for the guided firmware installer screen (toggled by `f`).
+///
+/// The checklist and `ready` flag are recomputed by [`InstallerUiState::refresh`]
+/// (which does the filesystem / sysfs / PATH lookups) on open and on the `r`
+/// key, so rendering stays cheap. `output` holds captured flash status lines.
+#[derive(Default)]
+pub struct InstallerUiState {
+    pub open: bool,
+    pub items: Vec<ChecklistItem>,
+    pub ready: bool,
+    pub output: Vec<String>,
+}
+
+impl InstallerUiState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Recompute the checklist from the live environment: firmware image,
+    /// esptool discovery, and USB device state. Side-effecting (I/O), so it is
+    /// called on open / refresh rather than per frame.
+    pub fn refresh(&mut self) {
+        let image = flash::resolve_image(None);
+        let esptool = flash::esptool_path();
+        let device = flash::classify_usb(&flash::detect_usb());
+        self.items = flash::checklist(&image, esptool.as_deref(), device);
+        self.ready = flash::ready(&self.items);
+    }
+}
+
 /// Compact battery label for the dashboard title. `None` renders as an em dash.
 pub fn battery_label(pct: Option<u8>, charging: bool) -> String {
     match pct {
@@ -60,7 +91,13 @@ pub fn status_label(connected: bool) -> &'static str {
     }
 }
 
-pub fn render(frame: &mut Frame, snap: &SnapshotDto, connected: bool, cfg: &ConfigUiState) {
+pub fn render(
+    frame: &mut Frame,
+    snap: &SnapshotDto,
+    connected: bool,
+    cfg: &ConfigUiState,
+    installer: &InstallerUiState,
+) {
     let owner = snap.owner.clone().unwrap_or_default();
     let rows: Vec<Row> = snap
         .sessions
@@ -79,7 +116,11 @@ pub fn render(frame: &mut Frame, snap: &SnapshotDto, connected: bool, cfg: &Conf
         })
         .collect();
 
-    let hint = if cfg.open { "" } else { "  [c] config  [q] quit" };
+    let hint = if cfg.open || installer.open {
+        ""
+    } else {
+        "  [c] config  [f] flash  [q] quit"
+    };
     let bat = battery_label(snap.battery, snap.charging);
     let title =
         format!(" OpenMicro — agents  {}  {}{} ", status_label(connected), bat, hint);
@@ -92,6 +133,72 @@ pub fn render(frame: &mut Frame, snap: &SnapshotDto, connected: bool, cfg: &Conf
     if cfg.open {
         render_config(frame, cfg);
     }
+    if installer.open {
+        render_installer(frame, installer);
+    }
+}
+
+/// Render the guided firmware installer overlay: the prerequisite checklist
+/// (✓/✗ per row), a flash action when ready, any captured output, and the key
+/// hints. Honest by construction: the "Press Enter to flash" action only
+/// appears when all prerequisites pass; otherwise it shows what to fix.
+fn render_installer(frame: &mut Frame, installer: &InstallerUiState) {
+    let area = frame.area();
+    let w = 72u16.min(area.width.saturating_sub(2));
+    let h = 18u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        "Flash firmware — Creator Micro 2 (ESP32-S3)",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::from(""));
+
+    for (ok, text) in &installer.items {
+        let (mark, color) = if *ok {
+            ("\u{2713}", Color::Green) // ✓
+        } else {
+            ("\u{2717}", Color::Red) // ✗
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::raw(text.clone()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if installer.ready {
+        lines.push(Line::styled(
+            "\u{25b6} Press Enter to flash",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "Resolve the items above (\u{2717}) before flashing.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if !installer.output.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "output:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        ));
+        for l in &installer.output {
+            lines.push(Line::raw(l.clone()));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" installer  [r] refresh  [Enter] flash  [f/Esc] close ");
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(Clear, rect);
+    frame.render_widget(para, rect);
 }
 
 fn state_label(s: AgentState) -> &'static str {
@@ -174,6 +281,35 @@ mod tests {
         assert_eq!(c.selected, SLEEP_ROW); // clamped at bottom (sleep row = 5)
         c.select_prev();
         assert_eq!(c.selected, SLEEP_ROW - 1);
+    }
+
+    #[test]
+    fn installer_refresh_populates_checklist() {
+        // refresh() reads the live environment; on this machine the firmware
+        // image is not built and the device is not in bootloader mode, so the
+        // checklist has three rows and is not ready — but never crashes.
+        let mut inst = InstallerUiState::new();
+        inst.refresh();
+        assert_eq!(inst.items.len(), 3, "three checklist rows");
+        assert!(!inst.ready, "not ready without a built image + bootloader device");
+        // esptool is installed here, so row 2 (esptool) should be satisfied.
+        assert!(inst.items[1].0, "esptool row should be ✓: {:?}", inst.items[1]);
+        assert!(!inst.items[0].0, "firmware image row should be ✗ (not built)");
+    }
+
+    #[test]
+    fn render_installer_open_does_not_panic() {
+        // Confirm the installer render path compiles and runs on a test buffer.
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let snap = SnapshotDto::default();
+        let cfg = ConfigUiState::new(200);
+        let mut inst = InstallerUiState::new();
+        inst.open = true;
+        inst.refresh();
+        terminal
+            .draw(|f| render(f, &snap, false, &cfg, &inst))
+            .unwrap();
     }
 
     #[test]
