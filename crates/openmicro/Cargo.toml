@@ -1,0 +1,14 @@
+[package]
+name = "openmicro"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+openmicro-proto = { path = "../openmicro-proto", features = ["std"] }
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+clap.workspace = true

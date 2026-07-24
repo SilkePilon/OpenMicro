@@ -81,7 +81,7 @@ std = ["serde/std", "postcard/use-std"]
 
 [dependencies]
 serde = { workspace = true }
-postcard = { version = "1", default-features = false }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 ```
 
 `crates/openmicrod/Cargo.toml`:
@@ -226,8 +226,8 @@ pub struct LedFrame {
 impl LedFrame {
     pub const BLANK: LedFrame = LedFrame { slots: [LedSlot::OFF; SLOT_COUNT] };
 
-    pub fn encode(&self) -> Result<heapless::Vec<u8, 256>, postcard::Error> {
-        postcard::to_vec(self)
+    pub fn encode(&self) -> Result<alloc::vec::Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
@@ -267,12 +267,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Add `heapless` dep and export the module**
+- [ ] **Step 2: Export the module**
 
-In `crates/openmicro-proto/Cargo.toml` add under `[dependencies]`:
-```toml
-heapless = { version = "0.8", features = ["serde"] }
-```
+(`postcard`'s `alloc` feature — enabling `to_allocvec` — is already set in Task 1's proto `Cargo.toml`; no extra dep needed.)
 
 In `crates/openmicro-proto/src/lib.rs`:
 ```rust
@@ -654,7 +651,6 @@ use std::collections::HashMap;
 use openmicro_proto::{AgentState, SLOT_COUNT};
 
 use crate::device::DeviceLink;
-use crate::focus::pick_owner;
 use crate::render::render_frame;
 use crate::session::{SessionKey, SessionStore};
 
@@ -709,7 +705,9 @@ impl Engine {
     }
 
     fn rerender(&self, device: &mut dyn DeviceLink) {
-        let _owner = pick_owner(self.store.iter(), self.pinned.as_ref());
+        // v1: each mapped agent has its own key, so every mapped slot is lit
+        // with its own state. Focus/owner drives input routing + TUI highlight
+        // (see control.rs), not which keys light.
         let mut slots = [None; SLOT_COUNT];
         for session in self.store.iter() {
             if let Some(i) = self.mapping.slot_for(&session.key) {
