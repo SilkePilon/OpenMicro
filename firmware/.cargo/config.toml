@@ -18,8 +18,14 @@ build-std = ["core", "alloc"]
 # bootloader mode by hand first; the Micro 2's native USB-Serial-JTAG has
 # no DTR/RTS auto-reset).
 runner = "espflash flash --monitor"
+# GNU LD (xtensa-esp-elf-gcc, installed by espup alongside the Rust fork)
+# with esp-hal's linkall.x, exactly as in the upstream esp-hal-v1.1.1
+# examples' .cargo/config.toml for Xtensa targets. If the GCC linker is
+# ever unavailable, the LLD fallback is:
+#   "-C", "linker=rust-lld", "-C", "link-arg=-Tlinkall.x"
 rustflags = [
-    "-C", "link-arg=-Tlinkall.x",
+    "-C", "link-arg=-Wl,-Tlinkall.x",
+    "-C", "link-arg=-nostartfiles",
 ]
 
 [env]

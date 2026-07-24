@@ -1,19 +1,16 @@
 //! OpenMicro ESP32-S3 firmware — embedded skeleton.
 //!
-//! # Status: UNVERIFIED, NOT COMPILED
+//! # Status: COMPILES ON CI, NEVER RUN ON HARDWARE
 //!
-//! This crate has never been built against the Xtensa target. There is no
-//! Xtensa Rust toolchain installed in the environment this was written in
-//! (installing `espup` was explicitly out of scope for that work), so
-//! nothing here has been through `cargo build --release` or `cargo check`
-//! for `xtensa-esp32s3-none-elf`. Treat every API call to `esp-hal`,
-//! `esp-hal-embassy`, `esp-radio`, and `trouble-host` below as "written to
-//! match the documented/published shape of that crate's API as of the
-//! versions pinned in `Cargo.toml`, not proven to compile." The only things
-//! that ARE verified are: `cargo fmt --check` (formatting), the module
-//! structure, and that `openmicro-effects`/`openmicro-proto` (the shared,
-//! host-tested pieces this crate calls into) are fully tested in the root
-//! workspace. See `README.md` for what the next step (build + flash) needs.
+//! This crate builds for `xtensa-esp32s3-none-elf` on CI
+//! (`.github/workflows/firmware.yml`), against the version set pinned in
+//! `Cargo.toml` (esp-hal 1.1.1 + esp-rtos 0.3.0 + esp-radio 0.18.0 +
+//! trouble-host 0.6.0 — the same set as the upstream `esp-hal-v1.1.1`
+//! `bas_peripheral` BLE example). Compiling is all it is proven to do: it
+//! has never been flashed to or run on a device, and every GPIO is still a
+//! `// TODO(pinout):` placeholder, so it cannot drive the real hardware
+//! yet. `openmicro-effects`/`openmicro-proto` (the shared pieces this crate
+//! calls into) are host-tested in the root workspace.
 //!
 //! # Why the GPIO pins are all placeholders
 //!
@@ -56,6 +53,10 @@ use embassy_sync::channel::Channel;
 use openmicro_proto::{Battery, InputEvent, LedFrame};
 use static_cell::StaticCell;
 
+// esp-hal 1.1's boot flow requires the application to embed an ESP-IDF app
+// descriptor for the 2nd-stage bootloader / espflash to accept the image.
+esp_bootloader_esp_idf::esp_app_desc!();
+
 /// Host -> firmware: decoded LED frames from the BLE write characteristic.
 /// Depth 2 so a fresh write can supersede one not yet rendered without
 /// blocking the BLE task.
@@ -75,11 +76,14 @@ static BATTERY_CHANNEL: Channel<CriticalSectionRawMutex, Battery, 1> = Channel::
 /// once real memory pressure is measured on hardware.
 const HEAP_SIZE: usize = 64 * 1024;
 
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: Spawner) {
+    esp_println::logger::init_logger_from_env();
+
     // esp-hal 1.x peripheral init. `esp_hal::init` hands back the
     // peripheral singletons used to construct every driver below.
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    let peripherals =
+        esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
     // Global allocator. `esp_alloc::heap_allocator!` is a safe macro that
     // sets up a `#[global_allocator]` backed by a static buffer of
@@ -87,19 +91,24 @@ async fn main(spawner: Spawner) {
     // site (the macro contains its own minimal, upstream-reviewed unsafe).
     esp_alloc::heap_allocator!(size: HEAP_SIZE);
 
-    // embassy time driver, required before any embassy task can `.await`
-    // a timer.
+    // esp-rtos scheduler start: provides both the embassy time driver /
+    // executor integration (`embassy` feature) and the RTOS scheduler that
+    // esp-radio 0.18 requires (`esp-radio` feature). Replaces the former
+    // `esp_hal_embassy::init` — esp-hal-embassy is dead upstream past
+    // esp-hal 1.0.x (see Cargo.toml's rationale block).
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    esp_hal_embassy::init(timg0.timer0);
+    let sw_int =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // esp-radio's BLE controller. `esp_radio::init` brings up the radio
-    // clocks; `BleConnector` wraps the BT peripheral as a `bt-hci`
-    // `Controller` impl for `trouble-host` to drive.
-    // TODO: confirm exact esp-radio 0.18.0 init call shape once building
-    // against the real toolchain (this mirrors its documented "ble"
-    // feature usage).
-    let radio_init = esp_radio::init().expect("esp-radio init");
-    let ble_controller = esp_radio::ble::controller::BleConnector::new(&radio_init, peripherals.BT);
+    // esp-radio's BLE controller: `BleConnector` wraps the BT peripheral as
+    // a `bt-hci` `Controller` impl for `trouble-host` to drive (wrapped in
+    // `ExternalController` inside `ble_task`). In esp-radio 0.18 there is
+    // no separate `esp_radio::init` step — the scheduler comes from
+    // `esp_rtos::start` above, per the upstream bas_peripheral example.
+    let ble_controller =
+        esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default())
+            .expect("BLE controller init");
 
     // TODO(pinout): LED RMT channel + LED_DATA_GPIO (see pins.rs / leds.rs).
     // TODO(pinout): key matrix row/col GPIOs, encoder A/B/press GPIOs,
