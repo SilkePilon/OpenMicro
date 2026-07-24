@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use openmicro_proto::{AgentState, SLOT_COUNT};
+use openmicro_proto::{AgentState, Command, StateColors, SLOT_COUNT};
 
 use crate::action::Action;
 use crate::device::DeviceLink;
@@ -37,6 +37,7 @@ pub struct Engine {
     pub mapping: Mapping,
     pub pinned: Option<SessionKey>,
     pub brightness: u8,
+    pub colors: StateColors,
 }
 
 impl Engine {
@@ -46,6 +47,31 @@ impl Engine {
             mapping: Mapping::default(),
             pinned: None,
             brightness,
+            colors: StateColors::default(),
+        }
+    }
+
+    /// Fields the caller needs to persist to config after a command.
+    pub fn to_config_fields(&self) -> (u8, StateColors) {
+        (self.brightness, self.colors)
+    }
+
+    /// Apply a TUI command: update engine state and re-render to the device.
+    pub async fn apply_command(&mut self, cmd: Command, device: &mut dyn DeviceLink) {
+        match cmd {
+            Command::SetBrightness(b) => {
+                self.brightness = b;
+                self.rerender(device).await;
+            }
+            Command::SetStateColor { state, rgb } => {
+                match state {
+                    AgentState::Idle => self.colors.idle = rgb,
+                    AgentState::Thinking => self.colors.thinking = rgb,
+                    AgentState::Working => self.colors.working = rgb,
+                    AgentState::AwaitingApproval => self.colors.awaiting_approval = rgb,
+                }
+                self.rerender(device).await;
+            }
         }
     }
 
@@ -135,7 +161,7 @@ impl Engine {
                 slots[i] = Some(session.state);
             }
         }
-        let frame = render_frame(&slots, self.brightness);
+        let frame = render_frame(&slots, self.brightness, &self.colors);
         device.set_leds(&frame).await;
     }
 }
@@ -144,7 +170,37 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::device::MockDevice;
-    use openmicro_proto::Rgb;
+    use openmicro_proto::{Command, Rgb};
+
+    #[tokio::test]
+    async fn apply_set_brightness_updates_and_rerenders() {
+        let mut engine = Engine::new(100);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        let before = dev.writes;
+        engine.apply_command(Command::SetBrightness(50), &mut dev).await;
+        assert_eq!(engine.brightness, 50);
+        assert!(dev.writes > before);
+        assert_eq!(dev.last_frame().slots[0].brightness, 50);
+    }
+
+    #[tokio::test]
+    async fn apply_set_state_color_changes_render() {
+        let mut engine = Engine::new(200);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        engine
+            .apply_command(
+                Command::SetStateColor {
+                    state: AgentState::Working,
+                    rgb: Rgb { r: 1, g: 2, b: 3 },
+                },
+                &mut dev,
+            )
+            .await;
+        assert_eq!(dev.last_frame().slots[0].color, Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(engine.colors.working, Rgb { r: 1, g: 2, b: 3 });
+    }
 
     #[tokio::test]
     async fn hook_event_lights_the_assigned_slot() {

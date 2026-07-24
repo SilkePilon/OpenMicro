@@ -95,10 +95,12 @@ mod tests {
 
     #[test]
     fn config_with_colors_roundtrips() {
-        use openmicro_proto::Rgb;
-        let mut cfg = Config::default();
-        cfg.brightness = 77;
-        cfg.colors.working = Rgb { r: 1, g: 2, b: 3 };
+        use openmicro_proto::{Rgb, StateColors};
+        let cfg = Config {
+            brightness: 77,
+            colors: StateColors { working: Rgb { r: 1, g: 2, b: 3 }, ..Default::default() },
+            ..Default::default()
+        };
         let toml = toml::to_string(&cfg).unwrap();
         let back = Config::from_toml_str(&toml);
         assert_eq!(back.brightness, 77);
@@ -108,13 +110,15 @@ mod tests {
 
     #[test]
     fn save_to_writes_file() {
-        use openmicro_proto::Rgb;
+        use openmicro_proto::{Rgb, StateColors};
         let dir = std::env::temp_dir().join(format!("omtest-{}", std::process::id()));
         let path = dir.join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = Config::default();
-        cfg.brightness = 55;
-        cfg.colors.thinking = Rgb { r: 9, g: 8, b: 7 };
+        let cfg = Config {
+            brightness: 55,
+            colors: StateColors { thinking: Rgb { r: 9, g: 8, b: 7 }, ..Default::default() },
+            ..Default::default()
+        };
         cfg.save_to(&path).unwrap();
         let back = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(back.brightness, 55);
