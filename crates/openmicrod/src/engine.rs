@@ -25,6 +25,9 @@ impl Mapping {
     pub fn slot_for(&self, key: &SessionKey) -> Option<usize> {
         self.slots.get(key).copied()
     }
+    pub fn release(&mut self, key: &SessionKey) {
+        self.slots.remove(key);
+    }
 }
 
 pub struct Engine {
@@ -51,6 +54,13 @@ impl Engine {
         state: AgentState,
         device: &mut dyn DeviceLink,
     ) {
+        if state == AgentState::Idle {
+            let key = SessionKey { agent: agent.to_string(), session: session.to_string() };
+            self.store.remove(&key);
+            self.mapping.release(&key);
+            self.rerender(device).await;
+            return;
+        }
         let key = self.store.update(agent, session, state);
         self.mapping.assign(&key);
         self.rerender(device).await;
@@ -97,5 +107,23 @@ mod tests {
         let frame = dev.last_frame();
         assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 }); // working
         assert_eq!(frame.slots[1].color, Rgb { r: 40, g: 90, b: 255 }); // thinking
+    }
+
+    #[tokio::test]
+    async fn idle_frees_the_slot() {
+        let mut engine = Engine::new(255);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        let frame = dev.last_frame();
+        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 }); // working
+
+        engine.on_event("claude", "s1", AgentState::Idle, &mut dev).await;
+        let frame = dev.last_frame();
+        assert_eq!(frame.slots[0], openmicro_proto::LedSlot::OFF);
+
+        // A new session should be able to reuse slot 0 now that it was freed.
+        engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
+        let frame = dev.last_frame();
+        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 });
     }
 }
