@@ -4,7 +4,7 @@
 //! `openmicro_proto::ble`. The daemon keeps `MockDevice` as the default; this
 //! backend is only used when the config selects `Transport::Ble`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
@@ -31,6 +31,15 @@ use crate::device::DeviceLink;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Backoff is capped at this many seconds.
 const BACKOFF_CAP_SECS: u64 = 30;
+/// Minimum time between reconnect *attempts* triggered from `set_leds`. Bounds
+/// how often a down link can trigger a (bounded) discovery attempt, so a dead
+/// device can't turn every render into a stall.
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+/// Hard cap on a single in-call reconnect attempt from `set_leds`, independent
+/// of `discover_and_resolve`'s own 15s discovery timeout. This is what bounds
+/// the worst-case time `set_leds` can hold its callers' locks while the link
+/// is down.
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Capped exponential backoff: `min(2^attempt, 30)` seconds.
 ///
@@ -54,7 +63,23 @@ pub struct BleDevice {
     led: Characteristic,
     last: LedFrame,
     connected: bool,
+    /// When the last reconnect attempt (successful or not) was made, used to
+    /// gate how often `set_leds` will retrigger discovery while the link is
+    /// down. `None` means no attempt has been made since the last successful
+    /// connection.
+    last_reconnect_attempt: Option<Instant>,
     input_tx: UnboundedSender<InputEvent>,
+}
+
+impl BleDevice {
+    /// True once at least `RECONNECT_COOLDOWN` has elapsed since the last
+    /// reconnect attempt (or no attempt has been made yet).
+    fn reconnect_cooldown_elapsed(&self) -> bool {
+        match self.last_reconnect_attempt {
+            None => true,
+            Some(t) => t.elapsed() >= RECONNECT_COOLDOWN,
+        }
+    }
 }
 
 impl BleDevice {
@@ -83,14 +108,17 @@ impl BleDevice {
             led: handles.led,
             last: LedFrame::BLANK,
             connected: true,
+            last_reconnect_attempt: None,
             input_tx,
         })
     }
 
     /// Re-run discovery and re-resolve handles using capped exponential backoff.
     ///
-    /// Wired for P2 (input routing / resilience); kept off the hot render path.
-    #[allow(dead_code)]
+    /// Called from the `set_leds` failure path with a small `max_attempts`
+    /// (currently 1) so it can't stall the render path for the full
+    /// exponential-backoff cap; a fuller standalone supervisor (retrying in
+    /// the background, independent of any particular write) can come later.
     pub async fn reconnect(&mut self, max_attempts: u32) -> anyhow::Result<()> {
         for attempt in 0..max_attempts {
             match discover_and_resolve(&self.adapter).await {
@@ -251,6 +279,20 @@ impl DeviceLink for BleDevice {
                 return;
             }
         };
+
+        // `set_leds` runs while the caller holds BOTH the engine and device
+        // mutexes (ingress/control/sleeper/input all lock engine->device), so
+        // everything below must be tightly bounded: a down link must not be
+        // able to stall the whole daemon.
+        //
+        // If we already know the link is down and haven't waited out the
+        // cooldown yet, skip the write entirely — don't even touch the
+        // (possibly stale) characteristic. The frame is already cached in
+        // `self.last` above, so `last_frame()` stays correct.
+        if !self.connected && !self.reconnect_cooldown_elapsed() {
+            return;
+        }
+
         // Prefer write-without-response for low-latency LED updates.
         let req = CharacteristicWriteRequest {
             op_type: WriteOp::Command,
@@ -258,7 +300,58 @@ impl DeviceLink for BleDevice {
         };
         if let Err(e) = self.led.write_ext(&bytes, &req).await {
             eprintln!("ble: LED write failed, marking disconnected: {e}");
+            let was_already_down = !self.connected;
             self.connected = false;
+            // Start (or restart) the cooldown clock on every failure, not
+            // just when we actually attempt discovery below. This is what
+            // guarantees at most one reconnect attempt per
+            // `RECONNECT_COOLDOWN`: the very next call, within the cooldown
+            // window, hits the top-of-function skip above instead of
+            // reaching this branch at all.
+            self.last_reconnect_attempt = Some(Instant::now());
+
+            if !was_already_down {
+                // First failure since we were last connected: just mark down
+                // and cache — no discovery attempt yet. This keeps a
+                // brand-new failure cheap; recovery is attempted starting
+                // from the next call, once the cooldown above has passed.
+                return;
+            }
+
+            // Best-effort, bounded reconnect: a single attempt (not the full
+            // exponential-backoff supervisor `reconnect` supports), AND
+            // capped by a short outer timeout independent of
+            // `discover_and_resolve`'s own 15s discovery timeout. Together
+            // with the cooldown above, this bounds the worst-case lock hold
+            // to ~RECONNECT_ATTEMPT_TIMEOUT (2s), at most once per
+            // RECONNECT_COOLDOWN (5s) while the link stays down. On success,
+            // retry the write once; on any failure/timeout, the frame stays
+            // cached in `self.last` and `connected` stays false — the next
+            // `set_leds` call (after the cooldown) will attempt this same
+            // recovery again.
+            //
+            // NOTE: this talks to real BlueZ/adapter state and cannot be
+            // exercised without hardware in CI. Validated on hardware only.
+            // It must never fabricate success: a failed/timed-out retry here
+            // is reported exactly like an unrecovered failure today.
+            match tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, self.reconnect(1)).await {
+                Ok(Ok(())) => {
+                    if let Err(e) = self.led.write_ext(&bytes, &req).await {
+                        eprintln!("ble: LED write failed again after reconnect: {e}");
+                        self.connected = false;
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("ble: reconnect failed: {e}");
+                    self.connected = false;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "ble: reconnect attempt timed out after {RECONNECT_ATTEMPT_TIMEOUT:?}; will retry after cooldown"
+                    );
+                    self.connected = false;
+                }
+            }
         }
     }
 

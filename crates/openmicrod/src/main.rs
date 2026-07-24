@@ -12,6 +12,7 @@ mod sleeper;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use config::Transport;
 use device::MockDevice;
@@ -28,7 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
     let mut engine_init = Engine::new(cfg.brightness);
     engine_init.colors = cfg.colors;
-    engine_init.sleep_minutes = cfg.sleep_minutes;
+    // Clamp here too: `set_sleep_minutes` clamps commands at runtime, but a
+    // hand-edited config file bypasses that and would otherwise seed the
+    // engine directly with an out-of-range value.
+    engine_init.sleep_minutes = cfg.sleep_minutes.min(engine::MAX_SLEEP_MINUTES);
     let engine = Arc::new(Mutex::new(engine_init));
 
     // Shared last-activity clock: touched by every processed hook event and
@@ -64,12 +68,19 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
+    // Every long-running background task is collected into one JoinSet so a
+    // panic or early exit in ANY of them — not just ingress/control — is
+    // surfaced (logged) instead of silently vanishing. Each task is tagged
+    // with a name so the log line says which one ended.
+    let mut tasks: JoinSet<(&'static str, anyhow::Result<()>)> = JoinSet::new();
+
     // Drain battery readings into the shared latest-value cell.
     let battery_store = battery.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(b) = battery_rx.recv().await {
             *battery_store.lock().await = Some(b);
         }
+        ("battery-drain", Ok(()))
     });
 
     // Route device input events into the engine. To respect the engine->device
@@ -79,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let engine_in = engine.clone();
     let device_in = device.clone();
     let clock_in = clock.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(ev) = input_rx.recv().await {
             clock_in.touch();
             let maybe_action = {
@@ -98,23 +109,87 @@ async fn main() -> anyhow::Result<()> {
                 eng.apply_action(act, &mut *dev).await;
             }
         }
+        ("input-routing", Ok(()))
     });
 
     let rt = runtime_dir();
     let hook_path = rt.join("openmicro.sock");
     let ctl_path = rt.join("openmicro-ctl.sock");
 
-    let ingress =
-        tokio::spawn(ingress::serve(hook_path, engine.clone(), device.clone(), clock.clone()));
-    let control =
-        tokio::spawn(control::serve(ctl_path, engine.clone(), device.clone(), battery.clone()));
-    tokio::spawn(sleeper::serve(clock.clone(), engine.clone(), device.clone()));
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let clock = clock.clone();
+        tasks.spawn(async move { ("ingress", ingress::serve(hook_path, engine, device, clock).await) });
+    }
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let battery = battery.clone();
+        tasks.spawn(async move { ("control", control::serve(ctl_path, engine, device, battery).await) });
+    }
+    {
+        let engine = engine.clone();
+        let device = device.clone();
+        let clock = clock.clone();
+        tasks.spawn(async move {
+            sleeper::serve(clock, engine, device).await;
+            ("sleeper", Ok(()))
+        });
+    }
+
+    // `ingress` and `control` are the daemon's core IPC surfaces: neither
+    // returns in normal operation, so any end of one of them (clean exit,
+    // error, or panic) means the daemon is no longer useful and must exit
+    // non-zero so systemd's `Restart=on-failure` kicks in. `battery`,
+    // `input-routing`, and `sleeper` are best-effort: their end is logged but
+    // the daemon keeps running.
+    fn is_fatal_task(name: &str) -> bool {
+        matches!(name, "ingress" | "control")
+    }
 
     println!("openmicrod running (transport: {:?}). Ctrl-C to stop.", cfg.transport);
-    tokio::select! {
-        r = ingress => { r??; }
-        r = control => { r??; }
-        _ = tokio::signal::ctrl_c() => {}
+    loop {
+        tokio::select! {
+            res = tasks.join_next() => {
+                match res {
+                    Some(Ok((name, Ok(())))) => {
+                        eprintln!("openmicrod: task '{name}' exited");
+                        if is_fatal_task(name) {
+                            eprintln!("openmicrod: '{name}' is a core task; shutting down.");
+                            anyhow::bail!("core task '{name}' exited unexpectedly");
+                        }
+                    }
+                    Some(Ok((name, Err(e)))) => {
+                        eprintln!("openmicrod: task '{name}' exited with error: {e}");
+                        if is_fatal_task(name) {
+                            eprintln!("openmicrod: '{name}' is a core task; shutting down.");
+                            return Err(e.context(format!("core task '{name}' failed")));
+                        }
+                    }
+                    Some(Err(join_err)) => {
+                        eprintln!("openmicrod: a background task panicked: {join_err}");
+                        // We don't have the task name for a panic (the closure
+                        // never returned its tag), so treat any panic as
+                        // fatal: a panicked ingress/control task must still
+                        // trigger a restart, and panics are unexpected enough
+                        // that "restart to be safe" is the right default even
+                        // for the best-effort tasks.
+                        return Err(anyhow::Error::from(join_err).context("background task panicked"));
+                    }
+                    None => {
+                        // Every task has now exited (ingress/control never return
+                        // in normal operation, so this means every task hit an
+                        // error/panic already logged above): nothing left to do.
+                        eprintln!("openmicrod: all background tasks have exited; shutting down.");
+                        anyhow::bail!("all background tasks exited");
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("openmicrod: received Ctrl-C, shutting down.");
+                return Ok(());
+            }
+        }
     }
-    Ok(())
 }

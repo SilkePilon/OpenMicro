@@ -30,7 +30,7 @@ pub struct SessionDto {
     pub slot: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotDto {
     pub sessions: Vec<SessionDto>,
     pub owner: Option<String>,
@@ -38,6 +38,41 @@ pub struct SnapshotDto {
     pub battery: Option<u8>,
     #[serde(default)]
     pub charging: bool,
+    /// Live LED brightness from the daemon. `#[serde(default)]` so a snapshot
+    /// from an older daemon build (before Fix 1) still parses; falls back to
+    /// the historical UI default (200) rather than 0.
+    #[serde(default = "default_brightness")]
+    pub brightness: u8,
+    /// Live per-state LED colors from the daemon, same default rationale.
+    #[serde(default)]
+    pub colors: openmicro_proto::StateColors,
+    /// Live idle-sleep minutes from the daemon, same default rationale.
+    #[serde(default = "default_sleep_minutes")]
+    pub sleep_minutes: u32,
+}
+
+/// Matches the historical hardcoded UI default (`ConfigUiState::new(200)`).
+fn default_brightness() -> u8 {
+    200
+}
+
+/// Matches the historical hardcoded UI default (`ConfigUiState`'s `sleep_minutes: 3`).
+fn default_sleep_minutes() -> u32 {
+    3
+}
+
+impl Default for SnapshotDto {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            owner: None,
+            battery: None,
+            charging: false,
+            brightness: default_brightness(),
+            colors: openmicro_proto::StateColors::default(),
+            sleep_minutes: default_sleep_minutes(),
+        }
+    }
 }
 
 pub fn parse_snapshot(line: &str) -> Option<SnapshotDto> {
@@ -71,6 +106,32 @@ mod tests {
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.battery, None);
         assert!(!snap.charging);
+    }
+
+    #[test]
+    fn config_fields_default_when_absent() {
+        // Fix 1: older daemon snapshots (or a stale build) omit brightness/
+        // colors/sleep_minutes entirely; parsing must still succeed and fall
+        // back to the current UI defaults rather than erroring.
+        let line = r#"{"sessions":[],"owner":null}"#;
+        let snap = parse_snapshot(line).unwrap();
+        assert_eq!(snap.brightness, 200);
+        assert_eq!(snap.colors, openmicro_proto::StateColors::default());
+        assert_eq!(snap.sleep_minutes, 3);
+    }
+
+    #[test]
+    fn parses_config_fields_when_present() {
+        // The daemon now carries the live config in every snapshot; the TUI
+        // seeds its config panel from these instead of hardcoded constants.
+        let line = r#"{"sessions":[],"owner":null,"brightness":77,
+            "colors":{"idle":{"r":0,"g":0,"b":0},"thinking":{"r":40,"g":90,"b":255},
+            "working":{"r":9,"g":8,"b":7},"awaiting_approval":{"r":255,"g":140,"b":0}},
+            "sleep_minutes":42}"#;
+        let snap = parse_snapshot(line).unwrap();
+        assert_eq!(snap.brightness, 77);
+        assert_eq!(snap.colors.working, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
+        assert_eq!(snap.sleep_minutes, 42);
     }
 
     #[test]
