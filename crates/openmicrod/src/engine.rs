@@ -72,6 +72,8 @@ impl Engine {
                 }
                 self.rerender(device).await;
             }
+            // Fully handled in Fix 2 (engine sleep + config plumbing).
+            Command::SetSleepMinutes(_) => {}
         }
     }
 
