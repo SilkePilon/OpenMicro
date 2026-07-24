@@ -25,7 +25,9 @@ fn runtime_dir() -> std::path::PathBuf {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
-    let engine = Arc::new(Mutex::new(Engine::new(cfg.brightness)));
+    let mut engine_init = Engine::new(cfg.brightness);
+    engine_init.colors = cfg.colors;
+    let engine = Arc::new(Mutex::new(engine_init));
 
     // Channel for device->host input events. In P1 the daemon just drains it;
     // P2 will route these into the engine.
@@ -80,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     let ctl_path = rt.join("openmicro-ctl.sock");
 
     let ingress = tokio::spawn(ingress::serve(hook_path, engine.clone(), device.clone()));
-    let control = tokio::spawn(control::serve(ctl_path, engine.clone()));
+    let control = tokio::spawn(control::serve(ctl_path, engine.clone(), device.clone()));
 
     println!("openmicrod running (transport: {:?}). Ctrl-C to stop.", cfg.transport);
     tokio::select! {
