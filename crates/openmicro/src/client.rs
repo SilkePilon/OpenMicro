@@ -34,6 +34,10 @@ pub struct SessionDto {
 pub struct SnapshotDto {
     pub sessions: Vec<SessionDto>,
     pub owner: Option<String>,
+    #[serde(default)]
+    pub battery: Option<u8>,
+    #[serde(default)]
+    pub charging: bool,
 }
 
 pub fn parse_snapshot(line: &str) -> Option<SnapshotDto> {
@@ -50,6 +54,23 @@ mod tests {
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.sessions.len(), 1);
         assert_eq!(snap.owner.as_deref(), Some("claude:s1"));
+    }
+
+    #[test]
+    fn parses_battery_fields() {
+        let line = r#"{"sessions":[],"owner":null,"battery":84,"charging":true}"#;
+        let snap = parse_snapshot(line).unwrap();
+        assert_eq!(snap.battery, Some(84));
+        assert!(snap.charging);
+    }
+
+    #[test]
+    fn battery_defaults_when_absent() {
+        // Older daemon snapshots omit battery/charging entirely.
+        let line = r#"{"sessions":[],"owner":null}"#;
+        let snap = parse_snapshot(line).unwrap();
+        assert_eq!(snap.battery, None);
+        assert!(!snap.charging);
     }
 
     #[test]

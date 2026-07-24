@@ -39,13 +39,20 @@ async fn main() -> anyhow::Result<()> {
     // P2 will route these into the engine.
     let (input_tx, mut input_rx) =
         tokio::sync::mpsc::unbounded_channel::<openmicro_proto::InputEvent>();
+    // Channel for device->host battery readings, drained into `battery` below.
+    let (battery_tx, mut battery_rx) =
+        tokio::sync::mpsc::unbounded_channel::<openmicro_proto::Battery>();
+
+    // Latest known battery reading; None on the mock transport / before first read.
+    let battery: Arc<Mutex<Option<openmicro_proto::Battery>>> = Arc::new(Mutex::new(None));
 
     let device: Arc<Mutex<dyn device::DeviceLink + Send>> = match cfg.transport {
         Transport::Mock => {
             drop(input_tx);
+            drop(battery_tx);
             Arc::new(Mutex::new(MockDevice::new()))
         }
-        Transport::Ble => match ble::BleDevice::connect(input_tx).await {
+        Transport::Ble => match ble::BleDevice::connect(input_tx, battery_tx).await {
             Ok(dev) => {
                 println!("openmicrod: BLE device connected.");
                 Arc::new(Mutex::new(dev))
@@ -56,6 +63,14 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     };
+
+    // Drain battery readings into the shared latest-value cell.
+    let battery_store = battery.clone();
+    tokio::spawn(async move {
+        while let Some(b) = battery_rx.recv().await {
+            *battery_store.lock().await = Some(b);
+        }
+    });
 
     // Route device input events into the engine. To respect the engine->device
     // lock order used by `ingress` (and to avoid holding the engine lock across
@@ -91,7 +106,8 @@ async fn main() -> anyhow::Result<()> {
 
     let ingress =
         tokio::spawn(ingress::serve(hook_path, engine.clone(), device.clone(), clock.clone()));
-    let control = tokio::spawn(control::serve(ctl_path, engine.clone(), device.clone()));
+    let control =
+        tokio::spawn(control::serve(ctl_path, engine.clone(), device.clone(), battery.clone()));
     tokio::spawn(sleeper::serve(clock.clone(), engine.clone(), device.clone()));
 
     println!("openmicrod running (transport: {:?}). Ctrl-C to stop.", cfg.transport);

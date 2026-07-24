@@ -13,7 +13,7 @@ use openmicro_proto::Command;
 use ratatui::prelude::*;
 
 use client::{adjust_brightness, step_preset, SnapshotDto, PALETTE};
-use ui::{ConfigUiState, PANEL_STATES};
+use ui::{ConfigUiState, PANEL_STATES, SLEEP_ROW};
 
 /// Shared write handle for sending `Command`s to the daemon. `None` when
 /// disconnected. Populated by the reader thread on each successful connect.
@@ -144,6 +144,9 @@ fn adjust(cfg: &mut ConfigUiState, dir: i32, writer: &Writer) {
     if cfg.selected == 0 {
         cfg.brightness = adjust_brightness(cfg.brightness, dir * 8);
         send_command(writer, &Command::SetBrightness(cfg.brightness));
+    } else if cfg.selected == SLEEP_ROW {
+        cfg.sleep_minutes = (cfg.sleep_minutes as i32 + dir).max(0) as u32;
+        send_command(writer, &Command::SetSleepMinutes(cfg.sleep_minutes));
     } else {
         let i = cfg.selected - 1;
         cfg.color_idx[i] = step_preset(cfg.color_idx[i], dir);

@@ -366,7 +366,7 @@ mod tests {
         let pinned = engine.pinned.clone().expect("focus should be pinned");
         // Owner started at codex:s2 (slot 1); +1 wraps to slot 0 = claude:s1.
         assert_eq!(pinned, SessionKey { agent: "claude".into(), session: "s1".into() });
-        let snap = crate::control::snapshot(&engine);
+        let snap = crate::control::snapshot(&engine, None);
         assert_eq!(snap.owner.as_deref(), Some("claude:s1"));
     }
 }
