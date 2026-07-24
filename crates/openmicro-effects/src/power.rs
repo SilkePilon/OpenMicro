@@ -27,6 +27,14 @@ pub const HOLD_BOOTLOADER_MS: u32 = 8_000;
 /// Presses shorter than this are contact bounce, not intent.
 pub const DEBOUNCE_MS: u32 = 30;
 
+/// Someone meaning to power the device down must not land in the bootloader,
+/// so the two gestures are kept far apart. Checked at compile time rather than
+/// in a test, since it is a property of the constants themselves.
+const _: () = assert!(
+    HOLD_BOOTLOADER_MS >= HOLD_OFF_MS * 3,
+    "the power-off and bootloader holds are too close together"
+);
+
 /// What the button asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerAction {
@@ -175,15 +183,6 @@ mod tests {
             .skip(1)
             .collect();
         assert!(after.is_empty(), "kept firing after the bootloader: {after:?}");
-    }
-
-    #[test]
-    fn the_bootloader_threshold_is_well_clear_of_power_off() {
-        // Someone meaning to power down must not land in the bootloader.
-        assert!(
-            HOLD_BOOTLOADER_MS >= HOLD_OFF_MS * 3,
-            "the two gestures are too close together"
-        );
     }
 
     #[test]

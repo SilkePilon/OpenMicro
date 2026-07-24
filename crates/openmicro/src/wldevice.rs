@@ -155,6 +155,58 @@ pub fn usb_mode() -> UsbMode {
     classify(&crate::flash::detect_usb())
 }
 
+/// esptool argv that just talks to whatever is on the port, without resetting
+/// it. Succeeds only if a ROM bootloader is actually listening.
+pub fn sync_args(port: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--chip".to_string(), crate::flash::CHIP.to_string()];
+    if let Some(p) = port {
+        args.push("--port".to_string());
+        args.push(p.to_string());
+    }
+    args.push("--before".to_string());
+    args.push("no-reset".to_string());
+    args.push("--after".to_string());
+    args.push("no-reset".to_string());
+    args.push("chip-id".to_string());
+    args
+}
+
+/// esptool argv that resets the chip into download mode over USB-Serial-JTAG.
+///
+/// This is the route that works on *OpenMicro* firmware, which — unlike the
+/// vendor's — exposes the USB-Serial-JTAG peripheral, so esptool can drive the
+/// reset itself and needs no cooperation from the running firmware.
+pub fn usb_reset_args(port: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--chip".to_string(), crate::flash::CHIP.to_string()];
+    if let Some(p) = port {
+        args.push("--port".to_string());
+        args.push(p.to_string());
+    }
+    args.push("--before".to_string());
+    args.push("usb-reset".to_string());
+    args.push("--after".to_string());
+    args.push("no-reset".to_string());
+    args.push("chip-id".to_string());
+    args
+}
+
+/// Whether a ROM bootloader is really listening.
+///
+/// `303a:1001` is ambiguous: it is what the ROM download mode enumerates as,
+/// **and** what any firmware exposing the USB-Serial-JTAG console looks like —
+/// including OpenMicro's own. Presence on the bus is therefore not evidence of
+/// download mode; only a successful esptool sync is.
+pub fn download_mode_responds(port: Option<&str>) -> bool {
+    let Some(esptool) = crate::flash::esptool_path() else {
+        return false;
+    };
+    Command::new(&esptool)
+        .args(sync_args(port))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Ask the running firmware to reboot into ROM download mode.
 ///
 /// Returns progress lines for the UI. Succeeds when the bootloader actually
@@ -166,8 +218,18 @@ pub fn enter_bootloader() -> Result<Vec<String>, String> {
 
     match usb_mode() {
         UsbMode::Bootloader => {
-            log.push("already in bootloader mode.".to_string());
-            return Ok(log);
+            // Could be the ROM bootloader, or could be OpenMicro firmware
+            // exposing the same USB-Serial-JTAG identity. Ask before assuming.
+            if download_mode_responds(None) {
+                log.push("already in bootloader mode.".to_string());
+                return Ok(log);
+            }
+            log.push(
+                "a device is present over USB-Serial-JTAG but not in download mode \
+                 (OpenMicro firmware looks like this); resetting it."
+                    .to_string(),
+            );
+            return usb_reset_into_bootloader(log);
         }
         UsbMode::Absent => {
             return Err("no macropad found on USB. Connect it with a data-capable cable \
@@ -204,6 +266,34 @@ pub fn enter_bootloader() -> Result<Vec<String>, String> {
             BOOTLOADER_APPEAR_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Reset a USB-Serial-JTAG device into download mode with esptool.
+///
+/// Used for OpenMicro's own firmware, which needs no vendor RPC because the
+/// peripheral esptool drives is on the bus. Works even when the firmware has
+/// crashed, which is exactly when it is most needed.
+fn usb_reset_into_bootloader(mut log: Vec<String>) -> Result<Vec<String>, String> {
+    let esptool = crate::flash::esptool_path().ok_or_else(|| {
+        "resetting into bootloader mode needs esptool. Install it: pip install esptool."
+            .to_string()
+    })?;
+    let output = Command::new(&esptool)
+        .args(usb_reset_args(None))
+        .output()
+        .map_err(|e| format!("failed to launch esptool: {e}"))?;
+
+    if download_mode_responds(None) {
+        log.push("device is in bootloader mode.".to_string());
+        return Ok(log);
+    }
+    let mut lines = crate::flash::combine_output(&output.stdout, &output.stderr);
+    lines.push(
+        "the device did not enter download mode. If it is running OpenMicro, hold the \
+         power button for about 8 seconds to force it."
+            .to_string(),
+    );
+    Err(lines.join("\n"))
 }
 
 /// Write one framed RPC request to the vendor HID interface.
@@ -381,6 +471,36 @@ mod tests {
         assert!(args.contains(&"write-mem".to_string()));
         assert!(args.contains(&"0x6000812C".to_string()), "{args:?}");
         assert_eq!(args.last().unwrap(), "0", "the register is cleared, not set");
+    }
+
+    #[test]
+    fn sync_args_never_reset_the_chip() {
+        // This runs against a device that may be mid-boot; resetting it would
+        // change the very state we are trying to observe.
+        let args = sync_args(None);
+        assert!(args.windows(2).any(|w| w == ["--before", "no-reset"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--after", "no-reset"]), "{args:?}");
+    }
+
+    #[test]
+    fn usb_reset_args_use_the_serial_jtag_reset() {
+        // The route that works on OpenMicro firmware, which exposes
+        // USB-Serial-JTAG; the vendor's firmware does not, hence its HID RPC.
+        let args = usb_reset_args(Some("/dev/ttyACM0"));
+        assert!(args.windows(2).any(|w| w == ["--before", "usb-reset"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]), "{args:?}");
+    }
+
+    #[test]
+    fn download_mode_is_not_inferred_from_the_usb_id_alone() {
+        // 303a:1001 is what the ROM bootloader AND any firmware exposing the
+        // USB-Serial-JTAG console look like — including our own. Classification
+        // still reports Bootloader for the id, but the *decision* to flash must
+        // go through an esptool sync, which is what `download_mode_responds`
+        // is for.
+        assert_eq!(classify(&[(WL_VID, BOOTLOADER_PID)]), UsbMode::Bootloader);
+        // No device attached here, so nothing can answer a sync.
+        assert!(!download_mode_responds(Some("/dev/definitely-not-a-port")));
     }
 
     #[test]
