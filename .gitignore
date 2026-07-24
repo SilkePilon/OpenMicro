@@ -5,3 +5,6 @@
 
 # Claude Code scratch (worktrees, session state)
 /.claude/
+
+# The firmware is a separate workspace, so /target does not cover it.
+firmware/target/
