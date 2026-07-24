@@ -40,6 +40,24 @@ Make setup one-command. TUI flow: detect the device, walk the user through bootl
 ### P8 — Firmware crate (embedded Rust)
 `firmware/` — no_std esp-hal + embassy + TrouBLE for ESP32-S3. Custom BLE GATT service (LED write / INPUT notify / Battery), WS2812 RGB render with on-device effects (solid/breath/pulse/rainbow), key-matrix + encoder + joystick scan emitting `InputEvent`. Pinout from research (P0 doc) or TODO constants. Target build must compile; flash-and-run deferred to the user.
 
+**Status (2026-07-24): partially done, by design.**
+- Done + tested: `crates/openmicro-effects` — the Solid/Breath/Pulse/Rainbow
+  effect resolver moved out of the embedded crate into its own `no_std`,
+  root-workspace, host-testable library (14 unit tests, TDD'd), so the
+  animation logic is verified without any hardware or toolchain.
+- Done, NOT compiled: `firmware/` — the full skeleton (BLE GATT server over
+  TrouBLE, WS2812 render task, key/encoder/joystick input scanning, a
+  `pins.rs` with every physical GPIO as a grouped `// TODO(pinout):`
+  constant) exists as its own Cargo workspace, with dependency versions
+  pinned and cross-checked against each crate's published `Cargo.toml` (see
+  `firmware/README.md` and `.superpowers/sdd/p8-firmware-report.md` for the
+  exact versions + rationale, including two deliberate deviations from the
+  obvious "latest" picks where the docs showed real incompatibilities).
+  **It has never been built** — no Xtensa/`espup` toolchain was installed
+  (explicitly out of scope), so "target build must compile" above is not yet
+  met. That, plus filling in the real pinout and flashing, is the remaining
+  work and needs the physical device.
+
 ## Execution
 Each sub-project: a just-in-time plan, then subagent implementation with TDD + review, committed on `openmicro-features`, merged to `master` when green. Firmware (P8) and installer (P6) are built but marked "awaiting on-hardware validation."
 

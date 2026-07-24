@@ -72,9 +72,24 @@ without your say-so.
 ## Firmware status
 
 The firmware that runs on the macropad is **separate from this host software and
-is not yet ready** — it is awaiting hardware pinout confirmation and a flashing
-path. Until then the daemon runs against a mock device (and can talk to a real
-device over BLE where available). The current hardware investigation lives in
+is not yet ready to flash** — it exists as a documented skeleton awaiting
+hardware pinout confirmation and a build. What's done:
+
+- **`crates/openmicro-effects`** — the LED effect resolver (Solid / Breath /
+  Pulse / Rainbow) is complete, host-tested (`cargo test -p
+  openmicro-effects`), `no_std`, and shared by the firmware unchanged.
+- **`firmware/`** — an ESP32-S3 embedded skeleton (BLE GATT server, WS2812
+  render loop, key/encoder/joystick input scanning) with every physical pin
+  as a documented `// TODO(pinout):` placeholder. It is its own Cargo
+  workspace so it never affects `cargo build/test/clippy --workspace` at the
+  repo root. **It has not been compiled** — there is no Xtensa Rust toolchain
+  in this environment; see [`firmware/README.md`](firmware/README.md) for the
+  toolchain install, build, and flashing steps once you have the device and
+  its pinout in hand.
+
+Until firmware is built, flashed, and the pinout is filled in, the daemon runs
+against a mock device (and can talk to a real device over BLE where
+available). The hardware investigation lives in
 [`docs/hardware/creator-micro-2-pinout-research.md`](docs/hardware/creator-micro-2-pinout-research.md);
-`openmicro flash` is a placeholder that will perform flashing once that work
-lands.
+`openmicro flash` is a placeholder that will perform flashing once firmware is
+ready.
