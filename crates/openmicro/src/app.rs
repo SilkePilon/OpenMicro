@@ -324,9 +324,11 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     if !run_job(ui, "Flashing", "Firmware written", || flash::flash_capture(None, None)) {
         return Ok(());
     }
-    run_job(ui, "Restarting the device", "Device restarted", || {
-        wldevice::exit_bootloader(None)
-    });
+    // No explicit restart: the flash already ends with `--after
+    // watchdog-reset`, so the device has rebooted into the new firmware by the
+    // time we get here. Asking esptool to reset it again only finds a device
+    // that is no longer listening.
+    ui.info("The device has restarted into the new firmware.");
 
     finish_setup(ui)
 }
@@ -523,9 +525,8 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                     flash::flash_capture(None, None)
                 })
             {
-                run_job(ui, "Restarting the device", "Device restarted", || {
-                    wldevice::exit_bootloader(None)
-                });
+                // The flash's own `--after watchdog-reset` already rebooted it.
+                ui.info("The device has restarted into the new firmware.");
             }
         }
         "backup" => {
@@ -591,9 +592,7 @@ fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
     if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", move || {
         flash::restore(Some(&image_for_job), None)
     }) {
-        run_job(ui, "Restarting the device", "Device restarted", || {
-            wldevice::exit_bootloader(None)
-        });
+        ui.info("The device has restarted into the vendor firmware.");
     }
     Ok(())
 }

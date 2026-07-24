@@ -98,6 +98,9 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
 esp-backtrace = { version = "0.19.0", features = ["esp32s3", "panic-handler", "println"] }
 log = "0.4"
+# `SpiBus::write` — esp-hal implements the embedded-hal 1.0 traits rather
+# than exposing an inherent blocking write.
+embedded-hal = "1.0"
 static_cell = "2.1.0"
 heapless = "0.9"
 

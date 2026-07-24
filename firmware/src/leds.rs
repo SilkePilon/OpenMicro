@@ -94,6 +94,12 @@ impl<S: SpiOut> PerKeyChain<S> {
         }
     }
 
+    /// Draw one frame of the boot animation.
+    pub fn render_startup(&mut self, t_ms: u32) {
+        openmicro_effects::startup::frame(t_ms, &mut self.pixels);
+        self.flush();
+    }
+
     /// Turn every per-key LED off (idle sleep).
     pub fn blank(&mut self) {
         self.pixels = [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT];
@@ -130,5 +136,27 @@ impl<S: SpiOut> UnderglowChain<S> {
 
     pub fn blank(&mut self) {
         self.set(Rgb { r: 0, g: 0, b: 0 });
+    }
+
+    /// Draw one frame of the boot animation.
+    pub fn render_startup(&mut self, t_ms: u32) {
+        openmicro_effects::startup::frame(t_ms, &mut self.pixels);
+        if ws2812::encode(&self.pixels, &mut self.encoded).is_some() {
+            let _ = self.spi.write(&self.encoded);
+        }
+    }
+
+    /// A slow breath, shown once the boot animation is over.
+    ///
+    /// Proof of life: without it a working board with no agents connected is
+    /// indistinguishable from a dead one, which is exactly the ambiguity that
+    /// makes bring-up painful.
+    pub fn render_idle(&mut self, t_ms: u32) {
+        const IDLE: openmicro_proto::LedSlot = openmicro_proto::LedSlot {
+            color: Rgb { r: 40, g: 90, b: 255 },
+            effect: openmicro_proto::Effect::Breath,
+            brightness: 60,
+        };
+        self.set(resolve(&IDLE, t_ms));
     }
 }

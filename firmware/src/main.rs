@@ -83,6 +83,37 @@ static BATTERY_CHANNEL: Channel<CriticalSectionRawMutex, Battery, 1> = Channel::
 /// once real memory pressure is measured on hardware.
 const HEAP_SIZE: usize = 64 * 1024;
 
+/// Adapts esp-hal's blocking SPI master to `leds::SpiOut`.
+struct SpiWriter(esp_hal::spi::master::Spi<'static, esp_hal::Blocking>);
+
+impl leds::SpiOut for SpiWriter {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        embedded_hal::spi::SpiBus::write(&mut self.0, bytes).map_err(|_| ())
+    }
+}
+
+/// Build one WS2812 SPI host: MOSI is the LED data line, and the clock is
+/// fixed by the bit encoding (see `openmicro_effects::ws2812`).
+///
+/// No MISO, no chip select: a WS2812 chain is write-only and has no select
+/// line — the data pin is the entire bus.
+macro_rules! ws2812_spi {
+    ($peri:expr, $pin:expr) => {
+        SpiWriter(
+            esp_hal::spi::master::Spi::new(
+                $peri,
+                esp_hal::spi::master::Config::default()
+                    .with_frequency(esp_hal::time::Rate::from_hz(
+                        openmicro_effects::ws2812::SPI_HZ,
+                    ))
+                    .with_mode(esp_hal::spi::Mode::_0),
+            )
+            .expect("SPI init")
+            .with_mosi($pin),
+        )
+    };
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
@@ -133,7 +164,13 @@ async fn main(spawner: Spawner) {
     // for these single-instance tasks would be a bug here, not a runtime
     // condition worth handling.
     spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
-    spawner.spawn(led_render_task().expect("led_render_task token"));
+    spawner.spawn(
+        led_render_task(
+            ws2812_spi!(peripherals.SPI2, peripherals.GPIO7),
+            ws2812_spi!(peripherals.SPI3, peripherals.GPIO6),
+        )
+        .expect("led_render_task token"),
+    );
     spawner.spawn(input_task().expect("input_task token"));
     spawner.spawn(battery_task().expect("battery_task token"));
     spawner.spawn(power_task().expect("power_task token"));
@@ -184,20 +221,28 @@ async fn power_task() {
 }
 
 #[embassy_executor::task]
-async fn led_render_task() {
-    // The boot animation runs first, straight from `openmicro_effects::startup`
-    // (host-tested): it doubles as a check that the chain length and colour
-    // order are right, which a static colour would hide.
-    //
-    // NEXT: hand `leds::PerKeyChain` (GPIO7, 13 LEDs) and
-    // `leds::UnderglowChain` (GPIO6, 8 LEDs) an `SpiOut` backed by esp-hal's
-    // SPI master on their two hosts, then render `LED_FRAME_CHANNEL`'s latest
-    // value every `leds::RENDER_PERIOD_MS` with a free-running embassy
-    // `Instant`-derived `t_ms`. The bit encoding is already done and tested
-    // (`openmicro_effects::ws2812`, 3.2 MHz, 4 SPI bits per LED bit); what is
-    // missing is only the HAL plumbing, which cannot be validated without the
-    // board in hand.
+async fn led_render_task(per_key: SpiWriter, underglow: SpiWriter) {
+    let mut keys = leds::PerKeyChain::new(per_key);
+    let mut glow = leds::UnderglowChain::new(underglow);
+    let start = embassy_time::Instant::now();
+
     loop {
+        let t_ms = start.elapsed().as_millis() as u32;
+
+        if openmicro_effects::startup::is_running(t_ms) {
+            // The boot animation doubles as a wiring test: a sweep makes a
+            // wrong chain length, order or colour order obvious, where a static
+            // colour would hide all three.
+            keys.render_startup(t_ms);
+            glow.render_startup(t_ms);
+        } else {
+            // NEXT: render the latest `LedFrame` from the BLE task here. Until
+            // that channel is wired, the keys stay dark and the underglow
+            // breathes — which is at least honest about the device being alive
+            // and simply having nothing to show.
+            glow.render_idle(t_ms);
+        }
+
         embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
     }
 }

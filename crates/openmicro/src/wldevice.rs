@@ -375,7 +375,7 @@ pub fn exit_args(port: Option<&str>) -> Vec<String> {
         args.push(p.to_string());
     }
     args.push("--before".to_string());
-    args.push("no-reset".to_string());
+    args.push("usb-reset".to_string());
     args.push("--after".to_string());
     args.push("watchdog-reset".to_string());
     args.push("write-mem".to_string());
@@ -463,9 +463,11 @@ mod tests {
     #[test]
     fn exit_args_clear_the_force_download_bit_and_watchdog_reset() {
         let args = exit_args(None);
-        // `--before no-reset`: the device is already in download mode, and
-        // resetting first would drop us straight back out of it.
-        assert!(args.windows(2).any(|w| w == ["--before", "no-reset"]), "{args:?}");
+        // `--before usb-reset` rather than `no-reset`: by the time this runs
+        // the device may already have rebooted (a flash resets on its way
+        // out), and `no-reset` against a device that is not sitting in
+        // download mode just times out.
+        assert!(args.windows(2).any(|w| w == ["--before", "usb-reset"]), "{args:?}");
         // A plain hard reset does NOT work on USB-Serial-JTAG.
         assert!(args.windows(2).any(|w| w == ["--after", "watchdog-reset"]), "{args:?}");
         assert!(args.contains(&"write-mem".to_string()));
