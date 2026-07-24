@@ -114,14 +114,15 @@ async fn main(spawner: Spawner) {
     // TODO(pinout): key matrix row/col GPIOs, encoder A/B/press GPIOs,
     // joystick ADC X/Y GPIOs, battery sense pin (see pins.rs / input.rs).
 
-    // embassy-executor 0.10 dropped `Spawner::must_spawn`; `spawn` returns a
-    // `Result` and the only failure is the task's pool being exhausted, which
-    // for these single-instance tasks would be a bug here rather than a
-    // runtime condition worth handling.
-    spawner.spawn(ble_task(ble_controller)).expect("spawn ble_task");
-    spawner.spawn(led_render_task()).expect("spawn led_render_task");
-    spawner.spawn(input_task()).expect("spawn input_task");
-    spawner.spawn(battery_task()).expect("spawn battery_task");
+    // embassy-executor 0.10 reshaped this: `#[task]` functions now return
+    // `Result<SpawnToken, SpawnError>` and `Spawner::spawn` takes the token and
+    // returns `()`. The only failure is the task's pool being exhausted, which
+    // for these single-instance tasks would be a bug here, not a runtime
+    // condition worth handling.
+    spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
+    spawner.spawn(led_render_task().expect("led_render_task token"));
+    spawner.spawn(input_task().expect("input_task token"));
+    spawner.spawn(battery_task().expect("battery_task token"));
 }
 
 #[embassy_executor::task]
