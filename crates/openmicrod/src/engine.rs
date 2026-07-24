@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use openmicro_proto::{AgentState, SLOT_COUNT};
 
+use crate::action::Action;
 use crate::device::DeviceLink;
+use crate::focus::pick_owner;
 use crate::render::render_frame;
 use crate::session::{SessionKey, SessionStore};
 
@@ -66,6 +68,63 @@ impl Engine {
         self.rerender(device).await;
     }
 
+    /// Read-only lookup of which session (key + state) occupies a given slot.
+    /// Used to build a `RouterView` for input routing.
+    pub fn slot_lookup(&self) -> impl Fn(usize) -> Option<(SessionKey, AgentState)> + '_ {
+        move |slot: usize| {
+            self.store.iter().find_map(|s| {
+                if self.mapping.slot_for(&s.key) == Some(slot) {
+                    Some((s.key.clone(), s.state))
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    /// Execute a routed action against the engine + device.
+    pub async fn apply_action(&mut self, action: Action, device: &mut dyn DeviceLink) {
+        match action {
+            Action::AdjustBrightness(delta) => {
+                self.brightness = (self.brightness as i16 + delta).clamp(0, 255) as u8;
+                self.rerender(device).await;
+            }
+            Action::CycleFocus(dir) => {
+                // Live session keys ordered by their stable slot index.
+                let mut keyed: Vec<(usize, SessionKey)> = self
+                    .store
+                    .iter()
+                    .filter_map(|s| self.mapping.slot_for(&s.key).map(|i| (i, s.key.clone())))
+                    .collect();
+                keyed.sort_by_key(|(i, _)| *i);
+                if keyed.is_empty() {
+                    return;
+                }
+                let keys: Vec<SessionKey> = keyed.into_iter().map(|(_, k)| k).collect();
+
+                // Start from the pinned session if set, else the current owner.
+                let current = self
+                    .pinned
+                    .as_ref()
+                    .and_then(|p| keys.iter().position(|k| k == p))
+                    .or_else(|| {
+                        pick_owner(self.store.iter(), self.pinned.as_ref())
+                            .and_then(|o| keys.iter().position(|k| *k == o))
+                    })
+                    .unwrap_or(0);
+
+                let len = keys.len() as i64;
+                let next = (current as i64 + dir as i64).rem_euclid(len) as usize;
+                self.pinned = Some(keys[next].clone());
+                self.rerender(device).await;
+            }
+            Action::Approve(ref key) | Action::Interrupt(ref key) => {
+                // TODO(adapters): execute via per-agent control channel.
+                eprintln!("openmicro: action {:?} on {}:{}", action, key.agent, key.session);
+            }
+        }
+    }
+
     async fn rerender(&self, device: &mut dyn DeviceLink) {
         // v1: each mapped agent has its own key, so every mapped slot is lit
         // with its own state. Focus/owner drives input routing + TUI highlight
@@ -125,5 +184,53 @@ mod tests {
         engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
         assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 });
+    }
+
+    #[tokio::test]
+    async fn adjust_brightness_changes_engine_and_frame() {
+        let mut engine = Engine::new(100);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
+
+        engine.apply_action(Action::AdjustBrightness(16), &mut dev).await;
+        assert_eq!(engine.brightness, 116);
+        let frame = dev.last_frame();
+        // Both lit slots carry the new brightness.
+        assert_eq!(frame.slots[0].brightness, 116);
+        assert_eq!(frame.slots[1].brightness, 116);
+    }
+
+    #[tokio::test]
+    async fn adjust_brightness_clamps_high_and_low() {
+        let mut engine = Engine::new(250);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+
+        engine.apply_action(Action::AdjustBrightness(16), &mut dev).await;
+        assert_eq!(engine.brightness, 255);
+
+        engine.brightness = 4;
+        engine.apply_action(Action::AdjustBrightness(-16), &mut dev).await;
+        assert_eq!(engine.brightness, 0);
+    }
+
+    #[tokio::test]
+    async fn cycle_focus_pins_a_live_session() {
+        let mut engine = Engine::new(255);
+        let mut dev = MockDevice::new();
+        // claude:s1 -> slot 0, codex:s2 -> slot 1 (codex is the default owner).
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
+        assert!(engine.pinned.is_none());
+
+        engine.apply_action(Action::CycleFocus(1), &mut dev).await;
+
+        let pinned = engine.pinned.clone().expect("focus should be pinned");
+        // Owner started at codex:s2 (slot 1); +1 wraps to slot 0 = claude:s1.
+        assert_eq!(pinned, SessionKey { agent: "claude".into(), session: "s1".into() });
+        let snap = crate::control::snapshot(&engine);
+        assert_eq!(snap.owner.as_deref(), Some("claude:s1"));
     }
 }
