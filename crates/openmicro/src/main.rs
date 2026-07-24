@@ -54,9 +54,9 @@ fn main() -> anyhow::Result<()> {
     // restore afterwards — the guard owns cleanup, so it cannot be skipped or
     // double-run in a way that errors.
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     run(&mut terminal, &snap)
