@@ -224,8 +224,15 @@ where
         }
         Err(e) => {
             spinner.error(busy);
-            for line in e.lines().filter(|l| !l.trim().is_empty()) {
-                ui.error(line);
+            // Tool output is mostly progress chatter; only the last line is the
+            // failure. Rendering all of it as errors buries the one that matters
+            // in a wall of red markers.
+            let lines: Vec<&str> = e.lines().filter(|l| !l.trim().is_empty()).collect();
+            if let Some((last, rest)) = lines.split_last() {
+                for line in rest {
+                    ui.info(line);
+                }
+                ui.error(last);
             }
             false
         }
@@ -297,7 +304,9 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     let backup = flash::backup_path();
     if backup.is_file() {
         ui.step(&format!("Stock firmware already backed up to {}", short_path(&backup)));
-    } else if ui.confirm("Back up the stock firmware first? (strongly recommended)", true)? {
+    } else if ui.confirm("Back up the stock firmware first? (strongly recommended)", true)?
+        && port_is_clear(ui)?
+    {
         run_job(ui, "Reading the stock firmware", "Stock firmware saved", || {
             flash::backup(None, None).map(|(_, lines)| lines)
         });
@@ -307,7 +316,7 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     if obtain_firmware(ui)?.is_none() {
         return Ok(());
     }
-    if !ui.confirm("Write this firmware to the device now?", true)? {
+    if !ui.confirm("Write this firmware to the device now?", true)? || !port_is_clear(ui)? {
         return Ok(());
     }
     if !run_job(ui, "Flashing", "Firmware written", || flash::flash_capture(None, None)) {
@@ -507,6 +516,7 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                 return Ok(());
             }
             if ui.confirm("Write firmware to the device now?", true)?
+                && port_is_clear(ui)?
                 && run_job(ui, "Flashing", "Firmware written", || {
                     flash::flash_capture(None, None)
                 })
@@ -517,7 +527,7 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
             }
         }
         "backup" => {
-            if !ensure_bootloader(ui)? {
+            if !ensure_bootloader(ui)? || !port_is_clear(ui)? {
                 return Ok(());
             }
             run_job(ui, "Reading the stock firmware", "Stock firmware saved", || {
@@ -532,7 +542,7 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
             if !ui.confirm("Overwrite the device with your saved stock firmware?", false)? {
                 return Ok(());
             }
-            if !ensure_bootloader(ui)? {
+            if !ensure_bootloader(ui)? || !port_is_clear(ui)? {
                 return Ok(());
             }
             if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", || {
@@ -546,6 +556,19 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
         _ => {}
     }
     Ok(())
+}
+
+/// Warn when another process will fight us for the serial port.
+///
+/// Worth interrupting for: ModemManager opening the port mid-transfer kills a
+/// 4 MiB backup partway through with an error that reads like a hardware fault.
+/// Returns false when the user would rather stop and fix it first.
+fn port_is_clear(ui: &mut Ui) -> Result<bool, Cancelled> {
+    let Some(warning) = flash::port_contention() else {
+        return Ok(true);
+    };
+    ui.note("Something else is using the serial port", &warning);
+    ui.confirm("Try anyway?", false)
 }
 
 /// Put the device into bootloader mode if it is not already, asking first.

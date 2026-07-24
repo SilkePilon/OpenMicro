@@ -154,7 +154,7 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
 /// would knock it out; `--after watchdog-reset` is the only reset that works on
 /// this board, which has native USB-Serial-JTAG and therefore no DTR/RTS lines
 /// for the classic auto-reset. See [`crate::wldevice`].
-pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String> {
+pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path, major: Option<u32>) -> Vec<String> {
     let mut args = vec!["--chip".to_string(), chip.to_string()];
     if let Some(p) = port {
         args.push("--port".to_string());
@@ -164,7 +164,7 @@ pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String>
     args.push("no-reset".to_string());
     args.push("--after".to_string());
     args.push("watchdog-reset".to_string());
-    args.push("write_flash".to_string());
+    args.push(subcommand("write_flash", major));
     args.push("0x0".to_string());
     args.push(image.display().to_string());
     args
@@ -199,6 +199,26 @@ pub fn which(names: &[&str]) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Major version of the esptool at `path`, parsed from `esptool version`.
+///
+/// esptool 5 renamed every subcommand (`read_flash` -> `read-flash`) and now
+/// prints a deprecation warning for the old spelling; esptool 4 only knows the
+/// old one. Asking is cheap and beats guessing wrong in either direction.
+pub fn esptool_major(path: &Path) -> Option<u32> {
+    let output = Command::new(path).arg("version").output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = text.split_whitespace().find(|w| w.starts_with('v') || w.starts_with(char::is_numeric))?;
+    version.trim_start_matches('v').split('.').next()?.parse().ok()
+}
+
+/// Spell a subcommand the way this esptool expects it.
+pub fn subcommand(name: &str, major: Option<u32>) -> String {
+    match major {
+        Some(m) if m >= 5 => name.replace('_', "-"),
+        _ => name.to_string(),
+    }
 }
 
 /// Locate an `esptool` / `esptool.py` executable.
@@ -258,7 +278,7 @@ impl Flasher {
     pub fn args(&self, chip: &str, port: Option<&str>, image: &Path) -> Vec<String> {
         match self {
             Flasher::Espflash(_) => espflash_args(chip, port, image),
-            Flasher::Esptool(_) => esptool_args(chip, port, image),
+            Flasher::Esptool(p) => esptool_args(chip, port, image, esptool_major(p)),
         }
     }
 }
@@ -304,13 +324,23 @@ pub fn espflash_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String
 
 /// Build the `esptool` argument vector to read the whole flash into `dest` —
 /// the stock-firmware backup that makes a later [`restore`] possible.
-pub fn backup_args(chip: &str, port: Option<&str>, dest: &Path) -> Vec<String> {
+///
+/// Carries the same reset options as [`esptool_args`], and for the same
+/// reason. Without them esptool ends the session with its default hard reset
+/// "via RTS pin", which this board does not have: on a real device that tore
+/// the link down partway through and the read died with "Packet content
+/// transfer stopped".
+pub fn backup_args(chip: &str, port: Option<&str>, dest: &Path, major: Option<u32>) -> Vec<String> {
     let mut args = vec!["--chip".to_string(), chip.to_string()];
     if let Some(p) = port {
         args.push("--port".to_string());
         args.push(p.to_string());
     }
-    args.push("read_flash".to_string());
+    args.push("--before".to_string());
+    args.push("no-reset".to_string());
+    args.push("--after".to_string());
+    args.push("watchdog-reset".to_string());
+    args.push(subcommand("read_flash", major));
     args.push("0x0".to_string());
     args.push(FLASH_SIZE.to_string());
     args.push(dest.display().to_string());
@@ -339,16 +369,28 @@ pub fn backup(dest: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<S
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
 
-    let args = backup_args(CHIP, port, &dest);
-    let output = Command::new(&esptool)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
-    let mut lines = combine_output(&output.stdout, &output.stderr);
-    if !output.status.success() {
+    let args = backup_args(CHIP, port, &dest, esptool_major(&esptool));
+
+    // Reading 4 MiB over USB-Serial-JTAG is long enough that a single hiccup
+    // (a competing opener, a dropped packet) loses the whole thing. One retry
+    // costs a minute and saves the user starting over by hand.
+    let mut attempt = 0;
+    let lines = loop {
+        attempt += 1;
+        let output = Command::new(&esptool)
+            .args(&args)
+            .output()
+            .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
+        let mut lines = combine_output(&output.stdout, &output.stderr);
+        if output.status.success() {
+            break lines;
+        }
         lines.push(format!("esptool exited with {}.", exit_desc(output.status.code())));
-        return Err(lines.join("\n"));
-    }
+        if attempt >= 2 || !is_transient_transfer_error(&lines) {
+            return Err(lines.join("\n"));
+        }
+    };
+    let mut lines = lines;
     lines.push(format!("stock firmware saved to {}", dest.display()));
     Ok((dest, lines))
 }
@@ -373,7 +415,7 @@ pub fn restore(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, 
     })?;
     require_bootloader()?;
 
-    let args = esptool_args(CHIP, port, &path);
+    let args = esptool_args(CHIP, port, &path, esptool_major(&esptool));
     let output = Command::new(&esptool)
         .args(&args)
         .output()
@@ -394,6 +436,50 @@ pub fn combine_output(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
         .chain(String::from_utf8_lossy(stderr).lines())
         .map(|l| l.to_string())
         .collect()
+}
+
+/// True when a failure looks like a stalled transfer rather than a real fault.
+///
+/// esptool reports a dropped stream as "Packet content transfer stopped" or a
+/// timeout; both are worth one retry, whereas "no serial data received" means
+/// the device is not listening and retrying just wastes a minute.
+pub fn is_transient_transfer_error(lines: &[String]) -> bool {
+    let text = lines.join(" ").to_ascii_lowercase();
+    text.contains("packet content transfer stopped")
+        || text.contains("timed out waiting for packet")
+        || text.contains("corrupt data")
+}
+
+/// Warn about anything known to fight us for the serial port.
+///
+/// ModemManager probes every new `ttyACM` device, and on this board that means
+/// it opens the very port a flash or a 4 MiB backup is streaming over. The
+/// symptom is a transfer that dies partway through with "Packet content
+/// transfer stopped", which looks like a hardware fault and is not one.
+///
+/// Returns `None` when nothing is known to be in the way.
+pub fn port_contention() -> Option<String> {
+    if !which(&["systemctl"]).is_some_and(|_| true) {
+        return None;
+    }
+    let active = Command::new("systemctl")
+        .args(["is-active", "ModemManager"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+    if !active {
+        return None;
+    }
+    Some(
+        "ModemManager is running. It opens every new /dev/ttyACM* device, which \
+         interrupts flashing and firmware backups partway through (\"Packet content \
+         transfer stopped\").\n\n\
+         Stop it for now:\n    sudo systemctl stop ModemManager\n\n\
+         Or exclude the device permanently:\n    \
+         echo 'ATTRS{idVendor}==\"303a\", ENV{ID_MM_DEVICE_IGNORE}=\"1\"' | \
+         sudo tee /etc/udev/rules.d/99-openmicro.rules && sudo udevadm control --reload"
+            .to_string(),
+    )
 }
 
 /// Error out unless a Micro 2 is currently in ROM bootloader mode.
@@ -534,7 +620,7 @@ mod tests {
     #[test]
     fn esptool_args_without_port() {
         let img = PathBuf::from("/tmp/fw.bin");
-        let args = esptool_args("esp32s3", None, &img);
+        let args = esptool_args("esp32s3", None, &img, Some(4));
         assert_eq!(
             args,
             vec![
@@ -554,7 +640,7 @@ mod tests {
     #[test]
     fn esptool_args_with_port() {
         let img = PathBuf::from("/tmp/fw.bin");
-        let args = esptool_args("esp32s3", Some("/dev/ttyACM0"), &img);
+        let args = esptool_args("esp32s3", Some("/dev/ttyACM0"), &img, Some(4));
         assert_eq!(
             args,
             vec![
@@ -613,7 +699,10 @@ mod tests {
     fn flasher_args_dispatch_on_tool() {
         let img = PathBuf::from("/tmp/fw.bin");
         let esptool = Flasher::Esptool(PathBuf::from("/usr/bin/esptool"));
-        assert_eq!(esptool.args("esp32s3", None, &img), esptool_args("esp32s3", None, &img));
+        assert_eq!(
+            esptool.args("esp32s3", None, &img),
+            esptool_args("esp32s3", None, &img, esptool_major(Path::new("/usr/bin/esptool")))
+        );
         assert_eq!(esptool.program(), Path::new("/usr/bin/esptool"));
 
         let espflash = Flasher::Espflash(PathBuf::from("/usr/bin/espflash"));
@@ -644,16 +733,27 @@ mod tests {
 
     #[test]
     fn backup_args_read_the_whole_flash() {
-        let args = backup_args("esp32s3", None, Path::new("/tmp/stock.bin"));
+        let args = backup_args("esp32s3", None, Path::new("/tmp/stock.bin"), Some(4));
         assert_eq!(
             args,
-            vec!["--chip", "esp32s3", "read_flash", "0x0", FLASH_SIZE, "/tmp/stock.bin"]
+            vec![
+                "--chip",
+                "esp32s3",
+                "--before",
+                "no-reset",
+                "--after",
+                "watchdog-reset",
+                "read_flash",
+                "0x0",
+                FLASH_SIZE,
+                "/tmp/stock.bin"
+            ]
         );
     }
 
     #[test]
     fn backup_args_include_the_port_when_given() {
-        let args = backup_args("esp32s3", Some("/dev/ttyACM0"), Path::new("/tmp/s.bin"));
+        let args = backup_args("esp32s3", Some("/dev/ttyACM0"), Path::new("/tmp/s.bin"), Some(4));
         assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]));
     }
 
@@ -662,6 +762,44 @@ mod tests {
         let err = restore(Some(Path::new("/definitely/not/here/stock.bin")), None).unwrap_err();
         assert!(err.contains("no stock-firmware backup"), "{err}");
         assert!(err.contains("BEFORE"), "must explain when a backup had to be taken: {err}");
+    }
+
+    #[test]
+    fn subcommand_spelling_follows_the_esptool_major_version() {
+        // esptool 5 renamed everything and warns on the old spelling; esptool 4
+        // does not know the new one.
+        assert_eq!(subcommand("read_flash", Some(5)), "read-flash");
+        assert_eq!(subcommand("write_flash", Some(5)), "write-flash");
+        assert_eq!(subcommand("read_flash", Some(4)), "read_flash");
+        assert_eq!(subcommand("read_flash", None), "read_flash");
+    }
+
+    #[test]
+    fn esptool_major_reads_the_installed_version() {
+        // esptool is installed in this environment; whatever it reports, the
+        // major version must parse rather than silently falling back.
+        let path = esptool_path().expect("esptool present");
+        assert!(esptool_major(&path).is_some(), "could not parse esptool version");
+    }
+
+    #[test]
+    fn backup_args_carry_the_same_reset_options_as_flashing() {
+        // Their absence is what killed a real 4 MiB read partway through:
+        // esptool ended the session with a hard reset "via RTS pin", which this
+        // board does not have.
+        let args = backup_args("esp32s3", None, Path::new("/tmp/s.bin"), Some(5));
+        assert!(args.windows(2).any(|w| w == ["--before", "no-reset"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--after", "watchdog-reset"]), "{args:?}");
+        assert!(args.contains(&"read-flash".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn transient_transfer_errors_are_told_apart_from_real_ones() {
+        let stalled = vec!["A fatal error occurred: Packet content transfer stopped".to_string()];
+        assert!(is_transient_transfer_error(&stalled));
+        let absent = vec!["No serial data received.".to_string()];
+        assert!(!is_transient_transfer_error(&absent), "retrying this just wastes a minute");
+        assert!(!is_transient_transfer_error(&[]));
     }
 
     #[test]
