@@ -1,0 +1,6 @@
+# Requires the Espressif Rust fork toolchain, installed via `espup` (NOT
+# installed in the environment this skeleton was written in — see
+# README.md). The "esp" channel name below is the toolchain name espup
+# registers with rustup after `espup install && source ~/export-esp.sh`.
+[toolchain]
+channel = "esp"

@@ -762,6 +762,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "openmicro-effects"
+version = "0.1.0"
+dependencies = [
+ "openmicro-proto",
+]
+
+[[package]]
 name = "openmicro-hook"
 version = "0.1.0"
 dependencies = [

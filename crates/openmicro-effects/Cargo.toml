@@ -1,0 +1,9 @@
+[package]
+name = "openmicro-effects"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "no_std, host-testable LED effect resolver shared by the daemon (preview) and the ESP32-S3 firmware."
+
+[dependencies]
+openmicro-proto = { path = "../openmicro-proto" }

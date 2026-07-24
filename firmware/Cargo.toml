@@ -1,0 +1,76 @@
+# SEPARATE workspace on purpose: this table makes Cargo treat `firmware/`
+# as its own workspace root, so the ROOT repo's `cargo build|test|clippy
+# --workspace` (run from the repo root Cargo.toml) never discovers or
+# builds this crate. It is only ever built by invoking cargo from inside
+# `firmware/` itself, once the Xtensa toolchain (see README.md) is
+# installed.
+[workspace]
+members = ["."]
+
+[package]
+name = "openmicro-firmware"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "openmicro-firmware"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+# --- Version pinning rationale (see README.md and the P8 report for the
+# full writeup with doc sources) -------------------------------------------
+# esp-hal 1.1.1        : latest stable, ESP32-S3 support.
+# esp-hal-embassy 0.9.1: latest; its own Cargo.toml pins esp-hal to the
+#                        (caret) requirement "1.0.0-rc.0", which resolves
+#                        forward to 1.1.1 under Cargo's prerelease-floor
+#                        matching rules.
+# embassy-executor 0.7.0: NOT the crates.io-latest (0.10.0). Pinned to
+#                        match esp-hal-embassy 0.9.1's own optional
+#                        `embassy-executor = "0.7.0"` dependency exactly,
+#                        to avoid two semver-incompatible embassy-executor
+#                        instances (and therefore two incompatible
+#                        `Spawner`/task types) in one dependency graph.
+# esp-radio 0.18.0     : latest stable; requires esp-hal "~1.1.0-rc.0"
+#                        (resolves to 1.1.1); its "ble" feature pulls in
+#                        bt-hci 0.8 and esp-hal's `__bluetooth` (unstable).
+# trouble-host 0.6.0   : NOT the crates.io-latest (0.7.0). 0.7.0 requires
+#                        `bt-hci ^0.9`, which conflicts with esp-radio
+#                        0.18.0's `bt-hci ^0.8.0` pin (confirmed from both
+#                        crates' published Cargo.toml — these ranges do not
+#                        overlap). 0.6.0 requires `bt-hci ^0.8`, matching.
+# esp-hal-smartled     : deliberately NOT used. 0.17.0 (its latest release)
+#                        pins esp-hal to "~1.0" (i.e. <1.1.0), which
+#                        conflicts with esp-radio's floor of >=1.1.0-rc.0.
+#                        WS2812 is instead driven directly over
+#                        `esp_hal::rmt` in `leds.rs` (part of esp-hal
+#                        itself, so it can never skew independently).
+[dependencies]
+esp-hal = { version = "1.1.1", default-features = false, features = ["esp32s3", "unstable"] }
+esp-hal-embassy = { version = "0.9.1", default-features = false, features = ["esp32s3"] }
+embassy-executor = { version = "0.7.0", features = ["nightly"] }
+embassy-time = "0.4.0"
+embassy-sync = "0.6.2"
+embassy-futures = "0.1"
+esp-radio = { version = "0.18.0", default-features = false, features = ["esp32s3", "ble", "unstable"] }
+trouble-host = { version = "0.6.0", default-features = false }
+bt-hci = "0.8"
+smart-leds-trait = "0.3.2"
+esp-alloc = "0.10.0"
+esp-println = { version = "0.16", default-features = false, features = ["esp32s3", "log-04"] }
+esp-backtrace = { version = "0.18", default-features = false, features = ["esp32s3", "panic-handler", "println"] }
+static_cell = "2.1.0"
+heapless = "0.9"
+
+openmicro-proto = { path = "../crates/openmicro-proto", default-features = false }
+openmicro-effects = { path = "../crates/openmicro-effects" }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = true       # keep symbols for panic backtraces / espflash; strip later if flash size is tight
+overflow-checks = false

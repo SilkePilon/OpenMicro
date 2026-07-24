@@ -1,0 +1,21 @@
+# ESP32-S3 is Xtensa, not RISC-V, so it needs the espup-installed Xtensa
+# Rust fork (see ../README.md) rather than upstream rustc. This file is
+# structural only — it has never been exercised by an actual build here
+# (no toolchain installed).
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+# `espflash` doubles as both the cargo runner (flash + open a serial
+# monitor after a successful build) and the standalone flashing tool: see
+# README.md for the non-runner flash command (device must be put into
+# bootloader mode by hand first; the Micro 2's native USB-Serial-JTAG has
+# no DTR/RTS auto-reset).
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+]
+
+[env]
+ESP_LOG = "info"

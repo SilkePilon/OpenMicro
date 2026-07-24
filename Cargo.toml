@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/openmicro-proto",
+    "crates/openmicro-effects",
     "crates/openmicrod",
     "crates/openmicro",
     "crates/openmicro-hook",
