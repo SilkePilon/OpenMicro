@@ -1,3 +1,4 @@
+mod action;
 mod ble;
 mod config;
 mod control;
@@ -48,10 +49,29 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
-    // Drain input events (P2 will route them into the engine).
+    // Route device input events into the engine. To respect the engine->device
+    // lock order used by `ingress` (and to avoid holding the engine lock across
+    // routing), we snapshot the slot->session map under a short engine lock,
+    // drop it, route purely, then re-lock engine+device to apply.
+    let engine_in = engine.clone();
+    let device_in = device.clone();
     tokio::spawn(async move {
         while let Some(ev) = input_rx.recv().await {
-            eprintln!("openmicrod: input event (unrouted): {ev:?}");
+            let maybe_action = {
+                let slot_map: Vec<_> = {
+                    let eng = engine_in.lock().await;
+                    let lookup = eng.slot_lookup();
+                    (0..openmicro_proto::SLOT_COUNT).map(lookup).collect()
+                };
+                let lookup = |i: usize| slot_map.get(i).cloned().flatten();
+                let view = action::RouterView { slot_session: &lookup };
+                action::route(&ev, &view)
+            };
+            if let Some(act) = maybe_action {
+                let mut eng = engine_in.lock().await;
+                let mut dev = device_in.lock().await;
+                eng.apply_action(act, &mut *dev).await;
+            }
         }
     });
 
