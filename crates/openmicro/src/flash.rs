@@ -155,11 +155,18 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
 /// partition table `0x8000`, app `0x10000` are all inside it) per the flash
 /// layout in `docs/hardware/creator-micro-2-pinout-research.md`.
 ///
-/// The reset options are not incidental. `--before no-reset` is required
-/// because the device is already in download mode and esptool's usual reset
-/// would knock it out; `--after watchdog-reset` is the only reset that works on
-/// this board, which has native USB-Serial-JTAG and therefore no DTR/RTS lines
-/// for the classic auto-reset. See [`crate::wldevice`].
+/// The reset options are not incidental.
+///
+/// `--before usb-reset` drives the USB-Serial-JTAG reset. It works whether or
+/// not the chip is already in download mode, which matters because the USB id
+/// alone cannot tell those apart — `303a:1001` is both the ROM bootloader and
+/// any firmware exposing the same console. The previous `no-reset` assumed
+/// download mode and failed with a bare "Write timeout" against a device that
+/// was merely running.
+///
+/// `--after watchdog-reset` is the only reset that works on this board: native
+/// USB-Serial-JTAG means no DTR/RTS lines for the classic auto-reset. See
+/// [`crate::wldevice`].
 pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path, major: Option<u32>) -> Vec<String> {
     let mut args = vec!["--chip".to_string(), chip.to_string()];
     if let Some(p) = port {
@@ -167,7 +174,7 @@ pub fn esptool_args(chip: &str, port: Option<&str>, image: &Path, major: Option<
         args.push(p.to_string());
     }
     args.push("--before".to_string());
-    args.push("no-reset".to_string());
+    args.push("usb-reset".to_string());
     args.push("--after".to_string());
     args.push("watchdog-reset".to_string());
     args.push(subcommand("write_flash", major));
@@ -343,7 +350,7 @@ pub fn backup_args(chip: &str, port: Option<&str>, dest: &Path, major: Option<u3
         args.push(p.to_string());
     }
     args.push("--before".to_string());
-    args.push("no-reset".to_string());
+    args.push("usb-reset".to_string());
     args.push("--after".to_string());
     args.push("watchdog-reset".to_string());
     args.push(subcommand("read_flash", major));
@@ -487,7 +494,15 @@ pub fn port_contention() -> Option<String> {
     )
 }
 
-/// Error out unless a Micro 2 is currently in ROM bootloader mode.
+/// Error out unless a Micro 2 is reachable in ROM bootloader mode.
+///
+/// The USB id is only a hint: `303a:1001` is what the ROM bootloader looks
+/// like *and* what any firmware exposing the USB-Serial-JTAG console looks
+/// like, our own included. So a device carrying that id is accepted here and
+/// the esptool invocation resets it into download mode itself
+/// (`--before usb-reset`); what must be rejected is a device that is not
+/// present, or one still running the vendor firmware on its own product id,
+/// which cannot be reset this way and needs the HID route first.
 fn require_bootloader() -> Result<(), String> {
     match classify_usb(&detect_usb()) {
         DeviceState::Bootloader => Ok(()),
@@ -649,7 +664,7 @@ mod tests {
                 "--chip",
                 "esp32s3",
                 "--before",
-                "no-reset",
+                "usb-reset",
                 "--after",
                 "watchdog-reset",
                 "write_flash",
@@ -671,7 +686,7 @@ mod tests {
                 "--port",
                 "/dev/ttyACM0",
                 "--before",
-                "no-reset",
+                "usb-reset",
                 "--after",
                 "watchdog-reset",
                 "write_flash",
@@ -762,7 +777,7 @@ mod tests {
                 "--chip",
                 "esp32s3",
                 "--before",
-                "no-reset",
+                "usb-reset",
                 "--after",
                 "watchdog-reset",
                 "read_flash",
@@ -810,7 +825,7 @@ mod tests {
         // esptool ended the session with a hard reset "via RTS pin", which this
         // board does not have.
         let args = backup_args("esp32s3", None, Path::new("/tmp/s.bin"), Some(5));
-        assert!(args.windows(2).any(|w| w == ["--before", "no-reset"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--before", "usb-reset"]), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["--after", "watchdog-reset"]), "{args:?}");
         assert!(args.contains(&"read-flash".to_string()), "{args:?}");
     }
