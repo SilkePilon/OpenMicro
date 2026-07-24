@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod flash;
 mod ui;
 
 use std::io::{self, BufRead, Write};
