@@ -1,0 +1,14 @@
+# OpenMicro adapter for the Codex CLI.
+#
+# Codex spawns a "notify" program after each turn and appends ONE JSON argument
+# describing the event, e.g.:
+#
+#   openmicro-hook codex-notify '{"type":"agent-turn-complete","turn-id":"123",...}'
+#
+# `notify` is a ROOT key: in TOML it must appear BEFORE any [table] (e.g. [tui],
+# [mcp_servers.*]). Add this line near the top of ~/.codex/config.toml.
+#
+# openmicro-hook accepts the payload as its first positional argument (Codex's
+# form) and also falls back to reading it from stdin.
+
+notify = ["openmicro-hook", "codex-notify"]
