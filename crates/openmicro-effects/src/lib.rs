@@ -10,8 +10,11 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod demo;
 pub mod power;
+pub mod ring;
 pub mod startup;
+pub mod status;
 pub mod ws2812;
 
 pub use openmicro_proto::{Effect, LedSlot, Rgb};
@@ -96,14 +99,25 @@ pub fn hsv_to_rgb(h: u8, s: u8, v: u8) -> Rgb {
 
 /// Deterministic triangle wave, `0` at `t_ms % period_ms == 0`, peaking at
 /// `255` at half the period, and back down to `0` at a full period.
-fn triangle_wave(t_ms: u32, period_ms: u32) -> u32 {
+///
+/// A period under 2 ms would make `half` zero and divide by it, so it is
+/// clamped. That is not hypothetical: `period_ms` is derived from a `speed`
+/// byte that arrives over the wire, and no animation should be able to panic
+/// the firmware.
+pub fn triangle(t_ms: u32, period_ms: u32) -> u8 {
+    let period_ms = period_ms.max(2);
     let phase = t_ms % period_ms;
     let half = period_ms / 2;
-    if phase <= half {
+    let v = if phase <= half {
         (phase * 255) / half
     } else {
         ((period_ms - phase) * 255) / half
-    }
+    };
+    v.min(255) as u8
+}
+
+fn triangle_wave(t_ms: u32, period_ms: u32) -> u32 {
+    triangle(t_ms, period_ms) as u32
 }
 
 /// Shared LFO-driven brightness envelope for Breath/Pulse: interpolates

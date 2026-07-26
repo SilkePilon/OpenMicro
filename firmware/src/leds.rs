@@ -1,47 +1,49 @@
-//! WS2812 LED chains, driven over SPI.
+//! The two WS2812 chains.
 //!
-//! **Not RMT.** The vendor firmware drives both chains from SPI hosts using
-//! ESP-IDF's `led_strip` SPI backend, which the disassembly of their image
-//! makes plain (see `docs/hardware/creator-micro-2-pinout-findings.md`). This
-//! firmware does the same, because SPI is what the board is wired for: each
-//! chain sits on its own host, so the two are independent buses and cannot be
-//! daisy-chained.
+//! | Chain     | GPIO | LEDs | Shows                                    |
+//! |-----------|------|------|------------------------------------------|
+//! | Per-key   | 7    | 13   | which agent, and what it is doing        |
+//! | Underglow | 6    | 8    | overall status, readable across the room |
 //!
-//! There are two chains:
+//! Both live on the **upper PCB**, which is power-gated behind
+//! `pins::TOP_BOARD_POWER`. Nothing here works until those pins are driven, and
+//! the failure mode is silent: every write succeeds and nothing lights. That
+//! cost a night once — see `docs/hardware/creator-micro-2-pinout-findings.md`.
 //!
-//! | Chain    | GPIO | LEDs | Purpose               |
-//! |----------|------|------|-----------------------|
-//! | Per-key  | 7    | 13   | one per mechanical key |
-//! | Underglow| 6    | 8    | underglow              |
+//! # What this module does and does not decide
 //!
-//! The bit-level encoding lives in `openmicro_effects::ws2812`, on the host
-//! side of the fence, so it is unit-tested rather than merely asserted. This
-//! module is the thin part: keep a pixel buffer, resolve effects into it, hand
-//! the encoded bytes to SPI.
+//! It decides *nothing* about colour or motion. Those all come from
+//! `openmicro_effects::status` and `::ring`, which the daemon also uses, so the
+//! two ends cannot drift. This module only owns pixel buffers, the key-to-chain
+//! remap, and the fallbacks for when the host has gone quiet.
 //!
-//! Not yet exercised on hardware.
+//! The bit-level encoding lives in `openmicro_effects::ws2812` (SPI) or is done
+//! by RMT in `main.rs`; either way it is host-tested rather than merely
+//! asserted.
 
-use openmicro_effects::ws2812;
-use openmicro_effects::{resolve, Rgb};
-use openmicro_proto::LedFrame;
+use openmicro_effects::status::{self, Link};
+use openmicro_effects::{resolve, ring, Rgb};
+use openmicro_proto::layout;
+use openmicro_proto::{Glow, LedFrame};
 
 use crate::pins;
 
-/// Render tick period. ~60 Hz is smooth for Breath/Pulse/Rainbow without
-/// saturating the SPI bus or the BLE link.
+/// Render tick period. ~60 Hz, which the travelling motions need to glide
+/// rather than step; slower and `Motion::Spin` visibly stutters.
 pub const RENDER_PERIOD_MS: u64 = 16;
 
 /// Encoded-byte buffer size for the per-key chain.
-pub const PER_KEY_BUF_LEN: usize = ws2812::buffer_len(pins::PER_KEY_LED_COUNT);
+pub const PER_KEY_BUF_LEN: usize = openmicro_effects::ws2812::buffer_len(pins::PER_KEY_LED_COUNT);
 
 /// Encoded-byte buffer size for the underglow chain.
-pub const UNDERGLOW_BUF_LEN: usize = ws2812::buffer_len(pins::UNDERGLOW_LED_COUNT);
+pub const UNDERGLOW_BUF_LEN: usize =
+    openmicro_effects::ws2812::buffer_len(pins::UNDERGLOW_LED_COUNT);
 
-/// Anything that can push a prepared byte buffer out of an SPI host.
+/// Anything that can push a prepared frame of pixels out of a peripheral.
 ///
-/// Abstracted so the render logic does not name esp-hal's SPI type, which is
-/// parameterised by peripheral instance and DMA channel. `main.rs` supplies
-/// the real implementation for each of the two hosts.
+/// Abstracted so the render logic never names esp-hal's RMT or SPI types, which
+/// are parameterised by peripheral instance and DMA channel. `main.rs` supplies
+/// the real implementation for each chain.
 pub trait PixelOut {
     /// Push a whole frame. Errors are dropped by callers: a lost frame is
     /// replaced by the next one 16 ms later, and there is nothing useful to do
@@ -49,43 +51,40 @@ pub trait PixelOut {
     fn write_pixels(&mut self, pixels: &[Rgb]) -> Result<(), ()>;
 }
 
-/// Which physical LED in the per-key chain shows a given agent slot.
-///
-/// The protocol has `SLOT_COUNT` agent slots and the board has 13 per-key
-/// LEDs. Which physical key each slot should light is a product decision that
-/// depends on the key-ID map, and that map is still unknown — so this is the
-/// identity mapping for now, and slots beyond the chain are dropped rather
-/// than wrapping onto an arbitrary key.
-fn slot_to_chain_index(slot: usize) -> usize {
-    slot
-}
-
-/// The per-key chain: agent state, one LED per key.
-pub struct PerKeyChain<S> {
+/// The per-key chain.
+pub struct KeyChain<S> {
     out: S,
     pixels: [Rgb; pins::PER_KEY_LED_COUNT],
 }
 
-impl<S: PixelOut> PerKeyChain<S> {
+const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
+
+impl<S: PixelOut> KeyChain<S> {
     pub fn new(out: S) -> Self {
-        Self {
-            out,
-            pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT],
+        Self { out, pixels: [BLACK; pins::PER_KEY_LED_COUNT] }
+    }
+
+    /// Paint one key, by key id.
+    ///
+    /// This is the only place the key-to-chain remap is applied, so a wrong
+    /// `LED_FOR_KEY` shows up as the whole board being permuted rather than as
+    /// one subsystem disagreeing with another.
+    fn set_key(&mut self, key: u8, colour: Rgb) {
+        let Some(led) = layout::LED_FOR_KEY.get(key as usize) else { return };
+        if let Some(px) = self.pixels.get_mut(*led as usize) {
+            *px = colour;
         }
     }
 
-    /// One render tick: resolve every slot's effect at `t_ms` and push it out.
+    /// One render tick from a host frame: resolve every key's effect at `t_ms`.
     pub fn render(&mut self, frame: &LedFrame, t_ms: u32) {
-        for (slot_idx, slot) in frame.slots.iter().enumerate() {
-            let idx = slot_to_chain_index(slot_idx);
-            if idx < self.pixels.len() {
-                self.pixels[idx] = resolve(slot, t_ms);
-            }
+        let slots = status::key_slots(frame);
+        for (key, slot) in slots.iter().enumerate() {
+            self.set_key(key as u8, resolve(slot, t_ms));
         }
         self.flush();
     }
 
-    /// Encode the current pixels and write them.
     fn flush(&mut self) {
         let _ = self.out.write_pixels(&self.pixels);
     }
@@ -96,44 +95,54 @@ impl<S: PixelOut> PerKeyChain<S> {
         self.flush();
     }
 
-    /// Paint every key the same colour. Bring-up aid.
-    pub fn set_all(&mut self, colour: Rgb) {
-        self.pixels = [colour; pins::PER_KEY_LED_COUNT];
+    /// Light exactly one chain position, by *chain index* rather than key id.
+    ///
+    /// The bring-up aid for `LED_FOR_KEY`: step through the chain, note which
+    /// key each index appears under, and the table writes itself. Takes a raw
+    /// index on purpose — going through the remap would assume the very thing
+    /// being measured.
+    pub fn set_chain_index(&mut self, index: usize, colour: Rgb) {
+        self.pixels = [BLACK; pins::PER_KEY_LED_COUNT];
+        if let Some(px) = self.pixels.get_mut(index) {
+            *px = colour;
+        }
         self.flush();
     }
 
-    /// Turn every per-key LED off (idle sleep).
     pub fn blank(&mut self) {
-        self.pixels = [Rgb { r: 0, g: 0, b: 0 }; pins::PER_KEY_LED_COUNT];
+        self.pixels = [BLACK; pins::PER_KEY_LED_COUNT];
         self.flush();
     }
 }
 
-/// The underglow chain: one solid colour across all 8 LEDs.
+/// The underglow ring.
 ///
-/// Separate type rather than a generic over length, because it is a different
-/// SPI host and a different concept — it shows device state, not agent state.
-pub struct UnderglowChain<S> {
+/// A separate type from [`KeyChain`], not a generic over length, because it is a
+/// different peripheral *and* a different concept: it shows device status, not
+/// agent state, and it is the one thing that keeps working when the host does
+/// not.
+pub struct GlowRing<S> {
     out: S,
     pixels: [Rgb; pins::UNDERGLOW_LED_COUNT],
 }
 
-impl<S: PixelOut> UnderglowChain<S> {
+impl<S: PixelOut> GlowRing<S> {
     pub fn new(out: S) -> Self {
-        Self {
-            out,
-            pixels: [Rgb { r: 0, g: 0, b: 0 }; pins::UNDERGLOW_LED_COUNT],
-        }
+        Self { out, pixels: [BLACK; pins::UNDERGLOW_LED_COUNT] }
     }
 
-    /// Paint the whole chain one colour.
-    pub fn set(&mut self, colour: Rgb) {
-        self.pixels = [colour; pins::UNDERGLOW_LED_COUNT];
+    /// Draw one frame of a [`Glow`].
+    pub fn render(&mut self, glow: &Glow, t_ms: u32) {
+        ring::frame(glow, t_ms, &mut self.pixels);
         let _ = self.out.write_pixels(&self.pixels);
     }
 
-    pub fn blank(&mut self) {
-        self.set(Rgb { r: 0, g: 0, b: 0 });
+    /// Draw the ring for a link state the device worked out for itself.
+    ///
+    /// This is the whole reason the firmware carries a copy of the design: when
+    /// the daemon is the thing that is missing, it cannot be the one to say so.
+    pub fn render_link(&mut self, link: Link, brightness: u8, t_ms: u32) {
+        self.render(&status::local_glow(link, brightness), t_ms);
     }
 
     /// Draw one frame of the boot animation.
@@ -142,17 +151,20 @@ impl<S: PixelOut> UnderglowChain<S> {
         let _ = self.out.write_pixels(&self.pixels);
     }
 
-    /// A slow breath, shown once the boot animation is over.
-    ///
-    /// Proof of life: without it a working board with no agents connected is
-    /// indistinguishable from a dead one, which is exactly the ambiguity that
-    /// makes bring-up painful.
-    pub fn render_idle(&mut self, t_ms: u32) {
-        const IDLE: openmicro_proto::LedSlot = openmicro_proto::LedSlot {
-            color: Rgb { r: 40, g: 90, b: 255 },
-            effect: openmicro_proto::Effect::Breath,
-            brightness: 60,
-        };
-        self.set(resolve(&IDLE, t_ms));
+    /// Light exactly one ring position. Bring-up aid, as for the key chain.
+    pub fn set_chain_index(&mut self, index: usize, colour: Rgb) {
+        self.pixels = [BLACK; pins::UNDERGLOW_LED_COUNT];
+        if let Some(px) = self.pixels.get_mut(index) {
+            *px = colour;
+        }
+        let _ = self.out.write_pixels(&self.pixels);
+    }
+
+    pub fn blank(&mut self) {
+        self.pixels = [BLACK; pins::UNDERGLOW_LED_COUNT];
+        let _ = self.out.write_pixels(&self.pixels);
     }
 }
+
+// The link-state decision itself is `openmicro_effects::status::link_state`, on
+// the host side of the fence so it is unit-tested rather than merely asserted.

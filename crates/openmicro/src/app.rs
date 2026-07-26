@@ -1058,8 +1058,8 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
             Some(c) => format!("currently {}%", percent(c.brightness)),
             None => "unknown".to_string(),
         }),
-        SelectOption::new("colour", "Colour for a state").with_hint(match &current {
-            Some(c) => format!("working is currently {}", colour_name(&c.colors.working)),
+        SelectOption::new("colour", "Colour for an agent").with_hint(match &current {
+            Some(c) => format!("Claude is currently {}", colour_name(&c.colors.claude)),
             None => "unknown".to_string(),
         }),
         SelectOption::new("sleep", "Idle timeout before the lights sleep").with_hint(
@@ -1085,16 +1085,29 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
             send_command(ui, &openmicro_proto::Command::SetBrightness(value), "Brightness set");
         }
         "colour" => {
-            let states: Vec<SelectOption<openmicro_proto::AgentState>> = [
-                (openmicro_proto::AgentState::Idle, "Idle"),
-                (openmicro_proto::AgentState::Thinking, "Thinking"),
-                (openmicro_proto::AgentState::Working, "Working"),
-                (openmicro_proto::AgentState::AwaitingApproval, "Waiting for you"),
+            // Colour identifies *which agent*, not what it is doing — the
+            // effect and the underglow motion carry the state. So this picks a
+            // colour per agent, and the hint shows what it is now.
+            let agents: Vec<SelectOption<openmicro_proto::AgentKind>> = [
+                openmicro_proto::AgentKind::Claude,
+                openmicro_proto::AgentKind::Codex,
+                openmicro_proto::AgentKind::Grok,
+                openmicro_proto::AgentKind::Other,
             ]
             .into_iter()
-            .map(|(s, label)| SelectOption::new(s, label))
+            .map(|kind| {
+                let label = match kind {
+                    openmicro_proto::AgentKind::Other => "Any other agent".to_string(),
+                    _ => kind.label().to_string(),
+                };
+                let opt = SelectOption::new(kind, label);
+                match &current {
+                    Some(c) => opt.with_hint(colour_name(&c.colors.for_kind(kind))),
+                    None => opt,
+                }
+            })
             .collect();
-            let state = ui.select("Which state?", &states)?;
+            let agent = ui.select("Which agent?", &agents)?;
 
             let colours: Vec<SelectOption<openmicro_proto::Rgb>> = client::PALETTE
                 .iter()
@@ -1106,7 +1119,7 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
             let rgb = ui.select("Which colour?", &colours)?;
             send_command(
                 ui,
-                &openmicro_proto::Command::SetStateColor { state, rgb },
+                &openmicro_proto::Command::SetAgentColor { agent, rgb },
                 "Colour set",
             );
         }

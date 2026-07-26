@@ -1,4 +1,4 @@
-use openmicro_proto::StateColors;
+use openmicro_proto::AgentColors;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -16,7 +16,7 @@ pub struct Config {
     #[serde(default)]
     pub transport: Transport,
     #[serde(default)]
-    pub colors: StateColors,
+    pub colors: AgentColors,
     #[serde(default = "default_sleep_minutes")]
     pub sleep_minutes: u32,
 }
@@ -30,7 +30,7 @@ impl Default for Config {
         Self {
             brightness: 200,
             transport: Transport::Mock,
-            colors: StateColors::default(),
+            colors: AgentColors::default(),
             sleep_minutes: default_sleep_minutes(),
         }
     }
@@ -106,34 +106,45 @@ mod tests {
 
     #[test]
     fn config_with_colors_roundtrips() {
-        use openmicro_proto::{Rgb, StateColors};
+        use openmicro_proto::{AgentColors, Rgb};
         let cfg = Config {
             brightness: 77,
-            colors: StateColors { working: Rgb { r: 1, g: 2, b: 3 }, ..Default::default() },
+            colors: AgentColors { claude: Rgb { r: 1, g: 2, b: 3 }, ..Default::default() },
             ..Default::default()
         };
         let toml = toml::to_string(&cfg).unwrap();
         let back = Config::from_toml_str(&toml);
         assert_eq!(back.brightness, 77);
-        assert_eq!(back.colors.working, Rgb { r: 1, g: 2, b: 3 });
-        assert_eq!(back.colors.idle, cfg.colors.idle);
+        assert_eq!(back.colors.claude, Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(back.colors.codex, cfg.colors.codex, "untouched agents keep their colour");
+    }
+
+    #[test]
+    fn a_config_from_an_older_build_still_loads() {
+        // Before colour meant "which agent", this table held per-state keys. A
+        // user upgrading must not lose their brightness because of it.
+        let old = "brightness = 42\n\n[colors]\nidle = { r = 0, g = 0, b = 0 }\n\
+                   working = { r = 0, g = 200, b = 80 }\n";
+        let back = Config::from_toml_str(old);
+        assert_eq!(back.brightness, 42, "brightness survived the stale colour table");
+        assert_eq!(back.colors, openmicro_proto::AgentColors::default());
     }
 
     #[test]
     fn save_to_writes_file() {
-        use openmicro_proto::{Rgb, StateColors};
+        use openmicro_proto::{AgentColors, Rgb};
         let dir = std::env::temp_dir().join(format!("omtest-{}", std::process::id()));
         let path = dir.join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
             brightness: 55,
-            colors: StateColors { thinking: Rgb { r: 9, g: 8, b: 7 }, ..Default::default() },
+            colors: AgentColors { grok: Rgb { r: 9, g: 8, b: 7 }, ..Default::default() },
             ..Default::default()
         };
         cfg.save_to(&path).unwrap();
         let back = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(back.brightness, 55);
-        assert_eq!(back.colors.thinking, Rgb { r: 9, g: 8, b: 7 });
+        assert_eq!(back.colors.grok, Rgb { r: 9, g: 8, b: 7 });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

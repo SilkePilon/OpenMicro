@@ -692,6 +692,7 @@ dependencies = [
  "async-trait",
  "bluer",
  "futures",
+ "openmicro-effects",
  "openmicro-proto",
  "serde",
  "serde_json",

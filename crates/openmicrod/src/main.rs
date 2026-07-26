@@ -94,13 +94,18 @@ async fn main() -> anyhow::Result<()> {
         while let Some(ev) = input_rx.recv().await {
             clock_in.touch();
             let maybe_action = {
-                let slot_map: Vec<_> = {
+                // Snapshot the slot map *and* the current selection under one
+                // lock. Reading them separately would let a hook event land in
+                // between and route a decision onto a session the user was not
+                // looking at.
+                let (slot_map, focus): (Vec<_>, _) = {
                     let eng = engine_in.lock().await;
                     let lookup = eng.slot_lookup();
-                    (0..openmicro_proto::SLOT_COUNT).map(lookup).collect()
+                    let slots = (0..openmicro_proto::SLOT_COUNT).map(lookup).collect();
+                    (slots, eng.focused())
                 };
                 let lookup = |i: usize| slot_map.get(i).cloned().flatten();
-                let view = action::RouterView { slot_session: &lookup };
+                let view = action::RouterView { slot_session: &lookup, focus };
                 action::route(&ev, &view)
             };
             if let Some(act) = maybe_action {
@@ -110,6 +115,25 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         ("input-routing", Ok(()))
+    });
+
+    // Heartbeat. The device falls back to its own "no daemon" animation after
+    // `DAEMON_TIMEOUT_MS` without a frame, so an idle daemon has to keep saying
+    // "still here" — otherwise a quiet desk looks identical to a crash.
+    let engine_hb = engine.clone();
+    let device_hb = device.clone();
+    tasks.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+            openmicro_proto::HEARTBEAT_MS,
+        ));
+        // The first tick fires immediately, which is what we want: it announces
+        // the daemon as soon as it is up.
+        loop {
+            tick.tick().await;
+            let eng = engine_hb.lock().await;
+            let mut dev = device_hb.lock().await;
+            eng.heartbeat(&mut *dev).await;
+        }
     });
 
     let rt = runtime_dir();

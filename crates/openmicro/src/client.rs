@@ -34,7 +34,7 @@ pub struct SnapshotDto {
     pub brightness: u8,
     /// Live per-state LED colors from the daemon, same default rationale.
     #[serde(default)]
-    pub colors: openmicro_proto::StateColors,
+    pub colors: openmicro_proto::AgentColors,
     /// Live idle-sleep minutes from the daemon, same default rationale.
     #[serde(default = "default_sleep_minutes")]
     pub sleep_minutes: u32,
@@ -58,7 +58,7 @@ impl Default for SnapshotDto {
             battery: None,
             charging: false,
             brightness: default_brightness(),
-            colors: openmicro_proto::StateColors::default(),
+            colors: openmicro_proto::AgentColors::default(),
             sleep_minutes: default_sleep_minutes(),
         }
     }
@@ -105,7 +105,7 @@ mod tests {
         let line = r#"{"sessions":[],"owner":null}"#;
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.brightness, 200);
-        assert_eq!(snap.colors, openmicro_proto::StateColors::default());
+        assert_eq!(snap.colors, openmicro_proto::AgentColors::default());
         assert_eq!(snap.sleep_minutes, 3);
     }
 
@@ -114,13 +114,26 @@ mod tests {
         // The daemon now carries the live config in every snapshot; the TUI
         // seeds its config panel from these instead of hardcoded constants.
         let line = r#"{"sessions":[],"owner":null,"brightness":77,
-            "colors":{"idle":{"r":0,"g":0,"b":0},"thinking":{"r":40,"g":90,"b":255},
-            "working":{"r":9,"g":8,"b":7},"awaiting_approval":{"r":255,"g":140,"b":0}},
+            "colors":{"claude":{"r":9,"g":8,"b":7},"codex":{"r":230,"g":230,"b":230},
+            "grok":{"r":160,"g":60,"b":255},"other":{"r":120,"g":120,"b":120}},
             "sleep_minutes":42}"#;
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.brightness, 77);
-        assert_eq!(snap.colors.working, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
+        assert_eq!(snap.colors.claude, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
         assert_eq!(snap.sleep_minutes, 42);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_daemon_still_parses() {
+        // A stale daemon sends the retired per-state palette. The TUI must fall
+        // back to the default agent colours rather than refusing the snapshot
+        // and reporting the device as unreachable.
+        let line = r#"{"sessions":[],"owner":null,"brightness":77,
+            "colors":{"idle":{"r":0,"g":0,"b":0},"working":{"r":0,"g":200,"b":80}},
+            "sleep_minutes":42}"#;
+        let snap = parse_snapshot(line).expect("old snapshot shape must still parse");
+        assert_eq!(snap.brightness, 77);
+        assert_eq!(snap.colors, openmicro_proto::AgentColors::default());
     }
 
     #[test]

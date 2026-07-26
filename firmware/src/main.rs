@@ -245,10 +245,15 @@ async fn main(spawner: Spawner) {
     // for these single-instance tasks would be a bug here, not a runtime
     // condition worth handling.
     spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
+    // The render loop needs USB-detect: it is how the device distinguishes "no
+    // daemon running" (a host is there, so amber, fixable) from "no host at all"
+    // (aurora, just a fact). A pull-up because the line is driven low when VBUS
+    // is present on this board.
     spawner.spawn(
         led_render_task(
             per_key_leds,
             underglow_leds,
+            input_pin(peripherals.GPIO42, esp_hal::gpio::Pull::Up),
         )
         .expect("led_render_task token"),
     );
@@ -386,7 +391,13 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
 }
 
 #[embassy_executor::task]
-async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter<UNDERGLOW_CODES>) {
+async fn led_render_task(
+    per_key: RmtWriter<PER_KEY_CODES>,
+    underglow: RmtWriter<UNDERGLOW_CODES>,
+    usb_detect: esp_hal::gpio::Input<'static>,
+) {
+    use openmicro_effects::status::{self, Link};
+
     log::info!(
         "leds: per-key {} on GPIO{}, underglow {} on GPIO{}",
         pins::PER_KEY_LED_COUNT,
@@ -394,32 +405,73 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
         pins::UNDERGLOW_LED_COUNT,
         pins::UNDERGLOW_LED_GPIO
     );
-    let mut keys = leds::PerKeyChain::new(per_key);
-    let mut glow = leds::UnderglowChain::new(underglow);
+    let mut keys = leds::KeyChain::new(per_key);
+    let mut glow = leds::GlowRing::new(underglow);
     let start = embassy_time::Instant::now();
     let mut last_beat_ms = 0u32;
     let mut asleep = false;
+    let mut last_link: Option<Link> = None;
+    let mut last_demo_index: Option<usize> = None;
+    // The frame the host last sent, held so the animation keeps running between
+    // heartbeats instead of freezing for a second and a half at a time.
+    let mut held = LedFrame::BLANK;
 
     loop {
         let t_ms = start.elapsed().as_millis() as u32;
 
-        if DIAGNOSTIC_COLOURS {
-            let phase = (t_ms / 2000) % 4;
-            let colour = match phase {
-                0 => Rgb { r: 255, g: 0, b: 0 },
-                1 => Rgb { r: 0, g: 255, b: 0 },
-                2 => Rgb { r: 0, g: 0, b: 255 },
-                _ => Rgb { r: 255, g: 255, b: 255 },
-            };
-            keys.set_all(colour);
-            glow.set(colour);
-            if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
+        if IDENTIFY_CHAIN_ORDER {
+            // Bring-up aid for `layout::LED_FOR_KEY`: light one chain position
+            // at a time and log it, so the physical order can be read off the
+            // device and written into the table. Walks the ring in step.
+            let step = ((t_ms / IDENTIFY_DWELL_MS) % (pins::PER_KEY_LED_COUNT as u32)) as usize;
+            keys.set_chain_index(step, Rgb { r: 255, g: 255, b: 255 });
+            let ring_step =
+                ((t_ms / IDENTIFY_DWELL_MS) % (pins::UNDERGLOW_LED_COUNT as u32)) as usize;
+            glow.set_chain_index(ring_step, Rgb { r: 255, g: 120, b: 0 });
+            if t_ms.wrapping_sub(last_beat_ms) >= IDENTIFY_DWELL_MS {
                 last_beat_ms = t_ms;
-                esp_println::println!("diag t={}ms phase={}", t_ms, phase);
+                esp_println::println!("identify: key chain index {} / ring {}", step, ring_step);
             }
             embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
             continue;
         }
+
+        if DEMO_WALK {
+            use openmicro_effects::demo;
+            let (index, step) = demo::scene_at(t_ms);
+            if last_demo_index != Some(index) {
+                last_demo_index = Some(index);
+                esp_println::println!("demo {}/{}: {}", index + 1, demo::SCENE_COUNT, step.label);
+            }
+            match step.scene {
+                demo::Scene::Local(link) => {
+                    keys.blank();
+                    glow.render_link(link, demo::DEMO_BRIGHTNESS, t_ms);
+                }
+                demo::Scene::Host(frame) => {
+                    keys.render(&frame, t_ms);
+                    glow.render(&frame.glow, t_ms);
+                }
+            }
+            embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+            continue;
+        }
+
+        // Drain any frame the host sent. Taking the newest and dropping the rest
+        // is right for a display: an older frame is never worth showing.
+        while let Ok(frame) = LED_FRAME_CHANNEL.try_receive() {
+            held = frame;
+            LAST_FRAME_MS.store(t_ms, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        let idle_for = t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed));
+        let since_frame =
+            t_ms.wrapping_sub(LAST_FRAME_MS.load(core::sync::atomic::Ordering::Relaxed));
+        // Active low: VBUS-present pulls this line down through a divider on
+        // this board. INFERRED — if the device thinks it is offline while
+        // plugged in, this is the polarity to flip.
+        let host_attached = usb_detect.is_low();
+        let link = status::link_state(host_attached, since_frame);
 
         if openmicro_effects::startup::is_running(t_ms) {
             // The boot animation doubles as a wiring test: a sweep makes a
@@ -434,9 +486,7 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
                     leds::UNDERGLOW_BUF_LEN
                 );
             }
-        } else if t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed))
-            >= LED_SLEEP_MS
-        {
+        } else if idle_for >= LED_SLEEP_MS {
             // Asleep: hold everything dark until something happens. Blanking
             // repeatedly is harmless — each frame is identical — and it keeps
             // the wake path a single comparison.
@@ -451,11 +501,25 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
                 asleep = false;
                 esp_println::println!("leds: awake");
             }
-            // NEXT: render the latest `LedFrame` from the BLE task here. Until
-            // that channel is wired, the keys stay dark and the underglow
-            // breathes — which is at least honest about the device being alive
-            // and simply having nothing to show.
-            glow.render_idle(t_ms);
+            if last_link != Some(link) {
+                last_link = Some(link);
+                esp_println::println!("link: {:?} (usb={})", link, host_attached);
+            }
+            match link {
+                // The daemon is driving: show what it sent, animated locally.
+                Link::Live => {
+                    keys.render(&held, t_ms);
+                    glow.render(&held.glow, t_ms);
+                }
+                // Nobody is driving. The keys have nothing to say — no agent
+                // state means no agent colours — but the ring must still show
+                // *something*, because a dark board is indistinguishable from a
+                // broken one.
+                Link::NoDaemon | Link::Offline => {
+                    keys.blank();
+                    glow.render_link(link, LOCAL_BRIGHTNESS, t_ms);
+                }
+            }
         }
 
         // Heartbeat. USB-Serial-JTAG throws away anything written while no
@@ -464,7 +528,7 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
         // periodic line makes "is it alive?" answerable at any time.
         if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
             last_beat_ms = t_ms;
-            esp_println::println!("alive t={}ms", t_ms);
+            esp_println::println!("alive t={}ms link={:?}", t_ms, link);
         }
 
         embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
@@ -481,13 +545,47 @@ const LED_SLEEP_MS: u32 = 5 * 60 * 1000;
 /// input and power tasks, read by the render loop.
 static LAST_ACTIVITY_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Milliseconds since boot when the host last sent a frame.
+///
+/// Starts at zero, which reads as "a frame arrived at t=0" — but the boot
+/// animation covers the first `startup::DURATION_MS`, and by the time it ends
+/// the gap already exceeds `DAEMON_TIMEOUT_MS`, so the device correctly settles
+/// into its own animation if nothing is talking to it.
+static LAST_FRAME_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Record activity, waking the LEDs.
 fn touch_activity(now_ms: u32) {
     LAST_ACTIVITY_MS.store(now_ms, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Bring-up aid: hold every LED at a solid primary, cycling.
-const DIAGNOSTIC_COLOURS: bool = false;
+/// Brightness for the animations the device runs on its own.
+///
+/// Not the user's configured brightness: that arrives with a frame, and these
+/// are exactly the states where no frame is arriving. Set moderate — these run
+/// unattended, possibly for days, and they are ambient rather than urgent.
+const LOCAL_BRIGHTNESS: u8 = 150;
+
+/// Bring-up aid: walk one LED at a time along each chain, logging the index, to
+/// establish `layout::LED_FOR_KEY`.
+///
+/// Enable with `OPENMICRO_IDENTIFY=1 cargo build --release`. Off otherwise.
+const IDENTIFY_CHAIN_ORDER: bool = option_env!("OPENMICRO_IDENTIFY").is_some();
+
+/// Walk every state the board can show, on a timer.
+///
+/// Only useful until the BLE server exists: the host-driven states (agent
+/// colours, the spinner, the decision row) are implemented and tested but have
+/// no way to arrive on real hardware yet, and this is the only way to see them.
+/// Off in shipped builds — a device inventing agent states it cannot know would
+/// be worse than one that admits it has nothing to show.
+///
+/// Enable with `OPENMICRO_DEMO=1 cargo build --release`. An env flag rather than
+/// editing this line, so a demo build is a command you can repeat and CI's
+/// default stays honest.
+const DEMO_WALK: bool = option_env!("OPENMICRO_DEMO").is_some();
+
+/// How long each LED stays lit in identify mode.
+const IDENTIFY_DWELL_MS: u32 = 1500;
 
 /// `bool` to esp-hal's pin level.
 fn level_of(high: bool) -> esp_hal::gpio::Level {

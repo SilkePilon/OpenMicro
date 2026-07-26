@@ -34,7 +34,7 @@ pub struct Snapshot {
     /// the wrong values).
     pub brightness: u8,
     /// Live per-state LED colors, for the same reason.
-    pub colors: openmicro_proto::StateColors,
+    pub colors: openmicro_proto::AgentColors,
     /// Live idle-sleep threshold in minutes (0 disables), for the same reason.
     pub sleep_minutes: u32,
 }
@@ -82,7 +82,7 @@ pub fn snapshot(engine: &Engine, battery: Option<openmicro_proto::Battery>) -> S
 /// so it must NOT be called while any engine/device lock is held. Callers
 /// capture the fields to persist, drop their guards, and then invoke this.
 /// Best-effort: errors are logged, not propagated.
-fn persist(brightness: u8, colors: openmicro_proto::StateColors, sleep_minutes: u32) {
+fn persist(brightness: u8, colors: openmicro_proto::AgentColors, sleep_minutes: u32) {
     let mut cfg = crate::config::load();
     cfg.brightness = brightness;
     cfg.colors = colors;
@@ -192,8 +192,8 @@ mod tests {
         let mut dev = MockDevice::new();
         engine
             .apply_command(
-                openmicro_proto::Command::SetStateColor {
-                    state: AgentState::Working,
+                openmicro_proto::Command::SetAgentColor {
+                    agent: openmicro_proto::AgentKind::Claude,
                     rgb: openmicro_proto::Rgb { r: 9, g: 8, b: 7 },
                 },
                 &mut dev,
@@ -203,7 +203,7 @@ mod tests {
 
         let snap = snapshot(&engine, None);
         assert_eq!(snap.brightness, 77);
-        assert_eq!(snap.colors.working, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
+        assert_eq!(snap.colors.claude, openmicro_proto::Rgb { r: 9, g: 8, b: 7 });
         assert_eq!(snap.sleep_minutes, 42);
     }
 

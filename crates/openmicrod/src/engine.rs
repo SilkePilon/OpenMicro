@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use openmicro_proto::{AgentState, Command, StateColors, SLOT_COUNT};
+use openmicro_proto::{AgentColors, AgentState, Command, LedFrame, SLOT_COUNT};
 
 use crate::action::Action;
 use crate::device::DeviceLink;
 use crate::focus::pick_owner;
-use crate::render::render_frame;
+use crate::render::{render_frame, SlotView};
 use crate::session::{SessionKey, SessionStore};
 
 /// Upper bound on `sleep_minutes` (24h). Mirrored in the TUI's `adjust()`.
@@ -40,7 +40,7 @@ pub struct Engine {
     pub mapping: Mapping,
     pub pinned: Option<SessionKey>,
     pub brightness: u8,
-    pub colors: StateColors,
+    pub colors: AgentColors,
     /// When true, `rerender` blanks the LEDs regardless of live sessions.
     pub asleep: bool,
     /// Idle minutes before the daemon puts the LEDs to sleep (0 disables).
@@ -54,14 +54,14 @@ impl Engine {
             mapping: Mapping::default(),
             pinned: None,
             brightness,
-            colors: StateColors::default(),
+            colors: AgentColors::default(),
             asleep: false,
             sleep_minutes: 3,
         }
     }
 
     /// Fields the caller needs to persist to config after a command.
-    pub fn to_config_fields(&self) -> (u8, StateColors, u32) {
+    pub fn to_config_fields(&self) -> (u8, AgentColors, u32) {
         (self.brightness, self.colors, self.sleep_minutes)
     }
 
@@ -93,13 +93,8 @@ impl Engine {
                 self.brightness = b;
                 self.rerender(device).await;
             }
-            Command::SetStateColor { state, rgb } => {
-                match state {
-                    AgentState::Idle => self.colors.idle = rgb,
-                    AgentState::Thinking => self.colors.thinking = rgb,
-                    AgentState::Working => self.colors.working = rgb,
-                    AgentState::AwaitingApproval => self.colors.awaiting_approval = rgb,
-                }
+            Command::SetAgentColor { agent, rgb } => {
+                self.colors.set(agent, rgb);
                 self.rerender(device).await;
             }
             Command::SetSleepMinutes(m) => {
@@ -130,6 +125,37 @@ impl Engine {
         let key = self.store.update(agent, session, state);
         self.mapping.assign(&key);
         self.rerender(device).await;
+    }
+
+    /// Which slot the ring and the bottom row are talking about.
+    ///
+    /// One definition, used both to render the frame and to route a press, so
+    /// the key that lights up and the session that gets approved cannot drift
+    /// apart.
+    pub fn focus_slot(&self) -> Option<usize> {
+        let owner = pick_owner(self.store.iter(), self.pinned.as_ref())?;
+        self.mapping.slot_for(&owner)
+    }
+
+    /// The selected session and its state.
+    pub fn focused(&self) -> Option<(SessionKey, AgentState)> {
+        let owner = pick_owner(self.store.iter(), self.pinned.as_ref())?;
+        let state = self.store.iter().find(|s| s.key == owner)?.state;
+        Some((owner, state))
+    }
+
+    /// The frame the device should be showing right now.
+    pub fn frame(&self) -> LedFrame {
+        if self.asleep {
+            return LedFrame::BLANK;
+        }
+        let mut slots = [None; SLOT_COUNT];
+        for session in self.store.iter() {
+            if let Some(i) = self.mapping.slot_for(&session.key) {
+                slots[i] = Some(SlotView { kind: session.kind(), state: session.state });
+            }
+        }
+        render_frame(&slots, self.focus_slot(), self.brightness, &self.colors)
     }
 
     /// Read-only lookup of which session (key + state) occupies a given slot.
@@ -184,29 +210,41 @@ impl Engine {
                 self.pinned = Some(keys[next].clone());
                 self.rerender(device).await;
             }
-            Action::Approve(ref key) | Action::Interrupt(ref key) => {
-                // TODO(adapters): execute via per-agent control channel.
+            Action::FocusSlot(slot) => {
+                // Pin explicitly, so a deliberate press is not immediately
+                // overridden by the next session to report activity.
+                // Resolved into an owned key before assigning, so the borrow
+                // `slot_lookup` holds on `self` has ended.
+                let key = (self.slot_lookup())(slot).map(|(k, _)| k);
+                if let Some(key) = key {
+                    self.pinned = Some(key);
+                    self.rerender(device).await;
+                }
+            }
+            Action::Approve(ref key)
+            | Action::AlwaysApprove(ref key)
+            | Action::Deny(ref key)
+            | Action::Interrupt(ref key) => {
+                // TODO(adapters): execute via per-agent control channel. The
+                // decision is routed and logged correctly; what is missing is a
+                // way to speak back to a running CLI, which needs one control
+                // channel per agent and is tracked separately.
                 eprintln!("openmicro: action {:?} on {}:{}", action, key.agent, key.session);
             }
         }
     }
 
+    /// Resend the current frame unchanged.
+    ///
+    /// The device treats a gap in frames as "the daemon is gone" and switches to
+    /// its own animation, so a daemon with nothing to report still has to say
+    /// so. See `openmicro_proto::HEARTBEAT_MS`.
+    pub async fn heartbeat(&self, device: &mut dyn DeviceLink) {
+        self.rerender(device).await;
+    }
+
     async fn rerender(&self, device: &mut dyn DeviceLink) {
-        if self.asleep {
-            device.set_leds(&openmicro_proto::LedFrame::BLANK).await;
-            return;
-        }
-        // v1: each mapped agent has its own key, so every mapped slot is lit
-        // with its own state. Focus/owner drives input routing + TUI highlight
-        // (see control.rs), not which keys light.
-        let mut slots = [None; SLOT_COUNT];
-        for session in self.store.iter() {
-            if let Some(i) = self.mapping.slot_for(&session.key) {
-                slots[i] = Some(session.state);
-            }
-        }
-        let frame = render_frame(&slots, self.brightness, &self.colors);
-        device.set_leds(&frame).await;
+        device.set_leds(&self.frame()).await;
     }
 }
 
@@ -214,7 +252,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::device::MockDevice;
-    use openmicro_proto::{Command, Rgb};
+    use openmicro_proto::{AgentKind, Command, Rgb};
 
     #[tokio::test]
     async fn apply_set_brightness_updates_and_rerenders() {
@@ -229,21 +267,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_set_state_color_changes_render() {
+    async fn apply_set_agent_color_changes_render() {
         let mut engine = Engine::new(200);
         let mut dev = MockDevice::new();
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         engine
             .apply_command(
-                Command::SetStateColor {
-                    state: AgentState::Working,
+                Command::SetAgentColor {
+                    agent: openmicro_proto::AgentKind::Claude,
                     rgb: Rgb { r: 1, g: 2, b: 3 },
                 },
                 &mut dev,
             )
             .await;
         assert_eq!(dev.last_frame().slots[0].color, Rgb { r: 1, g: 2, b: 3 });
-        assert_eq!(engine.colors.working, Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(engine.colors.claude, Rgb { r: 1, g: 2, b: 3 });
+    }
+
+    #[tokio::test]
+    async fn retuning_one_agent_leaves_another_sessions_key_alone() {
+        let mut engine = Engine::new(255);
+        let mut dev = MockDevice::new();
+        engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
+        engine.on_event("grok", "s2", AgentState::Working, &mut dev).await;
+        engine
+            .apply_command(
+                Command::SetAgentColor {
+                    agent: openmicro_proto::AgentKind::Claude,
+                    rgb: Rgb { r: 1, g: 2, b: 3 },
+                },
+                &mut dev,
+            )
+            .await;
+        let frame = dev.last_frame();
+        assert_eq!(frame.slots[0].color, Rgb { r: 1, g: 2, b: 3 }, "claude retuned");
+        assert_eq!(
+            frame.slots[1].color,
+            openmicro_proto::AgentKind::Grok.brand(),
+            "grok untouched"
+        );
     }
 
     #[tokio::test]
@@ -252,8 +314,9 @@ mod tests {
         let mut dev = MockDevice::new();
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
-        // claude:s1 got slot 0.
-        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 });
+        // claude:s1 got slot 0, and the key carries Claude's colour rather
+        // than a per-state one.
+        assert_eq!(frame.slots[0].color, AgentKind::Claude.brand());
         assert_eq!(dev.writes, 1);
     }
 
@@ -264,8 +327,10 @@ mod tests {
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         engine.on_event("codex", "s2", AgentState::Thinking, &mut dev).await;
         let frame = dev.last_frame();
-        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 }); // working
-        assert_eq!(frame.slots[1].color, Rgb { r: 40, g: 90, b: 255 }); // thinking
+        // Both are lit in their own agent's colour, so two sessions in
+        // different states are still told apart by *who* they are.
+        assert_eq!(frame.slots[0].color, AgentKind::Claude.brand());
+        assert_eq!(frame.slots[1].color, AgentKind::Codex.brand());
     }
 
     #[tokio::test]
@@ -274,7 +339,7 @@ mod tests {
         let mut dev = MockDevice::new();
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
-        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 }); // working
+        assert_eq!(frame.slots[0].color, AgentKind::Claude.brand());
 
         engine.on_event("claude", "s1", AgentState::Idle, &mut dev).await;
         let frame = dev.last_frame();
@@ -283,7 +348,7 @@ mod tests {
         // A new session should be able to reuse slot 0 now that it was freed.
         engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
-        assert_eq!(frame.slots[0].color, Rgb { r: 0, g: 200, b: 80 });
+        assert_eq!(frame.slots[0].color, AgentKind::Codex.brand());
     }
 
     #[tokio::test]
@@ -332,7 +397,7 @@ mod tests {
         // A hook event is activity: it wakes and re-lights the slot.
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         assert!(!engine.asleep);
-        assert_eq!(dev.last_frame().slots[0].color, Rgb { r: 0, g: 200, b: 80 });
+        assert_eq!(dev.last_frame().slots[0].color, AgentKind::Claude.brand());
     }
 
     #[tokio::test]
@@ -344,7 +409,7 @@ mod tests {
         engine.sleep(&mut dev).await;
         assert!(engine.wake(&mut dev).await); // was asleep
         assert!(!engine.asleep);
-        assert_eq!(dev.last_frame().slots[0].color, Rgb { r: 0, g: 200, b: 80 });
+        assert_eq!(dev.last_frame().slots[0].color, AgentKind::Claude.brand());
     }
 
     #[tokio::test]
