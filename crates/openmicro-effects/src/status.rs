@@ -67,10 +67,12 @@ pub fn link_state(host_attached: bool, since_last_frame_ms: u32) -> Link {
     }
 }
 
-/// Idle sits well below full: a calm state should not be the brightest thing on
-/// the desk.
-const IDLE_PCT: u32 = 45;
-const THINKING_PCT: u32 = 80;
+/// Idle sits below full: a calm state should not be the brightest thing on the
+/// desk. These are perceptual percentages — output is gamma-encoded on the way
+/// out (`gamma_channel`), so they are deliberately higher than they look; a
+/// nominal 45% became barely visible once encoding was applied.
+const IDLE_PCT: u32 = 62;
+const THINKING_PCT: u32 = 85;
 const WORKING_PCT: u32 = 100;
 const AWAITING_PCT: u32 = 100;
 
@@ -82,7 +84,7 @@ const WORKING_SPEED: u8 = 190;
 
 /// "Connected, but nothing is running" — a very dim white breath. Present
 /// enough to prove the whole chain works, quiet enough to ignore.
-const NO_AGENTS_PCT: u32 = 18;
+const NO_AGENTS_PCT: u32 = 40;
 const NO_AGENTS_COLOR: Rgb = Rgb { r: 200, g: 220, b: 255 };
 
 /// The colour of "a host is here but the daemon is not". Amber because it is a
@@ -93,7 +95,7 @@ const NO_DAEMON_PCT: u32 = 100;
 /// Offline runs [`Motion::Aurora`], which picks its own hues, so this colour is
 /// unused — kept explicit rather than leaving a junk value on the wire.
 const OFFLINE_COLOR: Rgb = Rgb { r: 0, g: 120, b: 200 };
-const OFFLINE_PCT: u32 = 55;
+const OFFLINE_PCT: u32 = 85;
 
 fn pct(brightness: u8, percent: u32) -> u8 {
     ((brightness as u32 * percent) / 100) as u8
@@ -195,7 +197,7 @@ pub fn action_slot(role: ActionRole, armed: bool, brightness: u8) -> LedSlot {
 ///
 /// Kept dimmer than the decision row: it is a standing option, not a reply to a
 /// question, and it should not compete with a live prompt for attention.
-const INTERRUPT_PCT: u32 = 55;
+const INTERRUPT_PCT: u32 = 72;
 
 pub fn interrupt_slot(armed: bool, brightness: u8) -> LedSlot {
     if !armed {
@@ -227,12 +229,26 @@ pub fn key_slots(frame: &LedFrame) -> [LedSlot; layout::KEY_COUNT] {
             KeyRole::Interrupt => interrupt_slot(frame.actions.interrupt, b),
             KeyRole::Reserved => LedSlot::OFF,
             KeyRole::Approve => action_slot(ActionRole::Approve, frame.actions.approve, b),
-            KeyRole::Always => action_slot(ActionRole::Always, frame.actions.always, b),
             KeyRole::Deny => action_slot(ActionRole::Deny, frame.actions.deny, b),
+            KeyRole::Status => frame.status,
         };
     }
     keys
 }
+
+/// The transparent-keycap status light.
+///
+/// The one key that reads from across the room, so it carries the focused
+/// agent's colour and flashes when that agent wants something. Approve and deny
+/// are immediately to its left, which is what makes them findable by feel: find
+/// the lit key, the decisions are next to it.
+pub fn status_slot(color: Rgb, state: Option<AgentState>, brightness: u8) -> LedSlot {
+    let Some(state) = state else { return LedSlot::OFF };
+    LedSlot { color, effect: slot_effect(state), brightness: pct(brightness, STATUS_PCT) }
+}
+
+/// The status light runs at full scale — it is the board's headline.
+const STATUS_PCT: u32 = 100;
 
 /// Which keys to offer for a state.
 ///
@@ -245,7 +261,7 @@ pub fn action_keys_for(state: Option<AgentState>) -> ActionKeys {
         Some(AgentState::AwaitingApproval) => {
             // Nothing is executing while the agent waits, so there is nothing
             // to interrupt.
-            ActionKeys { approve: true, always: true, deny: true, interrupt: false }
+            ActionKeys { approve: true, deny: true, interrupt: false }
         }
         Some(AgentState::Thinking) | Some(AgentState::Working) => {
             ActionKeys { interrupt: true, ..ActionKeys::NONE }
@@ -440,7 +456,7 @@ mod tests {
     #[test]
     fn action_keys_appear_only_when_a_decision_is_pending() {
         let armed = action_keys_for(Some(AgentState::AwaitingApproval));
-        assert!(armed.approve && armed.always && armed.deny);
+        assert!(armed.approve && armed.deny);
 
         for state in [AgentState::Idle, AgentState::Thinking, AgentState::Working] {
             assert!(
@@ -497,7 +513,7 @@ mod tests {
 
     #[test]
     fn an_unarmed_action_key_is_fully_off() {
-        for role in [ActionRole::Approve, ActionRole::Always, ActionRole::Deny] {
+        for role in [ActionRole::Approve, ActionRole::Deny] {
             assert_eq!(action_slot(role, false, 255), LedSlot::OFF, "{role:?}");
         }
     }
@@ -515,16 +531,23 @@ mod tests {
     }
 
     #[test]
-    fn the_three_action_keys_are_three_different_colors() {
-        let colors = [
-            action_slot(ActionRole::Approve, true, 255).color,
-            action_slot(ActionRole::Always, true, 255).color,
-            action_slot(ActionRole::Deny, true, 255).color,
-        ];
-        for (i, a) in colors.iter().enumerate() {
-            for b in colors.iter().skip(i + 1) {
-                assert_ne!(a, b, "two action keys share a colour");
-            }
-        }
+    fn the_two_decision_keys_are_different_colors() {
+        let approve = action_slot(ActionRole::Approve, true, 255).color;
+        let deny = action_slot(ActionRole::Deny, true, 255).color;
+        assert_ne!(approve, deny, "approve and deny must never share a colour");
+    }
+
+    #[test]
+    fn the_status_light_carries_the_agent_color_and_flashes_when_waiting() {
+        let claude = AgentKind::Claude.brand();
+        let waiting = status_slot(claude, Some(AgentState::AwaitingApproval), 255);
+        assert_eq!(waiting.color, claude, "the status light is the agent's colour");
+        assert_eq!(waiting.effect, Effect::Pulse, "it must flash when input is wanted");
+        assert!(waiting.brightness > 0);
+
+        // Running is steady, so a flash always means "needs you".
+        assert_eq!(status_slot(claude, Some(AgentState::Working), 255).effect, Effect::Solid);
+        // Nothing focused: dark.
+        assert_eq!(status_slot(claude, None, 255), LedSlot::OFF);
     }
 }

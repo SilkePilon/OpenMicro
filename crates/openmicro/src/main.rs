@@ -9,6 +9,7 @@ mod agents;
 mod app;
 mod client;
 mod daemon;
+mod display;
 mod firmware;
 mod flash;
 mod probe;

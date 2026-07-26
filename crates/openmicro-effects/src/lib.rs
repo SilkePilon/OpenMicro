@@ -53,6 +53,32 @@ pub fn resolve(slot: &LedSlot, t_ms: u32) -> Rgb {
     }
 }
 
+/// Gamma-encode one channel, with gamma = 2.
+///
+/// A WS2812's PWM is linear in duty cycle, but the eye is not: perceived
+/// brightness goes roughly as a fractional power of it. A linear ramp therefore
+/// *looks* like it leaps to nearly full brightness and then plateaus — so a
+/// crossfade between two LEDs, which is how a travelling animation fakes the
+/// positions between them, reads as a snap even when the arithmetic is perfectly
+/// smooth.
+///
+/// Gamma **2**, not the 2.6 a table would normally use, because encoding throws
+/// away real output: at 2.6 a mid-scale value lands near 46/255 and the whole
+/// board looks nearly off. Two is enough to linearise a crossfade, keeps far
+/// more brightness, and — being just `v²/255` — needs no table at all.
+///
+/// Applied once, at the output boundary, immediately before encoding. Anywhere
+/// earlier and values that get scaled again afterwards would be
+/// double-corrected.
+pub fn gamma_channel(v: u8) -> u8 {
+    ((v as u16 * v as u16) / 255) as u8
+}
+
+/// Gamma-encode a colour, ready for the wire. See [`gamma_channel`].
+pub fn gamma(c: Rgb) -> Rgb {
+    Rgb { r: gamma_channel(c.r), g: gamma_channel(c.g), b: gamma_channel(c.b) }
+}
+
 /// Per-channel scale of `c` by `brightness` (0..=255, where 255 is unchanged).
 pub fn scale(c: Rgb, brightness: u8) -> Rgb {
     Rgb {
@@ -145,6 +171,52 @@ mod tests {
 
     fn slot(color: Rgb, effect: Effect, brightness: u8) -> LedSlot {
         LedSlot { color, effect, brightness }
+    }
+
+    #[test]
+    fn gamma_is_monotonic_and_keeps_the_endpoints() {
+        // Off must stay off, or an idle board glows. Monotonicity matters
+        // because a table that dips anywhere would make a rising ramp visibly
+        // stutter — the exact fault this exists to remove.
+        assert_eq!(gamma_channel(0), 0);
+        assert!(gamma_channel(255) > 235, "full scale must stay near full");
+        for v in 1..=255u8 {
+            assert!(
+                gamma_channel(v) >= gamma_channel(v - 1),
+                "gamma dips at {v}: {} then {}",
+                gamma_channel(v - 1),
+                gamma_channel(v)
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_pulls_the_midpoint_well_below_half() {
+        // The whole point: 50% perceptual is nowhere near 50% duty cycle. If
+        // this were near 128 the table would be doing nothing.
+        let mid = gamma_channel(128);
+        assert!(mid < 90, "gamma is too weak to fix a crossfade: {mid}");
+        // ...but not so strong that the board goes dark, which gamma 2.6 did.
+        assert!(mid > 50, "gamma is crushing the mid-range: {mid}");
+    }
+
+    #[test]
+    fn gamma_never_makes_a_step_bigger_than_the_input_step() {
+        // Encoding must not amplify a one-unit change into a visible jump at
+        // any point in the range.
+        for v in 1..=255u8 {
+            let step = gamma_channel(v) as i32 - gamma_channel(v - 1) as i32;
+            assert!(step <= 3, "gamma jumps {step} at {v}");
+        }
+    }
+
+    #[test]
+    fn gamma_applies_to_every_channel() {
+        let c = Rgb { r: 255, g: 128, b: 0 };
+        let g = gamma(c);
+        assert_eq!(g.r, gamma_channel(255));
+        assert_eq!(g.g, gamma_channel(128));
+        assert_eq!(g.b, 0);
     }
 
     #[test]

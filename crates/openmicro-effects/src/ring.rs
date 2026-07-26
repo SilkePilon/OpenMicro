@@ -33,7 +33,7 @@ const SPIN_TAIL_LEDS: u32 = 3;
 /// One `Breath` swell at nominal speed.
 const BREATH_PERIOD_MS: u32 = 3400;
 /// Floor of the breath, as a percent of full — it dips, it does not blink.
-const BREATH_MIN_PCT: u32 = 12;
+const BREATH_MIN_PCT: u32 = 25;
 
 /// The `Alert` cycle: two quick flashes, then a gap.
 const ALERT_PERIOD_MS: u32 = 1100;
@@ -44,7 +44,7 @@ const ALERT_GAP_MS: u32 = 110;
 const SEARCH_PERIOD_MS: u32 = 4200;
 const SEARCH_TAIL_LEDS: u32 = 1;
 /// The dot is a background hint, not a notification.
-const SEARCH_MAX_PCT: u32 = 45;
+const SEARCH_MAX_PCT: u32 = 70;
 
 /// One `Aurora` drift.
 const AURORA_PERIOD_MS: u32 = 9000;
@@ -58,7 +58,7 @@ const AURORA_PERIOD_MS: u32 = 9000;
 const AURORA_HUE_MIN: u32 = 112;
 const AURORA_HUE_MAX: u32 = 168;
 /// Aurora never goes fully dark — it is ambient, so it keeps a floor.
-const AURORA_MIN_PCT: u32 = 35;
+const AURORA_MIN_PCT: u32 = 50;
 
 /// Sub-LED resolution for the travelling motions.
 ///
@@ -77,19 +77,45 @@ fn period_for(nominal_ms: u32, speed: u8) -> u32 {
     ((nominal_ms * NOMINAL_SPEED as u32) / speed).max(1)
 }
 
-/// Brightness of a comet LED: 255 at the head, fading to 0 at the tail's end.
+/// How far in front of the head an LED starts to light, in LEDs.
 ///
-/// `head` and the returned position are in [`SUB`]ths of an LED.
+/// Without this the comet is **choppy**, and not subtly so. The head advances in
+/// fractions of an LED, but an LED in front of it used to sit at weight 0 until
+/// the head crossed it, at which point its distance wrapped from "almost a whole
+/// revolution behind" to zero and it snapped straight to full brightness. The
+/// trailing edge faded smoothly; the leading edge was a hard step, so a
+/// revolution read as `count` discrete jumps rather than a glide.
+///
+/// One LED of lead-in is enough: the rise and the fall then meet at the head, so
+/// the profile is continuous the whole way round.
+const COMET_LEAD_LEDS: u32 = 1;
+
+/// Brightness of a comet LED: 255 at the head, ramping up ahead of it and
+/// fading out behind it.
+///
+/// `head` is in [`SUB`]ths of an LED.
 fn comet_weight(index: usize, count: usize, head: u32, tail_leds: u32) -> u8 {
     let span = count as u32 * SUB;
     let at = index as u32 * SUB;
     // How far this LED sits *behind* the head, going the way the comet travels.
     let behind = (head + span - at) % span;
-    let tail = tail_leds * SUB;
-    if behind >= tail {
-        return 0;
+    let tail = (tail_leds * SUB).max(1);
+    let lead = (COMET_LEAD_LEDS * SUB).min(span / 2).max(1);
+
+    if behind <= tail {
+        // In the tail: brightest at the head, fading away behind it.
+        (255 - (behind * 255) / tail) as u8
+    } else {
+        // In front of the head. `span - behind` is how far ahead it is, so it
+        // brightens as the head closes in and reaches 255 exactly where the
+        // trailing branch starts.
+        let ahead = span - behind;
+        if ahead <= lead {
+            (255 - (ahead * 255) / lead) as u8
+        } else {
+            0
+        }
     }
-    (255 - (behind * 255) / tail) as u8
 }
 
 /// Where the head of a travelling motion is at `t_ms`, in [`SUB`]ths of an LED.
@@ -265,7 +291,9 @@ mod tests {
         let lit = lit_count(&px);
         assert!(lit > 0, "the comet has to be somewhere");
         assert!(lit < COUNT, "a comet that lights everything is just Breath");
-        assert!(lit <= SPIN_TAIL_LEDS as usize, "tail longer than configured: {lit}");
+        // Tail plus the one-LED lead-in that keeps the leading edge smooth.
+        let widest = (SPIN_TAIL_LEDS + COMET_LEAD_LEDS) as usize;
+        assert!(lit <= widest, "comet spans {lit} LEDs, wider than {widest}");
     }
 
     #[test]
@@ -397,8 +425,10 @@ mod tests {
         let fast_px = render(&fast, half);
         let slow_px = render(&slow, half);
         assert_ne!(fast_px, slow_px, "speed had no effect");
-        // Shape is preserved: still a comet, still the same tail length.
-        assert!(lit_count(&fast_px) <= SPIN_TAIL_LEDS as usize);
+        // Shape is preserved: still a comet of the same width, just further round.
+        let widest = (SPIN_TAIL_LEDS + COMET_LEAD_LEDS) as usize;
+        assert!(lit_count(&fast_px) <= widest);
+        assert!(lit_count(&slow_px) <= widest);
     }
 
     #[test]
@@ -426,6 +456,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The render tick the firmware actually uses.
+    const FRAME_MS: u32 = 16;
+
+    #[test]
+    fn travelling_motions_glide_rather_than_step() {
+        // The regression this pins down: the comet used to anti-alias only its
+        // trailing edge, so each LED snapped from off to full as the head
+        // crossed it and a revolution read as eight visible jumps. Sampled at
+        // the real frame rate, no single LED may lurch.
+        //
+        // A full LED step is 255; at ~6 frames per LED a smooth ramp moves ~42
+        // per frame, so 90 catches a snap while leaving headroom for rounding.
+        const MAX_JUMP: i32 = 90;
+        for (motion, period) in
+            [(Motion::Spin, SPIN_PERIOD_MS), (Motion::Searching, SEARCH_PERIOD_MS)]
+        {
+            for speed in [64, NOMINAL_SPEED, 190, 255] {
+                let mut g = glow(motion, 255);
+                g.speed = speed;
+                let mut prev = render(&g, 0);
+                let mut t = FRAME_MS;
+                while t <= period {
+                    let now = render(&g, t);
+                    for i in 0..COUNT {
+                        let delta = now[i].r as i32 - prev[i].r as i32;
+                        assert!(
+                            delta.abs() <= MAX_JUMP,
+                            "{motion:?} at speed {speed} jumped {delta} on LED {i} at t={t}"
+                        );
+                    }
+                    prev = now;
+                    t += FRAME_MS;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_comet_brightens_before_the_head_reaches_an_led() {
+        // The leading ramp: an LED just in front of the head must already be
+        // partly lit, which is what removes the step.
+        let span = COUNT as u32 * SUB;
+        // Head half an LED short of LED 1.
+        let head = SUB / 2;
+        let w = comet_weight(1, COUNT, head, SPIN_TAIL_LEDS);
+        assert!(w > 0, "LED ahead of the head is still dark, so it will snap on");
+        assert!(w < 255, "it should not be at full brightness before the head arrives");
+
+        // ...and it must be continuous across the head itself.
+        let just_before = comet_weight(1, COUNT, SUB - 1, SPIN_TAIL_LEDS);
+        let exactly_on = comet_weight(1, COUNT, SUB, SPIN_TAIL_LEDS);
+        assert!(
+            (exactly_on as i32 - just_before as i32).abs() <= 2,
+            "discontinuity at the head: {just_before} then {exactly_on}"
+        );
+        let _ = span;
     }
 
     #[test]

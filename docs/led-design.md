@@ -25,8 +25,8 @@ Thirteen keys in rows of **2, 4, 4, 3**.
 │STOP││    ││    ││    │        6 = interrupt, 7–9 reserved
 └────┘└────┘└────┘└────┘
 ┌────┐┌────┐┌────┐
-│ ✓  ││ ★  ││ ✗  │             10 approve · 11 always · 12 deny
-└────┘└────┘└────┘
+│ ✓  ││ ✗  ││ ◉  │             10 approve · 11 deny · 12 status
+└────┘└────┘└────┘             12 has the transparent keycap
  ◌ ◌ ◌ ◌ ◌ ◌ ◌ ◌               8-LED underglow ring
 ```
 
@@ -49,15 +49,18 @@ Six `AG` keys and seven `ACT` keys, numbered row-major. That six is why
 (`solid`, `snake`, `rainbow`, `gradient`, `shallow_breath`) maps almost directly
 onto the motions below — `snake` is `Spin`, `shallow_breath` is `Breath`.
 
-Everything above is recovered fact. The one thing that is **not** is
-`layout::LED_FOR_KEY`, the map from key id to position along the WS2812 chain:
-nothing in the vendor image states the physical routing order, so it defaults to
-identity. If the lights land on the wrong keys, that one table is the only thing
-to change.
+Everything above is recovered fact. The one thing the image does **not** state is
+`layout::LED_FOR_KEY`, the map from key id to position along the WS2812 chain —
+the strip is written as a flat array and the routing is a PCB fact.
 
-To establish it, build with `OPENMICRO_IDENTIFY=1 cargo build --release`: the
-firmware then lights one chain position at a time and logs its index to serial,
-so the physical order can be read off the device and written into the table.
+**It runs backwards.** Chain position `i` is key `12 - i`; the transparent-keycap
+key at the bottom right is chain index 0. The first attempt assumed identity, on
+the reasoning that a board numbered row-major is probably wired row-major. It is
+not — with identity, approve and deny lit up along the *top* row. Only looking at
+the hardware settled it.
+
+To re-check after a board revision: `Device → What the lights are doing →
+Identify LEDs` lights one chain position at a time and logs its index.
 
 ## Agent colours
 
@@ -86,10 +89,13 @@ findable.
 
 | State | Effect | Brightness |
 |---|---|---|
-| Idle | Breath | 45% |
-| Thinking | Breath | 80% |
+| Idle | Breath | 62% |
+| Thinking | Breath | 85% |
 | Working | Solid | 100% |
 | Awaiting approval | **Pulse** | 100% |
+
+Those percentages are *perceptual* — output is gamma-encoded afterwards, so they
+sit higher than they look. See **Smoothness** below.
 
 ## The ring
 
@@ -126,17 +132,67 @@ prompt. Their appearing *is* the notification.
 | Key | Colour | Lit when |
 |---|---|---|
 | 10 Approve | green `0,230,70` | focused session awaits approval |
-| 11 Always | amber `255,170,0` | same |
-| 12 Deny | red `255,30,20` | same |
+| 11 Deny | red `255,30,20` | same |
+| 12 Status | the focused agent's colour | whenever a session is focused |
 | 6 Stop | dim red `180,25,15` | focused session is thinking or working |
 
-Approve/always/deny are held **solid**, not pulsing: these are targets to hit,
-and the ring's `Alert` is already carrying the urgency. Two things shouting at
-once is worse than one.
+Approve and deny are held **solid**, not pulsing: these are targets to hit, and
+the ring's `Alert` is already carrying the urgency. Two things shouting at once
+is worse than one.
+
+**Key 12 is the transparent keycap**, and it is an indicator rather than a
+button — pressing it does nothing. A clear cap passes far more light than a
+tinted one, so it is the one key legible from across a room: it carries the
+focused agent's own colour, steady while that agent works and flashing when it
+wants something. Approve and deny sitting immediately to its left is what makes
+them findable without looking — find the lit key, the decisions are next to it.
+
+There is deliberately no "always allow" key. It was on key 12 in an earlier
+draft; the status light is a better use of the only transparent cap on the board,
+and a third decision key nobody asked for was not worth the space.
 
 Stop sits on its own row, and never lights at the same time as Deny — they share
 a hue, so overlap would be genuinely confusing. It is dimmer because it is a
 standing option rather than a reply to a question.
+
+## Smoothness
+
+Three independent things made the travelling motions look choppy, and only fixing
+all three helped:
+
+1. **The comet only anti-aliased its trailing edge.** An LED in front of the head
+   sat at zero until the head crossed it, then snapped to full — so a revolution
+   read as eight discrete jumps. `COMET_LEAD_LEDS` adds a one-LED ramp in front,
+   so the rise and fall meet at the head and the profile is continuous.
+2. **Output was linear.** A WS2812's PWM is linear in duty cycle and the eye is
+   not, so a linear crossfade *looks* like a snap. Output is now gamma-encoded
+   once, at the boundary, in `gamma_channel`. Gamma **2** rather than the usual
+   2.6: at 2.6 a mid-scale value lands near 46/255 and the whole board looks
+   nearly off. Two linearises the crossfade and keeps the brightness — and being
+   `v²/255`, needs no table.
+3. **Frame timing drifted.** The loop used `Timer::after(16ms)` *after* doing the
+   work, so the interval was 16 ms plus however long rendering took, and a
+   blocking serial write showed up as a hitch. It now uses a `Ticker`, which
+   holds phase.
+
+Note that the percentages in `status.rs` are *perceptual*, and were re-tuned
+upward once gamma landed — a nominal 45% became barely visible under encoding.
+
+A test samples both travelling motions at the real 16 ms frame rate, across four
+speeds, and fails if any LED lurches by more than a smooth ramp would.
+
+## Seeing it without a device link
+
+`Device → What the lights are doing` in the TUI switches the board between:
+
+- **Normal** — real state.
+- **Demo** — a scripted walk through all eight scenes, 4 s each.
+- **Identify LEDs** — one chain position at a time, logging its index.
+
+This goes down USB-Serial-JTAG as a single byte, *not* through the daemon: the
+daemon talks to the device over BLE and that is not wired yet. So it works on an
+already-flashed device with no daemon and no rebuild. When the GATT server lands
+this should move onto the daemon path.
 
 ## Where the code lives
 
@@ -169,8 +225,8 @@ of dropped writes do not make the display flicker between modes.
 
 Implemented and unit-tested: all of the above.
 
-Verified on hardware: the boot sweep, `Offline`, `NoDaemon`, and — via
-`OPENMICRO_DEMO=1` — every host-driven state.
+Verified on hardware: the boot sweep, `Offline`, `NoDaemon`, the serial
+mode-switch round trip, and — via demo mode — every host-driven state.
 
 **Not reachable on hardware yet:** the real host-driven path, because
 `firmware/src/ble.rs` is still a sketch, so `LED_FRAME_CHANNEL` has nothing

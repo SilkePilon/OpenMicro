@@ -52,6 +52,14 @@ pub fn render_frame(
     };
 
     frame.actions = status::action_keys_for(focused.map(|v| v.state));
+    // The transparent-keycap light mirrors the focused session, so the one key
+    // that is readable from across the room says who is waiting.
+    frame.status = match focused {
+        Some(view) => {
+            status::status_slot(colors.for_kind(view.kind), Some(view.state), brightness)
+        }
+        None => LedSlot::OFF,
+    };
     frame.brightness = brightness;
     frame
 }
@@ -144,7 +152,7 @@ mod tests {
         slots[0] = view(AgentKind::Claude, AgentState::AwaitingApproval);
         let frame = render_frame(&slots, Some(0), 255, &AgentColors::default());
 
-        assert!(frame.actions.approve && frame.actions.always && frame.actions.deny);
+        assert!(frame.actions.approve && frame.actions.deny);
         assert_eq!(frame.glow.motion, Motion::Alert);
         // The waiting key itself is the only per-key animation, so it is
         // findable among five busy neighbours.
@@ -194,8 +202,10 @@ mod tests {
         assert_eq!(keys[0].color, AgentKind::Claude.brand());
         // ...the bottom row reads green, amber, red left to right...
         assert_eq!(keys[layout::APPROVE_KEY as usize].color, openmicro_proto::APPROVE_COLOR);
-        assert_eq!(keys[layout::ALWAYS_KEY as usize].color, openmicro_proto::ALWAYS_COLOR);
         assert_eq!(keys[layout::DENY_KEY as usize].color, openmicro_proto::DENY_COLOR);
+        // ...the transparent keycap flashes in Claude's colour...
+        assert_eq!(keys[layout::STATUS_KEY as usize].color, AgentKind::Claude.brand());
+        assert_eq!(keys[layout::STATUS_KEY as usize].effect, Effect::Pulse);
         // ...nothing is running, so stop stays dark...
         assert_eq!(keys[layout::INTERRUPT_KEY as usize], LedSlot::OFF);
         // ...and the unused keys stay dark.

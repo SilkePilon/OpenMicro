@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use crate::agents::{self, AgentKind, HookStatus};
 use crate::daemon;
+use crate::display;
 use crate::firmware::{self, Release};
 use crate::flash;
 use crate::client;
@@ -853,10 +854,32 @@ fn device_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
             UsbMode::Bootloader => "clears the download-boot flag and resets",
             _ => "not in bootloader mode",
         }),
+        SelectOption::new("lights", "What the lights are doing")
+            .with_hint(match display::find_port() {
+                Some(_) => "demo, identify, or back to normal",
+                None => "needs a USB cable",
+            }),
         SelectOption::new("back", "Back"),
     ];
 
     match ui.select("Device", &options)? {
+        "lights" => {
+            let modes = vec![
+                SelectOption::new(display::Mode::Demo, "Demo")
+                    .with_hint("walk every state the board can show"),
+                SelectOption::new(display::Mode::Identify, "Identify LEDs")
+                    .with_hint("one LED at a time, for mapping the chain order"),
+                SelectOption::new(display::Mode::Normal, "Normal")
+                    .with_hint("back to showing real agent state"),
+            ];
+            let mode = ui.select("What should the lights do?", &modes)?;
+            // Sent straight down USB-Serial-JTAG rather than through the daemon:
+            // the daemon talks to the device over BLE, and that is not wired yet.
+            match display::send(mode) {
+                Ok(msg) => ui.success(&msg),
+                Err(e) => ui.warn(&e),
+            }
+        }
         "check" => {
             let mut spinner = ui.spinner();
             spinner.start("Scanning USB and Bluetooth");

@@ -156,7 +156,6 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ActionKeys {
     pub approve: bool,
-    pub always: bool,
     pub deny: bool,
     /// Row 2's stop key. Offered whenever there is work to stop, which is a
     /// different condition from the three above — hence a separate flag rather
@@ -165,8 +164,7 @@ pub struct ActionKeys {
 }
 
 impl ActionKeys {
-    pub const NONE: ActionKeys =
-        ActionKeys { approve: false, always: false, deny: false, interrupt: false };
+    pub const NONE: ActionKeys = ActionKeys { approve: false, deny: false, interrupt: false };
 
     /// True when a decision is being offered — i.e. the bottom row is visible.
     ///
@@ -174,7 +172,7 @@ impl ActionKeys {
     /// pending question, and callers asking "is something waiting on me?" would
     /// get the wrong answer if it counted.
     pub const fn any(&self) -> bool {
-        self.approve || self.always || self.deny
+        self.approve || self.deny
     }
 }
 
@@ -185,9 +183,6 @@ pub const INTERRUPT_COLOR: Rgb = Rgb { r: 180, g: 25, b: 15 };
 
 /// Green for yes.
 pub const APPROVE_COLOR: Rgb = Rgb { r: 0, g: 230, b: 70 };
-/// Amber for "yes, and stop asking" — kin to approve, but not the same
-/// decision, so not the same colour.
-pub const ALWAYS_COLOR: Rgb = Rgb { r: 255, g: 170, b: 0 };
 /// Red for no.
 pub const DENY_COLOR: Rgb = Rgb { r: 255, g: 30, b: 20 };
 
@@ -274,6 +269,10 @@ pub struct LedFrame {
     pub glow: Glow,
     /// Which action keys are offered.
     pub actions: ActionKeys,
+    /// The transparent-keycap status light: the focused agent's colour and
+    /// state. Carried separately from `slots` because it is not an agent slot —
+    /// it mirrors whichever slot has the focus.
+    pub status: LedSlot,
     /// Master brightness.
     ///
     /// Carried explicitly because the action keys are sent as booleans, not
@@ -288,6 +287,7 @@ impl LedFrame {
         slots: [LedSlot::OFF; SLOT_COUNT],
         glow: Glow::OFF,
         actions: ActionKeys::NONE,
+        status: LedSlot::OFF,
         brightness: 0,
     };
 
@@ -341,7 +341,12 @@ mod tests {
             brightness: 77,
             speed: 200,
         };
-        frame.actions = ActionKeys { approve: true, always: false, deny: true, interrupt: false };
+        frame.actions = ActionKeys { approve: true, deny: true, interrupt: false };
+        frame.status = LedSlot {
+            color: Rgb { r: 9, g: 9, b: 9 },
+            effect: Effect::Pulse,
+            brightness: 100,
+        };
         let bytes = frame.encode().unwrap();
         let back = LedFrame::decode(&bytes).unwrap();
         assert_eq!(frame, back, "glow and action keys must survive the wire");
@@ -388,8 +393,6 @@ mod tests {
         // that leans green is actively dangerous.
         assert!(APPROVE_COLOR.g > APPROVE_COLOR.r + 100);
         assert!(DENY_COLOR.r > DENY_COLOR.g + 100);
-        // Amber sits between them, and is not mistakable for either.
-        assert!(ALWAYS_COLOR.r > 200 && ALWAYS_COLOR.g > 100 && ALWAYS_COLOR.b < 60);
     }
 
     #[test]
@@ -397,7 +400,8 @@ mod tests {
         assert!(!ActionKeys::NONE.any());
         assert!(ActionKeys { approve: true, ..Default::default() }.any());
         assert!(ActionKeys { deny: true, ..Default::default() }.any());
-        assert!(ActionKeys { always: true, ..Default::default() }.any());
+        // The stop key is not a pending decision, so it must not count.
+        assert!(!ActionKeys { interrupt: true, ..Default::default() }.any());
     }
 
     #[test]
@@ -409,6 +413,7 @@ mod tests {
         for slot in blank.slots {
             assert_eq!(slot, LedSlot::OFF);
         }
+        assert_eq!(blank.status, LedSlot::OFF);
     }
 
     #[test]

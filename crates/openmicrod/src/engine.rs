@@ -222,7 +222,6 @@ impl Engine {
                 }
             }
             Action::Approve(ref key)
-            | Action::AlwaysApprove(ref key)
             | Action::Deny(ref key)
             | Action::Interrupt(ref key) => {
                 // TODO(adapters): execute via per-agent control channel. The

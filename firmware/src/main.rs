@@ -131,6 +131,11 @@ impl<const N: usize> leds::PixelOut for RmtWriter<N> {
         }
         let mut at = 0;
         for px in pixels {
+            // Gamma-encode here and nowhere else: this is the single output
+            // boundary, so every animation gets it exactly once. Without it a
+            // linear crossfade between adjacent LEDs looks like a snap, which
+            // reads as a choppy comet however smooth the arithmetic is.
+            let px = openmicro_effects::gamma(*px);
             // Wire order is green, red, blue.
             for byte in [px.g, px.r, px.b] {
                 for bit in (0..8).rev() {
@@ -337,6 +342,14 @@ async fn main(spawner: Spawner) {
         })
         .expect("input_task token"),
     );
+    // Display-mode commands over USB-Serial-JTAG. Only the RX half is used;
+    // esp-println owns TX through raw register writes, so the TX guard is leaked
+    // rather than dropped — dropping it would silence every log line.
+    let (serial_rx, serial_tx) =
+        esp_hal::usb_serial_jtag::UsbSerialJtag::new(peripherals.USB_DEVICE).split();
+    core::mem::forget(serial_tx);
+    spawner.spawn(serial_command_task(serial_rx).expect("serial_command_task token"));
+
     spawner.spawn(battery_task().expect("battery_task token"));
     spawner.spawn(
         power_task(input_pin(peripherals.GPIO2, esp_hal::gpio::Pull::Up))
@@ -407,6 +420,12 @@ async fn led_render_task(
     );
     let mut keys = leds::KeyChain::new(per_key);
     let mut glow = leds::GlowRing::new(underglow);
+    // A Ticker, not `Timer::after` at the end of the loop. `after` sleeps for a
+    // fixed time *after* the work finishes, so the frame interval is 16 ms plus
+    // however long rendering took — and a blocking USB-serial write or a longer
+    // RMT transfer then shows up as a visible hitch. A ticker holds the phase.
+    let mut ticker =
+        embassy_time::Ticker::every(embassy_time::Duration::from_millis(leds::RENDER_PERIOD_MS));
     let start = embassy_time::Instant::now();
     let mut last_beat_ms = 0u32;
     let mut asleep = false;
@@ -419,7 +438,31 @@ async fn led_render_task(
     loop {
         let t_ms = start.elapsed().as_millis() as u32;
 
-        if IDENTIFY_CHAIN_ORDER {
+        if display_mode() == MODE_PROBE {
+            // Three fixed chain positions in three unmistakable colours, held
+            // still. Whichever physical row the blue one is in tells us which
+            // end of the chain is which, and that is the only thing standing
+            // between `LED_FOR_KEY` being identity and being correct.
+            keys.set_chain_indices(&[
+                (PROBE_FIRST, Rgb { r: 255, g: 0, b: 0 }),
+                (PROBE_MIDDLE, Rgb { r: 0, g: 255, b: 0 }),
+                (PROBE_LAST, Rgb { r: 0, g: 0, b: 255 }),
+            ]);
+            glow.set_chain_index(0, Rgb { r: 255, g: 255, b: 255 });
+            if t_ms.wrapping_sub(last_beat_ms) >= 3000 {
+                last_beat_ms = t_ms;
+                esp_println::println!(
+                    "probe: chain {} red, {} green, {} blue",
+                    PROBE_FIRST,
+                    PROBE_MIDDLE,
+                    PROBE_LAST
+                );
+            }
+            ticker.next().await;
+            continue;
+        }
+
+        if display_mode() == MODE_IDENTIFY {
             // Bring-up aid for `layout::LED_FOR_KEY`: light one chain position
             // at a time and log it, so the physical order can be read off the
             // device and written into the table. Walks the ring in step.
@@ -432,11 +475,11 @@ async fn led_render_task(
                 last_beat_ms = t_ms;
                 esp_println::println!("identify: key chain index {} / ring {}", step, ring_step);
             }
-            embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+            ticker.next().await;
             continue;
         }
 
-        if DEMO_WALK {
+        if display_mode() == MODE_DEMO {
             use openmicro_effects::demo;
             let (index, step) = demo::scene_at(t_ms);
             if last_demo_index != Some(index) {
@@ -453,7 +496,7 @@ async fn led_render_task(
                     glow.render(&frame.glow, t_ms);
                 }
             }
-            embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+            ticker.next().await;
             continue;
         }
 
@@ -531,7 +574,7 @@ async fn led_render_task(
             esp_println::println!("alive t={}ms link={:?}", t_ms, link);
         }
 
-        embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+        ticker.next().await;
     }
 }
 
@@ -563,29 +606,102 @@ fn touch_activity(now_ms: u32) {
 /// Not the user's configured brightness: that arrives with a frame, and these
 /// are exactly the states where no frame is arriving. Set moderate — these run
 /// unattended, possibly for days, and they are ambient rather than urgent.
-const LOCAL_BRIGHTNESS: u8 = 150;
+const LOCAL_BRIGHTNESS: u8 = 255;
 
-/// Bring-up aid: walk one LED at a time along each chain, logging the index, to
-/// establish `layout::LED_FOR_KEY`.
+/// What the display is doing. One of the `MODE_*` values below.
 ///
-/// Enable with `OPENMICRO_IDENTIFY=1 cargo build --release`. Off otherwise.
-const IDENTIFY_CHAIN_ORDER: bool = option_env!("OPENMICRO_IDENTIFY").is_some();
+/// Runtime state rather than a build flag, so the TUI can switch it on a device
+/// that is already flashed — asking someone to rebuild firmware to see a demo is
+/// not a feature. Set over USB-Serial-JTAG; see `serial_command_task`.
+static DISPLAY_MODE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(INITIAL_DISPLAY_MODE);
 
-/// Walk every state the board can show, on a timer.
+/// Show real state: host frames, or the local fallback animations.
+pub const MODE_NORMAL: u8 = 0;
+/// Walk every state the board can show. See `openmicro_effects::demo`.
+pub const MODE_DEMO: u8 = 1;
+/// Light one chain position at a time, logging its index, to establish
+/// `layout::LED_FOR_KEY`.
+pub const MODE_IDENTIFY: u8 = 2;
+/// Light three known chain positions in three fixed colours, and hold them.
 ///
-/// Only useful until the BLE server exists: the host-driven states (agent
-/// colours, the spinner, the decision row) are implemented and tested but have
-/// no way to arrive on real hardware yet, and this is the only way to see them.
-/// Off in shipped builds — a device inventing agent states it cannot know would
-/// be worse than one that admits it has nothing to show.
+/// Faster than [`MODE_IDENTIFY`] for the question that actually matters — which
+/// end of the chain is the top of the board — because it can be answered by
+/// looking once instead of watching thirteen steps go by.
+pub const MODE_PROBE: u8 = 3;
+
+/// Mode at boot. The env flags only seed it; the serial commands are the real
+/// interface, and a reset always returns to normal.
+const INITIAL_DISPLAY_MODE: u8 = if option_env!("OPENMICRO_DEMO").is_some() {
+    MODE_DEMO
+} else if option_env!("OPENMICRO_IDENTIFY").is_some() {
+    MODE_IDENTIFY
+} else {
+    MODE_NORMAL
+};
+
+fn display_mode() -> u8 {
+    DISPLAY_MODE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Apply a single-byte display-mode command.
 ///
-/// Enable with `OPENMICRO_DEMO=1 cargo build --release`. An env flag rather than
-/// editing this line, so a demo build is a command you can repeat and CI's
-/// default stays honest.
-const DEMO_WALK: bool = option_env!("OPENMICRO_DEMO").is_some();
+/// Whitespace is ignored so a line-buffered terminal, which sends a trailing
+/// newline, does not look like an unknown command.
+fn handle_serial_command(byte: u8) {
+    let mode = match byte {
+        b'n' | b'N' => MODE_NORMAL,
+        b'd' | b'D' => MODE_DEMO,
+        b'i' | b'I' => MODE_IDENTIFY,
+        b'p' | b'P' => MODE_PROBE,
+        b'\r' | b'\n' | b' ' | b'\t' => return,
+        other => {
+            esp_println::println!("mode: unknown command {:?} (want n, d or i)", other as char);
+            return;
+        }
+    };
+    DISPLAY_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
+    let name = match mode {
+        MODE_DEMO => "demo",
+        MODE_IDENTIFY => "identify",
+        MODE_PROBE => "probe",
+        _ => "normal",
+    };
+    esp_println::println!("mode: {}", name);
+}
+
+/// Read display-mode commands from USB-Serial-JTAG.
+///
+/// Only the RX half is taken. esp-println writes to the TX FIFO through raw
+/// register access rather than through this driver, so the two coexist — but it
+/// does mean the TX guard must not be dropped, or output stops.
+#[embassy_executor::task]
+async fn serial_command_task(
+    mut rx: esp_hal::usb_serial_jtag::UsbSerialJtagRx<'static, esp_hal::Blocking>,
+) {
+    esp_println::println!(
+        "mode: send 'd' demo, 'i' identify, 'p' probe, 'n' normal"
+    );
+    loop {
+        // Drain whatever arrived. `read_byte` is non-blocking, so this returns
+        // promptly and the poll interval below governs latency.
+        while let Ok(byte) = rx.read_byte() {
+            handle_serial_command(byte);
+        }
+        // 50 ms is imperceptible for a mode switch and costs nothing.
+        embassy_time::Timer::after_millis(50).await;
+    }
+}
+
+
 
 /// How long each LED stays lit in identify mode.
 const IDENTIFY_DWELL_MS: u32 = 1500;
+
+/// The three chain positions [`MODE_PROBE`] lights: both ends and the middle.
+const PROBE_FIRST: usize = 0;
+const PROBE_MIDDLE: usize = pins::PER_KEY_LED_COUNT / 2;
+const PROBE_LAST: usize = pins::PER_KEY_LED_COUNT - 1;
 
 /// `bool` to esp-hal's pin level.
 fn level_of(high: bool) -> esp_hal::gpio::Level {

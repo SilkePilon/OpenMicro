@@ -25,7 +25,9 @@ use crate::status::{self, Link};
 pub const SCENE_MS: u32 = 4000;
 
 /// Brightness the demo renders at.
-pub const DEMO_BRIGHTNESS: u8 = 150;
+/// Full scale. Output is gamma-encoded before it reaches the LEDs, so anything
+/// noticeably below this reads as dim on the real device.
+pub const DEMO_BRIGHTNESS: u8 = 255;
 
 /// What the board is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ fn many(sessions: &[(AgentKind, AgentState)], focus: usize) -> LedFrame {
     let (kind, state) = sessions[focus.min(sessions.len() - 1)];
     frame.glow = status::agent_glow(colors.for_kind(kind), state, DEMO_BRIGHTNESS);
     frame.actions = status::action_keys_for(Some(state));
+    frame.status = status::status_slot(colors.for_kind(kind), Some(state), DEMO_BRIGHTNESS);
     frame
 }
 
@@ -89,7 +92,7 @@ pub fn scene(index: usize) -> Step {
             scene: Scene::Host(one(AgentKind::Claude, AgentState::Thinking)),
         },
         4 => Step {
-            label: "Codex working — white, fast spin, stop key lit",
+            label: "Codex working — white, fast spin, stop key lit, status steady",
             scene: Scene::Host(one(AgentKind::Codex, AgentState::Working)),
         },
         5 => Step {
@@ -108,7 +111,7 @@ pub fn scene(index: usize) -> Step {
             )),
         },
         _ => Step {
-            label: "Claude waiting — ring alerts, approve/always/deny lit",
+            label: "Claude waiting — ring alerts, approve + deny lit, status flashing",
             scene: Scene::Host(one(AgentKind::Claude, AgentState::AwaitingApproval)),
         },
     }
@@ -200,7 +203,10 @@ mod tests {
     #[test]
     fn the_waiting_scene_lights_all_three_decision_keys() {
         let Scene::Host(f) = scene(7).scene else { panic!("scene 7 should be a host frame") };
-        assert!(f.actions.approve && f.actions.always && f.actions.deny);
+        assert!(f.actions.approve && f.actions.deny);
+        // The transparent-keycap light flashes in the agent's colour.
+        assert_eq!(f.status.color, AgentKind::Claude.brand());
+        assert_eq!(f.status.effect, openmicro_proto::Effect::Pulse);
         assert_eq!(f.glow.motion, Motion::Alert);
     }
 }

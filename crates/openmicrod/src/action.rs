@@ -17,8 +17,6 @@ use crate::session::SessionKey;
 pub enum Action {
     /// Allow the pending request once.
     Approve(SessionKey),
-    /// Allow it, and stop asking for this kind of request.
-    AlwaysApprove(SessionKey),
     /// Reject the pending request.
     Deny(SessionKey),
     /// Stop what the session is doing.
@@ -78,8 +76,9 @@ fn route_key(id: u8, view: &RouterView) -> Option<Action> {
                 .then(|| Action::Interrupt(key))
         }
         KeyRole::Approve => decide(view, Action::Approve),
-        KeyRole::Always => decide(view, Action::AlwaysApprove),
         KeyRole::Deny => decide(view, Action::Deny),
+        // An indicator, not a button.
+        KeyRole::Status => None,
     }
 }
 
@@ -120,8 +119,9 @@ mod tests {
         let press = |id| route(&InputEvent::Key { id, pressed: true }, &view);
 
         assert_eq!(press(layout::APPROVE_KEY), Some(Action::Approve(k.clone())));
-        assert_eq!(press(layout::ALWAYS_KEY), Some(Action::AlwaysApprove(k.clone())));
         assert_eq!(press(layout::DENY_KEY), Some(Action::Deny(k)));
+        // The transparent-keycap key is a status light, so it must never act.
+        assert_eq!(press(layout::STATUS_KEY), None);
     }
 
     #[test]

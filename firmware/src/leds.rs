@@ -109,6 +109,25 @@ impl<S: PixelOut> KeyChain<S> {
         self.flush();
     }
 
+    /// Light several chain positions at once, by raw chain index.
+    ///
+    /// One `flush` for the whole set, which matters more than it looks: a WS2812
+    /// latches only after the data line is held low for ~50 us, and building the
+    /// next frame takes less than that. Flushing once per position therefore had
+    /// the strip treat the later writes as continuation data for LEDs that do not
+    /// exist, and only the *first* write ever appeared — which made an earlier
+    /// three-colour probe show exactly one lit LED and nearly sent me chasing a
+    /// dead chain.
+    pub fn set_chain_indices(&mut self, lit: &[(usize, Rgb)]) {
+        self.pixels = [BLACK; pins::PER_KEY_LED_COUNT];
+        for (index, colour) in lit {
+            if let Some(px) = self.pixels.get_mut(*index) {
+                *px = *colour;
+            }
+        }
+        self.flush();
+    }
+
     pub fn blank(&mut self) {
         self.pixels = [BLACK; pins::PER_KEY_LED_COUNT];
         self.flush();
