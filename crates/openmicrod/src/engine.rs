@@ -8,10 +8,8 @@ use crate::focus::pick_owner;
 use crate::render::{render_frame, SlotView};
 use crate::session::{SessionKey, SessionStore};
 
-/// Upper bound on `sleep_minutes` (24h). Mirrored in the TUI's `adjust()`.
 pub(crate) const MAX_SLEEP_MINUTES: u32 = 1440;
 
-/// Assigns each session key a stable slot index, first-come-first-served.
 #[derive(Debug, Default)]
 pub struct Mapping {
     slots: HashMap<SessionKey, usize>,
@@ -41,9 +39,7 @@ pub struct Engine {
     pub pinned: Option<SessionKey>,
     pub brightness: u8,
     pub colors: AgentColors,
-    /// When true, `rerender` blanks the LEDs regardless of live sessions.
     pub asleep: bool,
-    /// Idle minutes before the daemon puts the LEDs to sleep (0 disables).
     pub sleep_minutes: u32,
 }
 
@@ -60,20 +56,15 @@ impl Engine {
         }
     }
 
-    /// Fields the caller needs to persist to config after a command.
     pub fn to_config_fields(&self) -> (u8, AgentColors, u32) {
         (self.brightness, self.colors, self.sleep_minutes)
     }
 
-    /// Put the LEDs to sleep: blank the device and mark the engine asleep.
-    /// Wired into the idle-sleep timer in the daemon.
     pub async fn sleep(&mut self, device: &mut dyn DeviceLink) {
         self.asleep = true;
         self.rerender(device).await;
     }
 
-    /// Wake the LEDs if asleep, re-rendering live state. Returns whether it woke.
-    /// Activity paths wake inline; this is the explicit-wake entry point.
     #[allow(dead_code)]
     pub async fn wake(&mut self, device: &mut dyn DeviceLink) -> bool {
         if !self.asleep {
@@ -84,9 +75,7 @@ impl Engine {
         true
     }
 
-    /// Apply a TUI command: update engine state and re-render to the device.
     pub async fn apply_command(&mut self, cmd: Command, device: &mut dyn DeviceLink) {
-        // Any command counts as activity: wake before showing live state.
         self.asleep = false;
         match cmd {
             Command::SetBrightness(b) => {
@@ -98,8 +87,6 @@ impl Engine {
                 self.rerender(device).await;
             }
             Command::SetSleepMinutes(m) => {
-                // Clamp to 24h: a stuck key (or a bogus Command) can't drive
-                // this arbitrarily high. Mirrored in the TUI's own adjust().
                 self.sleep_minutes = m.min(MAX_SLEEP_MINUTES);
                 self.rerender(device).await;
             }
@@ -113,7 +100,6 @@ impl Engine {
         state: AgentState,
         device: &mut dyn DeviceLink,
     ) {
-        // Any hook event counts as activity: wake so the rerender shows it.
         self.asleep = false;
         if state == AgentState::Idle {
             let key = SessionKey { agent: agent.to_string(), session: session.to_string() };
@@ -127,24 +113,17 @@ impl Engine {
         self.rerender(device).await;
     }
 
-    /// Which slot the ring and the bottom row are talking about.
-    ///
-    /// One definition, used both to render the frame and to route a press, so
-    /// the key that lights up and the session that gets approved cannot drift
-    /// apart.
     pub fn focus_slot(&self) -> Option<usize> {
         let owner = pick_owner(self.store.iter(), self.pinned.as_ref())?;
         self.mapping.slot_for(&owner)
     }
 
-    /// The selected session and its state.
     pub fn focused(&self) -> Option<(SessionKey, AgentState)> {
         let owner = pick_owner(self.store.iter(), self.pinned.as_ref())?;
         let state = self.store.iter().find(|s| s.key == owner)?.state;
         Some((owner, state))
     }
 
-    /// The frame the device should be showing right now.
     pub fn frame(&self) -> LedFrame {
         if self.asleep {
             return LedFrame::BLANK;
@@ -158,8 +137,6 @@ impl Engine {
         render_frame(&slots, self.focus_slot(), self.brightness, &self.colors)
     }
 
-    /// Read-only lookup of which session (key + state) occupies a given slot.
-    /// Used to build a `RouterView` for input routing.
     pub fn slot_lookup(&self) -> impl Fn(usize) -> Option<(SessionKey, AgentState)> + '_ {
         move |slot: usize| {
             self.store.iter().find_map(|s| {
@@ -172,9 +149,7 @@ impl Engine {
         }
     }
 
-    /// Execute a routed action against the engine + device.
     pub async fn apply_action(&mut self, action: Action, device: &mut dyn DeviceLink) {
-        // Physical input counts as activity: wake before applying.
         self.asleep = false;
         match action {
             Action::AdjustBrightness(delta) => {
@@ -182,7 +157,6 @@ impl Engine {
                 self.rerender(device).await;
             }
             Action::CycleFocus(dir) => {
-                // Live session keys ordered by their stable slot index.
                 let mut keyed: Vec<(usize, SessionKey)> = self
                     .store
                     .iter()
@@ -194,7 +168,6 @@ impl Engine {
                 }
                 let keys: Vec<SessionKey> = keyed.into_iter().map(|(_, k)| k).collect();
 
-                // Start from the pinned session if set, else the current owner.
                 let current = self
                     .pinned
                     .as_ref()
@@ -211,10 +184,6 @@ impl Engine {
                 self.rerender(device).await;
             }
             Action::FocusSlot(slot) => {
-                // Pin explicitly, so a deliberate press is not immediately
-                // overridden by the next session to report activity.
-                // Resolved into an owned key before assigning, so the borrow
-                // `slot_lookup` holds on `self` has ended.
                 let key = (self.slot_lookup())(slot).map(|(k, _)| k);
                 if let Some(key) = key {
                     self.pinned = Some(key);
@@ -224,20 +193,11 @@ impl Engine {
             Action::Approve(ref key)
             | Action::Deny(ref key)
             | Action::Interrupt(ref key) => {
-                // TODO(adapters): execute via per-agent control channel. The
-                // decision is routed and logged correctly; what is missing is a
-                // way to speak back to a running CLI, which needs one control
-                // channel per agent and is tracked separately.
                 eprintln!("openmicro: action {:?} on {}:{}", action, key.agent, key.session);
             }
         }
     }
 
-    /// Resend the current frame unchanged.
-    ///
-    /// The device treats a gap in frames as "the daemon is gone" and switches to
-    /// its own animation, so a daemon with nothing to report still has to say
-    /// so. See `openmicro_proto::HEARTBEAT_MS`.
     pub async fn heartbeat(&self, device: &mut dyn DeviceLink) {
         self.rerender(device).await;
     }
@@ -313,8 +273,6 @@ mod tests {
         let mut dev = MockDevice::new();
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
-        // claude:s1 got slot 0, and the key carries Claude's colour rather
-        // than a per-state one.
         assert_eq!(frame.slots[0].color, AgentKind::Claude.brand());
         assert_eq!(dev.writes, 1);
     }
@@ -326,8 +284,6 @@ mod tests {
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         engine.on_event("codex", "s2", AgentState::Thinking, &mut dev).await;
         let frame = dev.last_frame();
-        // Both are lit in their own agent's colour, so two sessions in
-        // different states are still told apart by *who* they are.
         assert_eq!(frame.slots[0].color, AgentKind::Claude.brand());
         assert_eq!(frame.slots[1].color, AgentKind::Codex.brand());
     }
@@ -344,7 +300,6 @@ mod tests {
         let frame = dev.last_frame();
         assert_eq!(frame.slots[0], openmicro_proto::LedSlot::OFF);
 
-        // A new session should be able to reuse slot 0 now that it was freed.
         engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
         let frame = dev.last_frame();
         assert_eq!(frame.slots[0].color, AgentKind::Codex.brand());
@@ -360,7 +315,6 @@ mod tests {
         engine.apply_action(Action::AdjustBrightness(16), &mut dev).await;
         assert_eq!(engine.brightness, 116);
         let frame = dev.last_frame();
-        // Both lit slots carry the new brightness.
         assert_eq!(frame.slots[0].brightness, 116);
         assert_eq!(frame.slots[1].brightness, 116);
     }
@@ -393,7 +347,6 @@ mod tests {
             assert_eq!(slot, openmicro_proto::LedSlot::OFF);
         }
 
-        // A hook event is activity: it wakes and re-lights the slot.
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         assert!(!engine.asleep);
         assert_eq!(dev.last_frame().slots[0].color, AgentKind::Claude.brand());
@@ -404,9 +357,9 @@ mod tests {
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
-        assert!(!engine.wake(&mut dev).await); // already awake
+        assert!(!engine.wake(&mut dev).await);
         engine.sleep(&mut dev).await;
-        assert!(engine.wake(&mut dev).await); // was asleep
+        assert!(engine.wake(&mut dev).await);
         assert!(!engine.asleep);
         assert_eq!(dev.last_frame().slots[0].color, AgentKind::Claude.brand());
     }
@@ -422,8 +375,6 @@ mod tests {
 
     #[tokio::test]
     async fn set_sleep_minutes_clamps_to_24h() {
-        // Fix 5: a stuck key (or a bogus Command) can't drive sleep_minutes
-        // arbitrarily high.
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
         engine.apply_command(Command::SetSleepMinutes(u32::MAX), &mut dev).await;
@@ -434,7 +385,6 @@ mod tests {
     async fn cycle_focus_pins_a_live_session() {
         let mut engine = Engine::new(255);
         let mut dev = MockDevice::new();
-        // claude:s1 -> slot 0, codex:s2 -> slot 1 (codex is the default owner).
         engine.on_event("claude", "s1", AgentState::Working, &mut dev).await;
         std::thread::sleep(std::time::Duration::from_millis(2));
         engine.on_event("codex", "s2", AgentState::Working, &mut dev).await;
@@ -443,7 +393,6 @@ mod tests {
         engine.apply_action(Action::CycleFocus(1), &mut dev).await;
 
         let pinned = engine.pinned.clone().expect("focus should be pinned");
-        // Owner started at codex:s2 (slot 1); +1 wraps to slot 0 = claude:s1.
         assert_eq!(pinned, SessionKey { agent: "claude".into(), session: "s1".into() });
         let snap = crate::control::snapshot(&engine, None);
         assert_eq!(snap.owner.as_deref(), Some("claude:s1"));

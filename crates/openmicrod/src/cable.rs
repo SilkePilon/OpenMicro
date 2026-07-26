@@ -1,13 +1,3 @@
-//! Driving the device over the USB cable.
-//!
-//! The transport that actually works. BLE needs a GATT server the firmware does
-//! not yet have; this needs only the USB-Serial-JTAG console the firmware already
-//! exposes for its logs, and it has no pairing to lose and no link to drop.
-//!
-//! Both directions share one byte stream with the firmware's log output, so
-//! everything is `wire`-framed (see `openmicro_proto::wire`) and the reader skips
-//! anything that is not a frame.
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,33 +8,22 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::device::DeviceLink;
 
-/// Serial ports the device might appear on, in order.
 fn candidate_ports() -> Vec<PathBuf> {
     (0..4).map(|i| PathBuf::from(format!("/dev/ttyACM{i}"))).collect()
 }
 
-/// The first candidate that exists.
 pub fn find_port() -> Option<PathBuf> {
     candidate_ports().into_iter().find(|p| p.exists())
 }
 
-/// A device reached over the cable.
 pub struct CableDevice {
     port: PathBuf,
-    /// Shared so the reader thread and the writer can hold the same handle: the
-    /// character device must be opened once, or the two halves fight over it.
     handle: Arc<Mutex<std::fs::File>>,
     last: LedFrame,
-    /// Frames that failed to write. Surfaced in logs rather than silently
-    /// dropped, because a cable that has come loose looks exactly like an idle
-    /// desk otherwise.
     pub write_errors: u64,
 }
 
 impl CableDevice {
-    /// Open the device and start reading input events.
-    ///
-    /// `input_tx` receives every decoded [`InputEvent`]; the daemon routes them.
     pub fn open(input_tx: UnboundedSender<InputEvent>) -> Result<Self, String> {
         let port = find_port().ok_or_else(|| "no serial port found".to_string())?;
         Self::open_at(&port, input_tx)
@@ -60,17 +39,6 @@ impl CableDevice {
             .open(port)
             .map_err(|e| format!("can't open {}: {e}", port.display()))?;
 
-        // Put the tty into raw mode before a single byte moves.
-        //
-        // This is not optional and it is not obvious. A tty in its default line
-        // discipline *rewrites the byte stream*: `ONLCR` turns every 0x0A into
-        // CRLF, `IXON` eats 0x11/0x13 as flow control, and `ICANON` holds input
-        // until a newline. ASCII mode commands survive all of that, which is
-        // exactly why the first version appeared to work — but a postcard-encoded
-        // frame contains 0x0A sooner or later, and every such frame was silently
-        // corrupted. The device simply never saw a valid frame.
-        // A plain file is not a tty, which only happens in tests; the framing is
-        // what those exercise, so a failure here is not fatal for them.
         if let Err(e) = make_raw(&file) {
             if port.to_string_lossy().starts_with("/dev/tty") {
                 return Err(e);
@@ -79,10 +47,6 @@ impl CableDevice {
 
         let handle = Arc::new(Mutex::new(file));
 
-        // A blocking thread rather than async: reads from a tty are blocking
-        // reads on a character device, and tokio's file I/O would use a blocking
-        // pool for them anyway. One dedicated thread is simpler and its
-        // lifetime is the daemon's.
         let reader_handle = handle.clone();
         std::thread::spawn(move || read_loop(reader_handle, input_tx));
 
@@ -94,28 +58,18 @@ impl CableDevice {
     }
 }
 
-/// Put a tty into raw mode: no input canonicalisation, no output translation,
-/// no flow control, no echo.
-///
-/// Reads return whatever is available rather than waiting for a line, which is
-/// what lets the reader thread make progress on partial frames.
 fn make_raw(file: &std::fs::File) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
     let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a live descriptor owned by `file` for the duration of this
-    // call, and `termios` is a plain POD struct that tcgetattr fully initialises
-    // before cfmakeraw/tcsetattr read it.
     unsafe {
         let mut tio: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut tio) != 0 {
             return Err("tcgetattr failed; is this a tty?".to_string());
         }
         libc::cfmakeraw(&mut tio);
-        // Return from `read` as soon as any byte is available, and never block
-        // indefinitely: the reader thread must stay responsive to shutdown.
         tio.c_cc[libc::VMIN] = 0;
-        tio.c_cc[libc::VTIME] = 1; // tenths of a second
+        tio.c_cc[libc::VTIME] = 1;
         if libc::tcsetattr(fd, libc::TCSANOW, &tio) != 0 {
             return Err("tcsetattr failed".to_string());
         }
@@ -123,7 +77,6 @@ fn make_raw(file: &std::fs::File) -> Result<(), String> {
     Ok(())
 }
 
-/// Read framed input events forever, discarding log text.
 fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputEvent>) {
     let mut reader = wire::Reader::new();
     let mut buf = [0u8; 256];
@@ -131,8 +84,6 @@ fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputE
         let read = {
             let mut file = match handle.lock() {
                 Ok(f) => f,
-                // The writer panicked while holding the lock; nothing useful is
-                // left to read from.
                 Err(_) => return,
             };
             file.read(&mut buf)
@@ -142,17 +93,10 @@ fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputE
             Ok(n) => {
                 for byte in &buf[..n] {
                     if reader.push(*byte) == wire::Feed::Frame {
-                        match InputEvent::decode(reader.frame()) {
-                            Ok(ev) => {
-                                // A closed receiver means the daemon is shutting
-                                // down, so stop rather than spin.
-                                if input_tx.send(ev).is_err() {
-                                    return;
-                                }
+                        if let Ok(ev) = InputEvent::decode(reader.frame()) {
+                            if input_tx.send(ev).is_err() {
+                                return;
                             }
-                            // Not an input event — the firmware may frame other
-                            // things later. Ignore rather than treat as fatal.
-                            Err(_) => {}
                         }
                     }
                 }
@@ -162,8 +106,6 @@ fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputE
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
-                // The device went away. Sleep rather than spin; the daemon's
-                // heartbeat writes will report the real problem.
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
@@ -220,8 +162,6 @@ impl DeviceLink for CableDevice {
             });
 
         if let Err(e) = result {
-            // Only the first failure is loud: a detached cable would otherwise
-            // print every heartbeat, forever.
             if self.write_errors == 0 {
                 eprintln!("openmicrod: cable write failed ({e}); is the device still plugged in?");
             }
@@ -241,7 +181,6 @@ mod tests {
     use super::*;
     use openmicro_proto::{AgentKind, Effect, LedSlot};
 
-    /// A frame with something in it, so encoding is not trivially empty.
     fn a_frame() -> LedFrame {
         let mut f = LedFrame::BLANK;
         f.brightness = 200;
@@ -256,9 +195,6 @@ mod tests {
 
     #[test]
     fn a_led_frame_fits_in_one_wire_frame() {
-        // The firmware's RX FIFO is 64 bytes and MAX_PAYLOAD is 96. If a frame
-        // ever outgrew the payload limit it would be silently undeliverable, so
-        // pin the actual size down.
         let payload = a_frame().encode().unwrap();
         assert!(
             payload.len() <= wire::MAX_PAYLOAD,
@@ -330,7 +266,6 @@ mod tests {
         assert_eq!(dev.write_errors, 0, "a writable file must not report errors");
         assert_eq!(dev.last_frame(), frame);
 
-        // And what landed on disk must decode back to the same frame.
         let bytes = std::fs::read(&path).unwrap();
         let mut reader = wire::Reader::new();
         let mut got = None;

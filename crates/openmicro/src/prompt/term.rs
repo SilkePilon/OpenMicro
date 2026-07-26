@@ -1,11 +1,3 @@
-//! Terminal plumbing: raw-mode guard, in-place frame redraw, key events.
-//!
-//! Everything impure lives here so the frame builders stay pure functions.
-//! The rendering model (see `docs/tui-style.md`) is append-only: no alternate
-//! screen, only the active prompt block is redrawn, via `ESC[{n}A` +
-//! `ESC[J` and then the whole frame in a single `write` — clearing rows one
-//! by one makes large prompts visibly flash.
-
 use std::io::{self, Write};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,20 +5,11 @@ use crossterm::terminal;
 
 use super::width::frame_rows;
 
-/// RAII guard for raw mode and (optionally) cursor visibility.
-///
-/// Constructed at the top of every interactive prompt. `Drop` runs on normal
-/// return, on `?`-propagated errors, and during panic unwinding, so the
-/// user's shell is never left wedged in raw mode with a hidden cursor.
-/// Restore errors are deliberately ignored — cleanup must never panic.
 pub(crate) struct RawGuard {
     cursor_hidden: bool,
 }
 
 impl RawGuard {
-    /// `hide_cursor` is true for clack prompts; the search prompt keeps the
-    /// real cursor visible (its caret is a fake `inverse(' ')`, and the
-    /// original tool never hides the cursor there).
     pub(crate) fn new(hide_cursor: bool) -> io::Result<RawGuard> {
         terminal::enable_raw_mode()?;
         if hide_cursor {
@@ -51,10 +34,6 @@ impl Drop for RawGuard {
     }
 }
 
-/// The redraw zone of the active prompt: remembers how many physical rows the
-/// previous frame occupied so the next draw can move up over exactly that
-/// region, and keeps the last frame so a resize can re-count its rows under
-/// the new width.
 pub(crate) struct FrameZone {
     rows: usize,
     last: Vec<String>,
@@ -68,10 +47,6 @@ impl FrameZone {
         }
     }
 
-    /// Erase the previous frame and write the new one in a single `write`.
-    /// Lines are terminated with `\r\n` because we are in raw mode; the
-    /// cursor ends at column 0 on the row just below the frame, which is
-    /// exactly where the erase sequence expects it next time.
     pub(crate) fn draw(
         &mut self,
         out: &mut impl Write,
@@ -93,25 +68,16 @@ impl FrameZone {
         Ok(())
     }
 
-    /// Re-count the previous frame's rows under a new terminal width. Called
-    /// on `Resize` before the next draw. This is best-effort — terminals that
-    /// reflow scrollback wrap the old frame themselves — but it keeps the
-    /// prompt itself intact, which is more than the original tool manages
-    /// (it ignores SIGWINCH and corrupts).
     pub(crate) fn resize(&mut self, columns: usize) {
         self.rows = frame_rows(&self.last, columns);
     }
 }
 
-/// Events an interactive prompt loop cares about.
 pub(crate) enum PromptEvent {
     Key(KeyEvent),
     Resize(usize),
 }
 
-/// Block for the next relevant event. Key releases are filtered out (they
-/// arrive on Windows and under the kitty keyboard protocol; acting on both
-/// press and release double-steps every keystroke).
 pub(crate) fn next_event() -> io::Result<PromptEvent> {
     loop {
         match crossterm::event::read()? {
@@ -122,9 +88,6 @@ pub(crate) fn next_event() -> io::Result<PromptEvent> {
     }
 }
 
-/// Esc or Ctrl-C. In raw mode Ctrl-C is an ordinary key event, not SIGINT,
-/// which is what lets prompts return `Cancelled` instead of killing the
-/// process mid-frame.
 pub(crate) fn is_cancel_key(k: &KeyEvent) -> bool {
     k.code == KeyCode::Esc
         || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
@@ -134,10 +97,6 @@ pub(crate) fn is_cancel_key(k: &KeyEvent) -> bool {
 mod tests {
     use super::*;
 
-    /// Sanity-check the erase maths without a terminal: a frame with a
-    /// wrapping line must record its *physical* rows, and a resize must
-    /// re-count them, because `ESC[{n}A` with a logical-line count leaves
-    /// ghost rows on narrow terminals.
     #[test]
     fn frame_zone_counts_wrapped_rows_and_recounts_on_resize() {
         let mut zone = FrameZone::new();

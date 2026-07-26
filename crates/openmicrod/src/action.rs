@@ -1,13 +1,3 @@
-//! Turning a key press into something that happens.
-//!
-//! The routing follows the layout's roles (see `openmicro_proto::layout`), so
-//! there is no second opinion about which key is "Deny":
-//!
-//! - **agent keys** (top two rows) select which session the ring and the action
-//!   row are talking about;
-//! - **the bottom row** decides the selected session's pending request;
-//! - the encoder adjusts brightness, and the joystick cycles the selection.
-
 use openmicro_proto::layout::{self, KeyRole};
 use openmicro_proto::{AgentState, InputEvent};
 
@@ -15,42 +5,24 @@ use crate::session::SessionKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Allow the pending request once.
     Approve(SessionKey),
-    /// Reject the pending request.
     Deny(SessionKey),
-    /// Stop what the session is doing.
     Interrupt(SessionKey),
-    /// Make this slot the selected one.
     FocusSlot(usize),
-    /// Change global brightness by this signed delta (clamped later).
     AdjustBrightness(i16),
-    /// Move the selection among live sessions (+1 / -1).
     CycleFocus(i8),
 }
 
-/// Read-only view the router needs.
 pub struct RouterView<'a> {
-    /// Which session (and its state) occupies a given agent slot.
     pub slot_session: &'a dyn Fn(usize) -> Option<(SessionKey, AgentState)>,
-    /// The currently selected session — what the ring is showing, and what the
-    /// bottom row acts on.
     pub focus: Option<(SessionKey, AgentState)>,
 }
 
 pub const BRIGHTNESS_STEP: i16 = 8;
 
-/// Map one input event to an action, or `None` if the press means nothing.
-///
-/// The bottom row only resolves while the selected session is actually waiting
-/// on a decision — which is also the only time those keys are lit. A press on a
-/// dark key doing nothing is the intended behaviour, not a gap: it keeps the
-/// lights and the semantics honest about each other.
 pub fn route(event: &InputEvent, view: &RouterView) -> Option<Action> {
     match *event {
         InputEvent::Key { id, pressed: true } => route_key(id, view),
-        // Releases carry no meaning; acting on both edges would double every
-        // decision.
         InputEvent::Key { pressed: false, .. } => None,
         InputEvent::Encoder { delta } => {
             Some(Action::AdjustBrightness(delta as i16 * BRIGHTNESS_STEP))
@@ -62,28 +34,21 @@ pub fn route(event: &InputEvent, view: &RouterView) -> Option<Action> {
 fn route_key(id: u8, view: &RouterView) -> Option<Action> {
     match layout::role_of(id)? {
         KeyRole::Agent(slot) => {
-            // Only a slot with something in it can be selected; selecting an
-            // empty key would silently blank the ring.
             (view.slot_session)(slot as usize)?;
             Some(Action::FocusSlot(slot as usize))
         }
         KeyRole::Reserved => None,
         KeyRole::Interrupt => {
-            // Only meaningful while there is work running — which is also the
-            // only time the key is lit.
             let (key, state) = view.focus.clone()?;
             matches!(state, AgentState::Thinking | AgentState::Working)
                 .then(|| Action::Interrupt(key))
         }
         KeyRole::Approve => decide(view, Action::Approve),
         KeyRole::Deny => decide(view, Action::Deny),
-        // An indicator, not a button.
         KeyRole::Status => None,
     }
 }
 
-/// Apply a bottom-row decision to the selected session, if it is waiting for
-/// one.
 fn decide(view: &RouterView, make: fn(SessionKey) -> Action) -> Option<Action> {
     let (key, state) = view.focus.clone()?;
     (state == AgentState::AwaitingApproval).then(|| make(key))
@@ -103,7 +68,6 @@ mod tests {
         move |i: usize| slots.get(i).cloned().flatten()
     }
 
-    /// One agent in slot 0, in `state`, and selected.
     fn focused_on(state: AgentState) -> (impl Fn(usize) -> Option<(SessionKey, AgentState)>, SessionKey) {
         let k = key("claude", "s1");
         (lookup(vec![Some((k.clone(), state))]), k)
@@ -120,14 +84,11 @@ mod tests {
 
         assert_eq!(press(layout::APPROVE_KEY), Some(Action::Approve(k.clone())));
         assert_eq!(press(layout::DENY_KEY), Some(Action::Deny(k)));
-        // The transparent-keycap key is a status light, so it must never act.
         assert_eq!(press(layout::STATUS_KEY), None);
     }
 
     #[test]
     fn the_bottom_row_does_nothing_when_no_decision_is_pending() {
-        // Matches the lights: those keys are dark unless something is waiting,
-        // so a press on them must not silently act.
         for state in [AgentState::Idle, AgentState::Thinking, AgentState::Working] {
             let (look, k) = focused_on(state);
             let view = RouterView { slot_session: &look, focus: Some((k, state)) };
@@ -192,9 +153,6 @@ mod tests {
 
     #[test]
     fn a_key_off_the_board_does_nothing() {
-        // The encoder press arrives as a reserved high id, and a wedged
-        // firmware could send anything at all. Neither may resolve to a
-        // decision.
         let (look, k) = focused_on(AgentState::AwaitingApproval);
         let view = RouterView {
             slot_session: &look,
@@ -219,7 +177,6 @@ mod tests {
 
     #[test]
     fn approve_and_deny_are_never_the_same_action() {
-        // A mix-up here approves what the user rejected, so pin it down.
         let (look, k) = focused_on(AgentState::AwaitingApproval);
         let view = RouterView {
             slot_session: &look,

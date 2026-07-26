@@ -1,31 +1,12 @@
-//! Turning live sessions into a frame for the device.
-//!
-//! The visual decisions all live in `openmicro_effects::status` — this module
-//! only decides *which* session each part of the board is talking about. That
-//! split matters: the firmware runs the same `status` code when the daemon is
-//! not there to ask, so there is exactly one definition of what amber means.
-
 use openmicro_effects::status;
 use openmicro_proto::{AgentColors, AgentKind, AgentState, LedFrame, LedSlot, SLOT_COUNT};
 
-/// One agent key's worth of state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotView {
     pub kind: AgentKind,
     pub state: AgentState,
 }
 
-/// Build a frame from per-slot sessions.
-///
-/// `focus` is the slot whose state the ring shows — normally the session that
-/// owns the deck (see `focus::pick_owner`). `None` for an empty slot.
-///
-/// Three things happen here, and they are independent on purpose:
-/// - each occupied agent key gets its agent's colour and its state's effect;
-/// - the ring gets the focused session's state, or a quiet "nothing running"
-///   breath when there is none;
-/// - the bottom row lights only if the focused session is actually waiting on a
-///   decision.
 pub fn render_frame(
     slots: &[Option<SlotView>; SLOT_COUNT],
     focus: Option<usize>,
@@ -40,9 +21,6 @@ pub fn render_frame(
         }
     }
 
-    // The ring follows the focused session. Falling back to "no agents" when
-    // focus is empty (rather than leaving the ring dark) is what makes a
-    // working-but-idle device distinguishable from a dead one.
     let focused = focus.and_then(|i| slots.get(i).copied().flatten());
     frame.glow = match focused {
         Some(view) => {
@@ -52,8 +30,6 @@ pub fn render_frame(
     };
 
     frame.actions = status::action_keys_for(focused.map(|v| v.state));
-    // The transparent-keycap light mirrors the focused session, so the one key
-    // that is readable from across the room says who is waiting.
     frame.status = match focused {
         Some(view) => {
             status::status_slot(colors.for_kind(view.kind), Some(view.state), brightness)
@@ -70,7 +46,6 @@ mod tests {
 
     use openmicro_proto::Glow;
 
-    /// The ring when the daemon has nothing to say yet.
     fn idle_glow(brightness: u8) -> Glow {
         status::no_agents_glow(brightness)
     }
@@ -93,8 +68,6 @@ mod tests {
 
     #[test]
     fn different_agents_in_the_same_state_are_different_colors() {
-        // This is the headline behaviour: the board tells you *who*, not just
-        // that something is busy.
         let mut slots = [None; SLOT_COUNT];
         slots[0] = view(AgentKind::Claude, AgentState::Working);
         slots[1] = view(AgentKind::Codex, AgentState::Working);
@@ -124,8 +97,6 @@ mod tests {
 
     #[test]
     fn no_sessions_still_shows_a_quiet_ring() {
-        // A device that goes fully dark when idle is indistinguishable from one
-        // that has crashed.
         let frame = render_frame(&[None; SLOT_COUNT], None, 255, &AgentColors::default());
         assert_ne!(frame.glow.motion, Motion::Off);
         assert!(frame.glow.brightness > 0);
@@ -156,21 +127,16 @@ mod tests {
 
         assert!(frame.actions.approve && frame.actions.deny);
         assert_eq!(frame.glow.motion, Motion::Alert);
-        // The waiting key itself is the only per-key animation, so it is
-        // findable among five busy neighbours.
         assert_eq!(frame.slots[0].effect, Effect::Pulse);
     }
 
     #[test]
     fn a_busy_but_unfocused_waiting_session_does_not_arm_the_row() {
-        // The action keys act on the *focused* session. Arming them for a
-        // session the ring is not showing would make the press ambiguous.
         let mut slots = [None; SLOT_COUNT];
         slots[0] = view(AgentKind::Claude, AgentState::Working);
         slots[1] = view(AgentKind::Grok, AgentState::AwaitingApproval);
         let frame = render_frame(&slots, Some(0), 255, &AgentColors::default());
         assert!(!frame.actions.any(), "armed for a session the ring is not showing");
-        // ...but slot 1's key still pulses, so you can see it is waiting.
         assert_eq!(frame.slots[1].effect, Effect::Pulse);
     }
 
@@ -200,17 +166,12 @@ mod tests {
         let frame = render_frame(&slots, Some(0), 255, &AgentColors::default());
         let keys = status::key_slots(&frame);
 
-        // The agent key carries Claude's colour...
         assert_eq!(keys[0].color, AgentKind::Claude.brand());
-        // ...the bottom row reads green, amber, red left to right...
         assert_eq!(keys[layout::APPROVE_KEY as usize].color, openmicro_proto::APPROVE_COLOR);
         assert_eq!(keys[layout::DENY_KEY as usize].color, openmicro_proto::DENY_COLOR);
-        // ...the transparent keycap flashes in Claude's colour...
         assert_eq!(keys[layout::STATUS_KEY as usize].color, AgentKind::Claude.brand());
         assert_eq!(keys[layout::STATUS_KEY as usize].effect, Effect::Pulse);
-        // ...nothing is running, so stop stays dark...
         assert_eq!(keys[layout::INTERRUPT_KEY as usize], LedSlot::OFF);
-        // ...and the unused keys stay dark.
         for id in layout::RESERVED_KEYS {
             assert_eq!(keys[id as usize], LedSlot::OFF, "reserved key {id} lit up");
         }

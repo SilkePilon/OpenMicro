@@ -1,142 +1,34 @@
-//! The physical key layout, and what each key is *for*.
-//!
-//! This is shared vocabulary rather than firmware-private detail: the daemon
-//! needs it to decide which keys to light and to route a press onto an action,
-//! and the firmware needs it to decide which LED to paint. Putting it in one
-//! place is what stops the two ends disagreeing about which key is "Deny".
-//!
-//! # Where these numbers come from
-//!
-//! Not guessed. Work Louder's shipping firmware embeds its own default
-//! `keymap.json`, and one of the profiles in it is an **agent** profile — the
-//! vendor's own take on exactly this use case:
-//!
-//! ```text
-//! "keymap": [
-//!   ["KV_OAI_AG00",  "KV_OAI_AG01"],
-//!   ["KV_OAI_AG02",  "KV_OAI_AG03",  "KV_OAI_AG04",  "KV_OAI_AG05"],
-//!   ["KV_OAI_ACT06", "KV_OAI_ACT07", "KV_OAI_ACT08", "KV_OAI_ACT09"],
-//!   ["KV_OAI_ACT10", "KV_OAI_ACT11", "KV_OAI_ACT12"]
-//! ]
-//! ```
-//!
-//! So the board is 13 keys in rows of **2, 4, 4, 3**, numbered row-major from
-//! the top left, and the vendor splits them into six `AG` (agent) keys and
-//! seven `ACT` (action) keys. That six is why [`crate::SLOT_COUNT`] is six.
-//!
-//! # The physical picture
-//!
-//! ```text
-//!         ┌────┐┌────┐
-//!         │  0 ││  1 │            row 0 — agent slots 0..1
-//!         └────┘└────┘
-//!   ┌────┐┌────┐┌────┐┌────┐
-//!   │  2 ││  3 ││  4 ││  5 │      row 1 — agent slots 2..5
-//!   └────┘└────┘└────┘└────┘
-//!   ┌────┐┌────┐┌────┐┌────┐
-//!   │  6 ││  7 ││  8 ││  9 │      row 2 — reserved, dark
-//!   └────┘└────┘└────┘└────┘
-//!   ┌────┐┌────┐┌────┐
-//!   │ 10 ││ 11 ││ 12 │            row 3 — Approve / Deny / Status
-//!   │ ✓  ││ ✗  ││ ◉  │            (12 = transparent keycap, agent colour)
-//!   └────┘└────┘└────┘
-//! ```
-//!
-//! Row 3 is the row opposite the dial. Its rightmost key carries the transparent
-//! keycap and shows the focused agent's colour; approve and deny sit immediately
-//! to its left.
-
-/// Mechanical switches on the board.
 pub const KEY_COUNT: usize = 13;
 
-/// Keys per row, top to bottom. Sums to [`KEY_COUNT`].
 pub const ROWS: [u8; 4] = [2, 4, 4, 3];
 
-/// Addressable underglow LEDs, in a ring.
 pub const UNDERGLOW_COUNT: usize = 8;
 
-/// Keys that show an agent slot, indexed by slot number.
 pub const AGENT_KEYS: [u8; 6] = [0, 1, 2, 3, 4, 5];
 
-/// Stop whatever the selected session is doing.
-///
-/// Row 2's leftmost key. It lives on its own row rather than in the bottom
-/// three because it answers a different question: the bottom row responds to a
-/// request the agent made, while this one interrupts work nobody asked about.
-/// Mixing it into the decision row would make "deny" and "stop" neighbours,
-/// which is one wrong press away from being annoying.
 pub const INTERRUPT_KEY: u8 = 6;
 
-/// Keys with no assigned meaning yet. Held dark on purpose: an unlit key reads
-/// as "nothing here", where a lit one invites a press that does nothing.
 pub const RESERVED_KEYS: [u8; 3] = [7, 8, 9];
 
-// The bottom row, left to right. This is the row opposite the dial, and its
-// rightmost key is the one with the clear keycap — approve and deny sit to the
-// *left* of that, which is what puts them under the fingers that reach there.
-//
-// Ordering approve then deny left-to-right, rather than the reverse, so the
-// safe answer is the one you reach first.
-
-/// Allow the pending action once. Bottom row, leftmost.
 pub const APPROVE_KEY: u8 = 10;
-/// Reject the pending action. Bottom row, middle.
 pub const DENY_KEY: u8 = 11;
 
-/// The focused agent's status light. Bottom row, rightmost.
-///
-/// This is the key with the **transparent keycap**, which passes far more light
-/// than the tinted ones — so it is the one key on the board that reads clearly
-/// from across a room, and it shows the focused agent's own colour. Approve and
-/// deny sit immediately to its left, which is what makes them findable without
-/// looking: you find the lit status key, and the decision keys are next to it.
-///
-/// An indicator, not a button. Pressing it does nothing.
 pub const STATUS_KEY: u8 = 12;
 
-/// The two decision keys, left to right.
 pub const ACTION_KEYS: [u8; 2] = [APPROVE_KEY, DENY_KEY];
 
-/// Chain position of the LED under a given key.
-///
-/// **This is the one number here that is not confirmed.** Everything else came
-/// out of the vendor's keymap; the order the WS2812 chain is physically routed
-/// in did not, because nothing in their image states it — the strip is written
-/// as a flat array and the wiring is a PCB fact.
-///
-/// **The chain runs backwards relative to the key numbering.** Measured on the
-/// device, not assumed: with an identity map, the keys the firmware believed were
-/// the bottom row lit up along the top, and a probe holding chain index 0 lit the
-/// bottom-right key — the one with the transparent keycap, which is the *last*
-/// key in row-major order. So chain position `i` is key `KEY_COUNT - 1 - i`.
-///
-/// The first attempt here was identity, on the reasoning that a board numbered
-/// row-major is probably wired row-major. It is not, and nothing in the vendor
-/// image says so either way; only looking at the hardware settled it.
-///
-/// To re-check after any board revision: build with `OPENMICRO_IDENTIFY=1`, which
-/// lights one chain position at a time and logs its index.
 pub const LED_FOR_KEY: [u8; KEY_COUNT] = [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
 
-/// What a key means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
-    /// Shows, and focuses, agent slot `n`.
     Agent(u8),
-    /// Stops the selected session.
     Interrupt,
-    /// No meaning yet.
     Reserved,
     Approve,
     Deny,
-    /// The transparent-keycap indicator. Shows the focused agent, not an action.
     Status,
 }
 
-/// One of the three bottom-row decision keys.
-///
-/// Split out from [`KeyRole`] so code that only ever deals with the action row
-/// does not have to handle `Agent`/`Reserved` cases that cannot occur there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionRole {
     Approve,
@@ -144,7 +36,6 @@ pub enum ActionRole {
 }
 
 impl ActionRole {
-    /// The key id this role sits on.
     pub const fn key(self) -> u8 {
         match self {
             Self::Approve => APPROVE_KEY,
@@ -152,7 +43,6 @@ impl ActionRole {
         }
     }
 
-    /// Its backlight colour.
     pub const fn color(self) -> crate::Rgb {
         match self {
             Self::Approve => crate::APPROVE_COLOR,
@@ -160,14 +50,9 @@ impl ActionRole {
         }
     }
 
-    /// Bottom row, left to right.
     pub const ALL: [ActionRole; 2] = [Self::Approve, Self::Deny];
 }
 
-/// The role of a key id, or `None` if it is off the board.
-///
-/// Total over `0..KEY_COUNT` by construction — the exhaustiveness test below
-/// keeps it that way if the rows are ever renumbered.
 pub const fn role_of(key: u8) -> Option<KeyRole> {
     match key {
         0..=5 => Some(KeyRole::Agent(key)),
@@ -180,7 +65,6 @@ pub const fn role_of(key: u8) -> Option<KeyRole> {
     }
 }
 
-/// The (row, column) a key sits at, for laying out a preview in the TUI.
 pub const fn row_col(key: u8) -> Option<(u8, u8)> {
     let mut row = 0;
     let mut first = 0u8;
@@ -195,7 +79,6 @@ pub const fn row_col(key: u8) -> Option<(u8, u8)> {
     None
 }
 
-/// Rows sum to the key count, and the LED table covers every key exactly once.
 const _: () = {
     let mut total = 0;
     let mut i = 0;
@@ -205,8 +88,6 @@ const _: () = {
     }
     assert!(total == KEY_COUNT, "ROWS must account for every key");
 
-    // A duplicated or out-of-range LED index would leave one key permanently
-    // dark and another double-driven, which is maddening to debug by eye.
     let mut i = 0;
     while i < KEY_COUNT {
         assert!((LED_FOR_KEY[i] as usize) < KEY_COUNT, "LED index off the chain");
@@ -243,20 +124,12 @@ mod tests {
 
     #[test]
     fn the_bottom_row_is_the_three_action_keys() {
-        // The user-facing promise: bottom row, left to right, is
-        // approve / always / deny. If a renumbering breaks that, the labels on
-        // a physical device silently become wrong.
         let bottom_row_start = KEY_COUNT as u8 - ROWS[3];
         assert_eq!(bottom_row_start, APPROVE_KEY, "approve starts the bottom row");
-        // Left to right: approve, deny, then the transparent-keycap status
-        // light. The decision keys are the two immediately left of it.
         assert_eq!(role_of(ACTION_KEYS[0]), Some(KeyRole::Approve));
         assert_eq!(role_of(ACTION_KEYS[1]), Some(KeyRole::Deny));
         assert_eq!(role_of(STATUS_KEY), Some(KeyRole::Status));
-        // The transparent keycap is the rightmost key on the board...
         assert_eq!(STATUS_KEY, KEY_COUNT as u8 - 1);
-        // ...and it is the first position along the LED chain, which is how the
-        // chain's direction was established.
         assert_eq!(LED_FOR_KEY[STATUS_KEY as usize], 0);
     }
 

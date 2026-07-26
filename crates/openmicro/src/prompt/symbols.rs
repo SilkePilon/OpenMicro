@@ -1,13 +1,4 @@
-//! Glyph sets, matching the symbol table in `docs/tui-style.md`.
-//!
-//! Unicode is used unless `TERM=linux` — that is the *whole* fallback
-//! condition (mirroring `npx skills add` on Unix), so keep any smarter
-//! detection out of here. The ASCII column follows the spec table exactly,
-//! including its two deliberate non-ASCII entries (`—` for the bar end and
-//! `•` for info) because that is what clack itself ships.
-
-/// One glyph set. Static borrows keep frame builders allocation-free for
-/// symbols and make the table trivially comparable against the spec in tests.
+#[allow(dead_code)]
 pub struct Symbols {
     pub step_active: &'static str,
     pub step_submit: &'static str,
@@ -28,7 +19,6 @@ pub struct Symbols {
     pub corner_top_right: &'static str,
     pub connect_left: &'static str,
     pub corner_bottom_right: &'static str,
-    // Inline glyphs of the hand-rolled search prompt.
     pub cursor: &'static str,
     pub expanded: &'static str,
     pub collapsed: &'static str,
@@ -40,38 +30,35 @@ pub struct Symbols {
 }
 
 pub(crate) static UNICODE: Symbols = Symbols {
-    step_active: "◆",           // U+25C6
-    step_submit: "◇",           // U+25C7
-    step_cancel: "■",           // U+25A0
-    step_error: "▲",            // U+25B2
-    bar_start: "┌",             // U+250C
-    bar: "│",                   // U+2502
-    bar_end: "└",               // U+2514
-    bar_h: "─",                 // U+2500
-    radio_active: "●",          // U+25CF
-    radio_inactive: "○",        // U+25CB
-    checkbox_selected: "◼",     // U+25FC
-    checkbox_empty: "◻",        // U+25FB
-    info: "●",                  // U+25CF
-    success: "◆",               // U+25C6
-    warn: "▲",                  // U+25B2
-    error: "■",                 // U+25A0
-    corner_top_right: "╮",      // U+256E
-    connect_left: "├",          // U+251C
-    corner_bottom_right: "╯",   // U+256F
-    cursor: "❯",                // U+276F
-    expanded: "▾",              // U+25BE
-    collapsed: "▸",             // U+25B8
-    partial: "◐",               // U+25D0
-    bullet: "•",                // U+2022
-    ellipsis: "…",              // U+2026
-    arrow_up: "↑",              // U+2191
-    arrow_down: "↓",            // U+2193
+    step_active: "◆",
+    step_submit: "◇",
+    step_cancel: "■",
+    step_error: "▲",
+    bar_start: "┌",
+    bar: "│",
+    bar_end: "└",
+    bar_h: "─",
+    radio_active: "●",
+    radio_inactive: "○",
+    checkbox_selected: "◼",
+    checkbox_empty: "◻",
+    info: "●",
+    success: "◆",
+    warn: "▲",
+    error: "■",
+    corner_top_right: "╮",
+    connect_left: "├",
+    corner_bottom_right: "╯",
+    cursor: "❯",
+    expanded: "▾",
+    collapsed: "▸",
+    partial: "◐",
+    bullet: "•",
+    ellipsis: "…",
+    arrow_up: "↑",
+    arrow_down: "↓",
 };
 
-/// `TERM=linux` fallback. The search-prompt glyphs below the spec table have
-/// no specced ASCII forms; these stand-ins keep the layout aligned (all are
-/// single-cell except `ellipsis`, whose callers pad by content anyway).
 pub(crate) static ASCII: Symbols = Symbols {
     step_active: "*",
     step_submit: "o",
@@ -114,9 +101,6 @@ pub(crate) fn set(unicode: bool) -> &'static Symbols {
 mod tests {
     use super::*;
 
-    /// Assert every Unicode glyph by codepoint against the spec table, so a
-    /// lookalike glyph (e.g. U+25C8 for U+25C6) cannot sneak in via
-    /// copy-paste.
     #[test]
     fn unicode_glyphs_match_spec_codepoints() {
         let cp = |s: &str| s.chars().next().unwrap() as u32;

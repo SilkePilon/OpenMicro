@@ -1,7 +1,6 @@
 use openmicro_proto::Rgb;
 use serde::Deserialize;
 
-/// Small preset palette the config panel cycles through for per-state colors.
 pub const PALETTE: [Rgb; 6] = [
     Rgb { r: 255, g: 255, b: 255 },
     Rgb { r: 255, g: 0, b: 0 },
@@ -27,25 +26,18 @@ pub struct SnapshotDto {
     pub battery: Option<u8>,
     #[serde(default)]
     pub charging: bool,
-    /// Live LED brightness from the daemon. `#[serde(default)]` so a snapshot
-    /// from an older daemon build (before Fix 1) still parses; falls back to
-    /// the historical UI default (200) rather than 0.
     #[serde(default = "default_brightness")]
     pub brightness: u8,
-    /// Live per-state LED colors from the daemon, same default rationale.
     #[serde(default)]
     pub colors: openmicro_proto::AgentColors,
-    /// Live idle-sleep minutes from the daemon, same default rationale.
     #[serde(default = "default_sleep_minutes")]
     pub sleep_minutes: u32,
 }
 
-/// Matches the historical hardcoded UI default (`ConfigUiState::new(200)`).
 fn default_brightness() -> u8 {
     200
 }
 
-/// Matches the historical hardcoded UI default (`ConfigUiState`'s `sleep_minutes: 3`).
 fn default_sleep_minutes() -> u32 {
     3
 }
@@ -90,7 +82,6 @@ mod tests {
 
     #[test]
     fn battery_defaults_when_absent() {
-        // Older daemon snapshots omit battery/charging entirely.
         let line = r#"{"sessions":[],"owner":null}"#;
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.battery, None);
@@ -99,9 +90,6 @@ mod tests {
 
     #[test]
     fn config_fields_default_when_absent() {
-        // Fix 1: older daemon snapshots (or a stale build) omit brightness/
-        // colors/sleep_minutes entirely; parsing must still succeed and fall
-        // back to the current UI defaults rather than erroring.
         let line = r#"{"sessions":[],"owner":null}"#;
         let snap = parse_snapshot(line).unwrap();
         assert_eq!(snap.brightness, 200);
@@ -111,8 +99,6 @@ mod tests {
 
     #[test]
     fn parses_config_fields_when_present() {
-        // The daemon now carries the live config in every snapshot; the TUI
-        // seeds its config panel from these instead of hardcoded constants.
         let line = r#"{"sessions":[],"owner":null,"brightness":77,
             "colors":{"claude":{"r":9,"g":8,"b":7},"codex":{"r":230,"g":230,"b":230},
             "grok":{"r":160,"g":60,"b":255},"other":{"r":120,"g":120,"b":120}},
@@ -125,9 +111,6 @@ mod tests {
 
     #[test]
     fn a_snapshot_from_an_older_daemon_still_parses() {
-        // A stale daemon sends the retired per-state palette. The TUI must fall
-        // back to the default agent colours rather than refusing the snapshot
-        // and reporting the device as unreachable.
         let line = r#"{"sessions":[],"owner":null,"brightness":77,
             "colors":{"idle":{"r":0,"g":0,"b":0},"working":{"r":0,"g":200,"b":80}},
             "sleep_minutes":42}"#;
@@ -143,8 +126,6 @@ mod tests {
 
     #[test]
     fn rejects_malformed_json() {
-        // Valid JSON, but the wrong shape (`sessions` must be an array of
-        // objects): deserialization fails and the `None` path is exercised.
         assert!(parse_snapshot(r#"{"sessions":"nope"}"#).is_none());
     }
 }

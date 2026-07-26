@@ -68,14 +68,12 @@ before showing you the menu.
 
 **Set up my macropad** is the guided path, and does the whole job in order:
 
-1. Explains that this replaces the vendor firmware, and that going back needs a
-   backup you take first.
+1. Explains that this replaces the vendor firmware, and how to go back.
 2. Finds the device over USB and Bluetooth.
 3. Skips ahead if it's already running OpenMicro firmware.
 4. Reboots it into bootloader mode — by asking the firmware, not by holding a
    button. See [Bootloader mode](#bootloader-mode).
-5. Offers to back up the stock firmware, then downloads or builds an image and
-   writes it.
+5. Downloads or builds an image and writes it.
 6. Detects your coding agents and wires up the ones you tick.
 
 The other entries do the same things individually: **Watch agent activity** is a
@@ -95,6 +93,7 @@ Each supported agent has an adapter in [`adapters/`](adapters/).
 | [Claude Code](adapters/claude-code/install.md) | Lifecycle hooks, event JSON on stdin |
 | [Codex CLI](adapters/codex/install.md)        | The `notify` program                 |
 | [Grok Code](adapters/grok-code/install.md)     | Claude-compatible hooks              |
+| [opencode](adapters/opencode/install.md)      | A plugin in its plugin directory     |
 
 **Coding agents** in the menu lists the ones found on this machine, pre-ticks
 those that are installed but not yet wired, and installs the ones you pick.
@@ -193,12 +192,7 @@ bootloader mode it shows up on USB as `303a:1001`; running its firmware it is
 
 Straightforward: Work Louder publish their firmware openly, as unencrypted
 merged images. **Firmware → Restore the stock firmware** lists every published
-vendor version and writes the one you pick. No backup required.
-
-**Firmware → Back up the stock firmware** is still worth doing before you flash
-if you want your device's *exact* image, settings and all, rather than a stock
-one — it dumps all 4 MiB to `~/.local/share/openmicro/`, and restore offers it
-alongside the vendor releases.
+vendor version and writes the one you pick. Nothing has to be saved beforehand.
 
 ## Configuration
 
@@ -231,6 +225,23 @@ Layout: `crates/openmicro-proto` (shared types, `no_std`),
 `crates/openmicrod` (daemon), `crates/openmicro` (the TUI),
 `crates/openmicro-hook` (agent shim), `firmware/` (ESP32-S3), `adapters/` (per-agent
 integration docs), `packaging/` (install scripts and the systemd unit).
+
+The source itself carries no comments. Everything a comment would have said —
+design decisions, hardware facts, protocol contracts, and the bug behind each
+workaround — lives in `docs/`, one document per component:
+
+| Document                                       | Covers                                        |
+| ---------------------------------------------- | --------------------------------------------- |
+| [docs/tui.md](docs/tui.md)                     | `crates/openmicro` — menus, flashing, adapters |
+| [docs/daemon.md](docs/daemon.md)               | `crates/openmicrod` and `crates/openmicro-hook` |
+| [docs/protocol.md](docs/protocol.md)           | `crates/openmicro-proto` — wire format, layout |
+| [docs/effects.md](docs/effects.md)             | `crates/openmicro-effects` — LED animation     |
+| [docs/firmware.md](docs/firmware.md)           | `firmware/` — pins, tasks, serial commands     |
+| [docs/led-design.md](docs/led-design.md)       | What the lights mean                           |
+| [docs/tui-style.md](docs/tui-style.md)         | The prompt toolkit's visual spec               |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | When something does not work              |
+
+Editing code means editing its document too — that is where the reasoning is now.
 
 ## License
 

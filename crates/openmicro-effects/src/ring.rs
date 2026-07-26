@@ -1,114 +1,45 @@
-//! Animations for the 8-LED underglow ring.
-//!
-//! The ring is the device's status line. Where the per-key LEDs answer "which
-//! agent, and what is it doing", the ring answers the one question you want
-//! from across the desk: *does this need me?*
-//!
-//! Every motion has a distinct **shape**, not merely a distinct speed:
-//!
-//! | Motion      | Shape                          | Means                        |
-//! |-------------|--------------------------------|------------------------------|
-//! | `Breath`    | whole ring swells together     | calm; nothing is running     |
-//! | `Spin`      | a comet travels round          | something is running         |
-//! | `Alert`     | sharp double-blink             | a decision is waiting on you |
-//! | `Aurora`    | slow cool multi-hue drift      | no host at all               |
-//! | `Searching` | one dim dot orbiting slowly    | host up, daemon down         |
-//!
-//! Shape rather than speed because two of these are never on screen at the
-//! same time, so there is nothing to compare a speed against. A swell and a
-//! travelling dot are told apart in one glance with no reference.
-//!
-//! All of it is a pure function of `(t_ms, index)`, so it renders identically
-//! on the host and on the device and can be tested without either.
-
 use openmicro_proto::{Glow, Motion, Rgb, NOMINAL_SPEED};
 
 use crate::{hsv_to_rgb, scale, triangle};
 
-/// One full revolution of the `Spin` comet at nominal speed.
 const SPIN_PERIOD_MS: u32 = 1200;
-/// How far the comet's tail trails behind its head, in LEDs.
 const SPIN_TAIL_LEDS: u32 = 3;
 
-/// One `Breath` swell at nominal speed.
 const BREATH_PERIOD_MS: u32 = 3400;
-/// Floor of the breath, as a percent of full — it dips, it does not blink.
 const BREATH_MIN_PCT: u32 = 25;
 
-/// The `Alert` cycle: two quick flashes, then a gap.
 const ALERT_PERIOD_MS: u32 = 1100;
 const ALERT_FLASH_MS: u32 = 90;
 const ALERT_GAP_MS: u32 = 110;
 
-/// One revolution of the `Searching` dot — deliberately slow and patient.
 const SEARCH_PERIOD_MS: u32 = 4200;
 const SEARCH_TAIL_LEDS: u32 = 1;
-/// The dot is a background hint, not a notification.
 const SEARCH_MAX_PCT: u32 = 70;
 
-/// One `Aurora` drift.
 const AURORA_PERIOD_MS: u32 = 9000;
-/// Aurora stays in the cool band: cyan through to blue. Warm hues are reserved
-/// for things that want attention, and "no host" does not.
-///
-/// The upper bound stops at 168 rather than running further into the blues
-/// because the hue wheel turns violet at 172 — and violet reads as *warm*
-/// again, with red climbing back above green. A test asserts the band never
-/// crosses that line.
 const AURORA_HUE_MIN: u32 = 112;
 const AURORA_HUE_MAX: u32 = 168;
-/// Aurora never goes fully dark — it is ambient, so it keeps a floor.
 const AURORA_MIN_PCT: u32 = 50;
 
-/// Sub-LED resolution for the travelling motions.
-///
-/// Positions are tracked in 1/256ths of an LED so a comet on an 8-LED ring
-/// glides instead of stepping between eight discrete places, which at these
-/// speeds is very visible.
 const SUB: u32 = 256;
 
-/// Scale a nominal period by a [`Glow::speed`], where [`NOMINAL_SPEED`] leaves
-/// it unchanged and 255 roughly halves it.
-///
-/// Saturating at 1 ms keeps the callers' modulo arithmetic safe no matter what
-/// arrives over the wire.
 fn period_for(nominal_ms: u32, speed: u8) -> u32 {
     let speed = speed.max(1) as u32;
     ((nominal_ms * NOMINAL_SPEED as u32) / speed).max(1)
 }
 
-/// How far in front of the head an LED starts to light, in LEDs.
-///
-/// Without this the comet is **choppy**, and not subtly so. The head advances in
-/// fractions of an LED, but an LED in front of it used to sit at weight 0 until
-/// the head crossed it, at which point its distance wrapped from "almost a whole
-/// revolution behind" to zero and it snapped straight to full brightness. The
-/// trailing edge faded smoothly; the leading edge was a hard step, so a
-/// revolution read as `count` discrete jumps rather than a glide.
-///
-/// One LED of lead-in is enough: the rise and the fall then meet at the head, so
-/// the profile is continuous the whole way round.
 const COMET_LEAD_LEDS: u32 = 1;
 
-/// Brightness of a comet LED: 255 at the head, ramping up ahead of it and
-/// fading out behind it.
-///
-/// `head` is in [`SUB`]ths of an LED.
 fn comet_weight(index: usize, count: usize, head: u32, tail_leds: u32) -> u8 {
     let span = count as u32 * SUB;
     let at = index as u32 * SUB;
-    // How far this LED sits *behind* the head, going the way the comet travels.
     let behind = (head + span - at) % span;
     let tail = (tail_leds * SUB).max(1);
     let lead = (COMET_LEAD_LEDS * SUB).min(span / 2).max(1);
 
     if behind <= tail {
-        // In the tail: brightest at the head, fading away behind it.
         (255 - (behind * 255) / tail) as u8
     } else {
-        // In front of the head. `span - behind` is how far ahead it is, so it
-        // brightens as the head closes in and reaches 255 exactly where the
-        // trailing branch starts.
         let ahead = span - behind;
         if ahead <= lead {
             (255 - (ahead * 255) / lead) as u8
@@ -118,13 +49,11 @@ fn comet_weight(index: usize, count: usize, head: u32, tail_leds: u32) -> u8 {
     }
 }
 
-/// Where the head of a travelling motion is at `t_ms`, in [`SUB`]ths of an LED.
 fn head_at(t_ms: u32, period_ms: u32, count: usize) -> u32 {
     let span = count as u32 * SUB;
     ((t_ms % period_ms) as u64 * span as u64 / period_ms as u64) as u32
 }
 
-/// Percent-of-full brightness for the `Alert` double-blink at `t_ms`.
 fn alert_level(t_ms: u32, period_ms: u32) -> u8 {
     let phase = t_ms % period_ms;
     let second_flash = ALERT_FLASH_MS + ALERT_GAP_MS;
@@ -135,10 +64,6 @@ fn alert_level(t_ms: u32, period_ms: u32) -> u8 {
     }
 }
 
-/// Render the whole ring for `glow` at `t_ms` into `out`.
-///
-/// `out` may be any length; the motions scale to it, so an 8-LED ring and a
-/// hypothetical 12-LED one both look right. Nothing is allocated.
 pub fn frame(glow: &Glow, t_ms: u32, out: &mut [Rgb]) {
     let count = out.len();
     if count == 0 {
@@ -180,16 +105,11 @@ pub fn frame(glow: &Glow, t_ms: u32, out: &mut [Rgb]) {
         }
 
         Motion::Aurora => {
-            // Ignores `glow.color` on purpose: this is the state where there is
-            // no host, so there is no agent whose colour it could be.
             let period = period_for(AURORA_PERIOD_MS, glow.speed);
             let span = AURORA_HUE_MAX - AURORA_HUE_MIN;
             for (i, px) in out.iter_mut().enumerate() {
-                // Offsetting each LED's phase by a fraction of the period is
-                // what makes it drift around the ring rather than pulse as one.
                 let phase = t_ms.wrapping_add((i as u32 * period) / count as u32);
                 let hue = AURORA_HUE_MIN + (triangle(phase, period) as u32 * span) / 255;
-                // A second, faster wave keeps it shimmering while it drifts.
                 let shimmer = triangle(phase.wrapping_mul(2), period);
                 let level = envelope(glow.brightness, shimmer, AURORA_MIN_PCT);
                 *px = hsv_to_rgb(hue as u8, 255, level);
@@ -208,12 +128,10 @@ pub fn frame(glow: &Glow, t_ms: u32, out: &mut [Rgb]) {
     }
 }
 
-/// `a * b / 255`, for composing two 0..=255 brightness factors.
 fn mul(a: u8, b: u8) -> u8 {
     ((a as u16 * b as u16) / 255) as u8
 }
 
-/// Map a 0..=255 wave onto `min_pct%..100%` of `ceiling`.
 fn envelope(ceiling: u8, wave: u8, min_pct: u32) -> u8 {
     let max = ceiling as u32;
     let min = (max * min_pct) / 100;
@@ -253,8 +171,6 @@ mod tests {
     #[test]
     fn off_and_zero_brightness_are_both_dark() {
         assert_eq!(total(&render(&glow(Motion::Off, 255), 500)), 0);
-        // Brightness 0 must win even for a motion that would otherwise light
-        // up, or "sleep" would not actually turn the ring off.
         for motion in [Motion::Breath, Motion::Spin, Motion::Alert, Motion::Aurora, Motion::Searching] {
             assert_eq!(total(&render(&glow(motion, 0), 500)), 0, "{motion:?} at brightness 0");
         }
@@ -281,7 +197,6 @@ mod tests {
         let trough = render(&g, 0);
         let peak = render(&g, BREATH_PERIOD_MS / 2);
         assert!(total(&peak) > total(&trough), "the swell must actually swell");
-        // A breath that reaches zero reads as a blink, which is Alert's job.
         assert!(total(&trough) > 0, "breath bottomed out at zero");
     }
 
@@ -291,7 +206,6 @@ mod tests {
         let lit = lit_count(&px);
         assert!(lit > 0, "the comet has to be somewhere");
         assert!(lit < COUNT, "a comet that lights everything is just Breath");
-        // Tail plus the one-LED lead-in that keeps the leading edge smooth.
         let widest = (SPIN_TAIL_LEDS + COMET_LEAD_LEDS) as usize;
         assert!(lit <= widest, "comet spans {lit} LEDs, wider than {widest}");
     }
@@ -300,8 +214,6 @@ mod tests {
     fn spin_travels_all_the_way_round_and_returns() {
         let g = glow(Motion::Spin, 255);
         let start = render(&g, 0);
-        // Every LED must be the brightest one at some point in a revolution,
-        // or part of the ring is dead.
         let mut was_head = [false; COUNT];
         for step in 0..SPIN_PERIOD_MS {
             let px = render(&g, step);
@@ -319,8 +231,6 @@ mod tests {
     #[test]
     fn spin_head_is_brighter_than_its_tail() {
         let px = render(&glow(Motion::Spin, 255), 0);
-        // At t=0 the head sits on LED 0 and the tail trails backwards round the
-        // ring, so the last LEDs are the dim end.
         let head = px[0].r as u32;
         let behind = px[COUNT - 1].r as u32;
         assert!(head > behind, "head {head} should lead tail {behind}");
@@ -329,8 +239,6 @@ mod tests {
     #[test]
     fn alert_is_two_sharp_flashes_then_a_gap() {
         let g = glow(Motion::Alert, 255);
-        // Sampled across one cycle, it must be fully on twice and fully off in
-        // between — a double-tap, not a fade.
         assert!(total(&render(&g, 0)) > 0, "first flash");
         assert_eq!(total(&render(&g, ALERT_FLASH_MS + 10)), 0, "gap between flashes");
         assert!(total(&render(&g, ALERT_FLASH_MS + ALERT_GAP_MS + 10)) > 0, "second flash");
@@ -339,8 +247,6 @@ mod tests {
 
     #[test]
     fn alert_spends_most_of_its_cycle_dark() {
-        // The rest between double-taps is what makes it read as urgent rather
-        // than as a strobe. Verify the duty cycle is genuinely low.
         let g = glow(Motion::Alert, 255);
         let lit = (0..ALERT_PERIOD_MS).filter(|t| total(&render(&g, *t)) > 0).count();
         let duty = lit * 100 / ALERT_PERIOD_MS as usize;
@@ -358,14 +264,12 @@ mod tests {
 
     #[test]
     fn aurora_is_cool_hued_and_ignores_the_slot_color() {
-        // It runs when there is no host, so there is no agent colour to honour.
         let mut warm = glow(Motion::Aurora, 255);
         warm.color = Rgb { r: 255, g: 0, b: 0 };
         let mut cool = glow(Motion::Aurora, 255);
         cool.color = Rgb { r: 0, g: 255, b: 0 };
         assert_eq!(render(&warm, 1234), render(&cool, 1234), "aurora must ignore colour");
 
-        // And it must actually look cool: blue/green dominant, never red.
         for t in [0, 900, 3000, 5500, 8999] {
             for p in render(&warm, t) {
                 assert!(
@@ -378,7 +282,6 @@ mod tests {
 
     #[test]
     fn aurora_varies_around_the_ring_rather_than_pulsing_as_one() {
-        // The per-LED phase offset is the whole reason it reads as a drift.
         let px = render(&glow(Motion::Aurora, 255), 2000);
         assert!(px.iter().any(|p| *p != px[0]), "aurora is uniform, so it is not drifting");
     }
@@ -397,8 +300,6 @@ mod tests {
         let px = render(&g, 0);
         assert_eq!(lit_count(&px), 1, "searching should be one dot");
 
-        // And dimmer than a notification would be, so it stays a background
-        // hint rather than demanding attention.
         let alert = render(&glow(Motion::Alert, 255), 0);
         assert!(
             total(&px) * 2 < total(&alert),
@@ -410,8 +311,6 @@ mod tests {
 
     #[test]
     fn searching_is_slower_than_spin() {
-        // The two are both travelling motions, so speed is what separates
-        // "working on it" from "looking for the daemon".
         assert!(SEARCH_PERIOD_MS > SPIN_PERIOD_MS * 2);
     }
 
@@ -420,12 +319,10 @@ mod tests {
         let mut fast = glow(Motion::Spin, 255);
         fast.speed = 255;
         let slow = glow(Motion::Spin, 255);
-        // At double speed the comet is twice as far round at the same instant.
         let half = SPIN_PERIOD_MS / 4;
         let fast_px = render(&fast, half);
         let slow_px = render(&slow, half);
         assert_ne!(fast_px, slow_px, "speed had no effect");
-        // Shape is preserved: still a comet of the same width, just further round.
         let widest = (SPIN_TAIL_LEDS + COMET_LEAD_LEDS) as usize;
         assert!(lit_count(&fast_px) <= widest);
         assert!(lit_count(&slow_px) <= widest);
@@ -435,7 +332,7 @@ mod tests {
     fn a_zero_speed_does_not_divide_by_zero() {
         let mut g = glow(Motion::Spin, 255);
         g.speed = 0;
-        let _ = render(&g, 999); // must not panic
+        let _ = render(&g, 999);
         for motion in [Motion::Breath, Motion::Alert, Motion::Aurora, Motion::Searching] {
             g.motion = motion;
             let _ = render(&g, 999);
@@ -447,8 +344,6 @@ mod tests {
         for motion in [Motion::Breath, Motion::Spin, Motion::Alert, Motion::Searching] {
             let dim = glow(motion, 40);
             let bright = glow(motion, 255);
-            // Sample across a cycle: the dim version must never out-shine the
-            // bright one at the same instant.
             for t in (0..SEARCH_PERIOD_MS).step_by(37) {
                 assert!(
                     total(&render(&dim, t)) <= total(&render(&bright, t)),
@@ -458,18 +353,10 @@ mod tests {
         }
     }
 
-    /// The render tick the firmware actually uses.
     const FRAME_MS: u32 = 16;
 
     #[test]
     fn travelling_motions_glide_rather_than_step() {
-        // The regression this pins down: the comet used to anti-alias only its
-        // trailing edge, so each LED snapped from off to full as the head
-        // crossed it and a revolution read as eight visible jumps. Sampled at
-        // the real frame rate, no single LED may lurch.
-        //
-        // A full LED step is 255; at ~6 frames per LED a smooth ramp moves ~42
-        // per frame, so 90 catches a snap while leaving headroom for rounding.
         const MAX_JUMP: i32 = 90;
         for (motion, period) in
             [(Motion::Spin, SPIN_PERIOD_MS), (Motion::Searching, SEARCH_PERIOD_MS)]
@@ -497,16 +384,12 @@ mod tests {
 
     #[test]
     fn the_comet_brightens_before_the_head_reaches_an_led() {
-        // The leading ramp: an LED just in front of the head must already be
-        // partly lit, which is what removes the step.
         let span = COUNT as u32 * SUB;
-        // Head half an LED short of LED 1.
         let head = SUB / 2;
         let w = comet_weight(1, COUNT, head, SPIN_TAIL_LEDS);
         assert!(w > 0, "LED ahead of the head is still dark, so it will snap on");
         assert!(w < 255, "it should not be at full brightness before the head arrives");
 
-        // ...and it must be continuous across the head itself.
         let just_before = comet_weight(1, COUNT, SUB - 1, SPIN_TAIL_LEDS);
         let exactly_on = comet_weight(1, COUNT, SUB, SPIN_TAIL_LEDS);
         assert!(
@@ -518,9 +401,6 @@ mod tests {
 
     #[test]
     fn comet_weight_wraps_around_the_ring_seam() {
-        // A comet whose head has just passed LED 0 must still light LED 7.
-        // Getting the modulo wrong here shows up as the tail vanishing once per
-        // revolution, which is easy to miss and awful to look at.
         let head = 0;
         assert_eq!(comet_weight(0, COUNT, head, 3), 255, "head is full brightness");
         assert!(comet_weight(COUNT - 1, COUNT, head, 3) > 0, "tail must cross the seam");

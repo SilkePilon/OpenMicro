@@ -4,16 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
-    /// No device: render into memory. Useful for testing the daemon alone.
     Mock,
-    /// USB cable, over the firmware's USB-Serial-JTAG console.
-    ///
-    /// The default, and the only transport that currently reaches real hardware:
-    /// the firmware's BLE GATT server is still a sketch, so `Ble` cannot deliver
-    /// a frame. Cable also needs no pairing and cannot drop out mid-session.
     #[default]
     Cable,
-    /// Bluetooth LE. Requires a firmware GATT server, which does not exist yet.
     Ble,
 }
 
@@ -51,8 +44,6 @@ impl Config {
         toml::from_str(s)
     }
 
-    /// Serialize to TOML and write atomically: write to a temp file in the same
-    /// directory, then rename over the target (rename is atomic on the same fs).
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
 
@@ -132,8 +123,6 @@ mod tests {
 
     #[test]
     fn transport_defaults_to_cable() {
-        // Cable, not BLE: it is the only transport that currently reaches real
-        // hardware, and it needs no pairing.
         assert_eq!(Config::from_toml_str("").unwrap().transport, Transport::Cable);
         assert_eq!(Config::from_toml_str("brightness = 80").unwrap().transport, Transport::Cable);
     }
@@ -167,8 +156,6 @@ mod tests {
 
     #[test]
     fn a_config_from_an_older_build_still_loads() {
-        // Before colour meant "which agent", this table held per-state keys. A
-        // user upgrading must not lose their brightness because of it.
         let old = "brightness = 42\n\n[colors]\nidle = { r = 0, g = 0, b = 0 }\n\
                    working = { r = 0, g = 200, b = 80 }\n";
         let back = Config::from_toml_str(old).unwrap();

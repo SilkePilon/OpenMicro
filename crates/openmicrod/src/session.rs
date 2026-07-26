@@ -10,10 +10,6 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
-    /// Which agent this is, for colouring.
-    ///
-    /// Derived from the name the hook reported rather than stored, so it cannot
-    /// drift out of step with `agent`.
     pub fn kind(&self) -> AgentKind {
         AgentKind::from_name(&self.agent)
     }
@@ -61,7 +57,6 @@ impl SessionStore {
         key
     }
 
-    /// Used by tests; part of the store's read API.
     #[allow(dead_code)]
     pub fn get(&self, key: &SessionKey) -> Option<&Session> {
         self.sessions.get(key)

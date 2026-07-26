@@ -1,34 +1,14 @@
-//! Taking OpenMicro back off the machine.
-//!
-//! Deliberately itemised rather than a single "remove everything" button: the
-//! stock-firmware backup is the *only* route back to the vendor firmware, and
-//! the agent hooks live inside config files the user owns. Both deserve a
-//! separate, informed yes.
-//!
-//! [`survey`] answers "what is actually here", so the UI can offer only the
-//! things that exist and say how big each one is; [`remove`] does the work and
-//! reports per-target outcomes.
-
 use std::path::{Path, PathBuf};
 
-/// One removable piece of an OpenMicro installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
-    /// The systemd user unit (stopped and disabled first).
     Service,
-    /// `openmicrod`, `openmicro`, `openmicro-hook` in `~/.local/bin`.
     Binaries,
-    /// Hook entries inside each coding agent's own config file.
     AgentHooks,
-    /// `~/.config/openmicro` — settings and the first-run marker.
     Config,
-    /// Downloaded firmware images, in `~/.cache/openmicro` and
-    /// `~/.local/share/openmicro`.
     Cache,
 }
 
-/// Every target, in the order they should be offered and removed. Service first
-/// so nothing is holding files open.
 pub const ALL_TARGETS: [Target; 5] = [
     Target::Service,
     Target::Binaries,
@@ -38,7 +18,6 @@ pub const ALL_TARGETS: [Target; 5] = [
 ];
 
 impl Target {
-    /// Short label for the picker.
     pub fn label(self) -> &'static str {
         match self {
             Target::Service => "Background service",
@@ -49,13 +28,10 @@ impl Target {
         }
     }
 
-    /// Whether this is selected by default in the picker. Everything here can be
-    /// put back by reinstalling, so everything is.
     pub fn default_selected(self) -> bool {
         true
     }
 
-    /// Stable id used as the multiselect value.
     pub fn id(self) -> &'static str {
         match self {
             Target::Service => "service",
@@ -66,28 +42,21 @@ impl Target {
         }
     }
 
-    /// Parse an id back into a target.
     pub fn from_id(id: &str) -> Option<Target> {
         ALL_TARGETS.into_iter().find(|t| t.id() == id)
     }
 }
 
-/// What a target looks like on this machine right now.
 #[derive(Debug, Clone)]
 pub struct Found {
     pub target: Target,
-    /// False when there is nothing to remove.
     pub present: bool,
-    /// Paths (or config files) that would be touched.
     pub paths: Vec<PathBuf>,
-    /// Extra context for the picker hint, e.g. a size or a warning.
     pub detail: String,
 }
 
-/// The three binaries `packaging/install.sh` puts in `~/.local/bin`.
 pub const BINARIES: [&str; 3] = ["openmicrod", "openmicro", "openmicro-hook"];
 
-/// Inspect the machine and describe every target.
 pub fn survey(home: &Path) -> Vec<Found> {
     ALL_TARGETS.into_iter().map(|t| survey_one(t, home)).collect()
 }
@@ -145,7 +114,6 @@ fn survey_one(target: Target, home: &Path) -> Found {
     }
 }
 
-/// The directories a plain directory target owns.
 fn cache_dirs_of(target: Target, home: &Path) -> Vec<PathBuf> {
     match target {
         Target::Cache => {
@@ -155,7 +123,6 @@ fn cache_dirs_of(target: Target, home: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// Describe a plain directory target.
 fn dir_target(target: Target, dirs: Vec<PathBuf>, when_present: &str) -> Found {
     let present = dirs.iter().any(|d| d.exists());
     Found {
@@ -166,23 +133,13 @@ fn dir_target(target: Target, dirs: Vec<PathBuf>, when_present: &str) -> Found {
     }
 }
 
-/// The outcome of removing one target.
 #[derive(Debug, Clone)]
 pub struct Removed {
     pub target: Target,
-    /// Lines to show the user.
     pub lines: Vec<String>,
-    /// Set when the target could not be fully removed.
     pub error: Option<String>,
 }
 
-/// Remove the chosen targets, in [`ALL_TARGETS`] order regardless of the order
-/// they were selected in — the service has to go first so nothing is holding
-/// the binaries open.
-///
-/// Best-effort per target: one failure does not abort the rest, and every
-/// outcome is reported, so the UI can never claim a clean uninstall it did not
-/// achieve.
 pub fn remove(chosen: &[Target], home: &Path) -> Vec<Removed> {
     let mut ordered: Vec<Target> =
         ALL_TARGETS.into_iter().filter(|t| chosen.contains(t)).collect();
@@ -196,13 +153,9 @@ fn remove_one(target: Target, home: &Path) -> Removed {
 
     match target {
         Target::Service => {
-            // Ask systemd to stop and forget it before the unit file goes, so
-            // it does not linger as a failed unit until the next daemon-reload.
             if crate::daemon::have_systemctl() {
                 match crate::daemon::systemctl("disable") {
                     Ok(_) => lines.push("service disabled".to_string()),
-                    // Not installed / not enabled is a perfectly fine state to
-                    // be uninstalling from.
                     Err(e) => lines.push(format!("disable: {e}")),
                 }
                 let _ = crate::daemon::stop();
@@ -272,8 +225,6 @@ fn remove_one(target: Target, home: &Path) -> Removed {
     Removed { target, lines, error }
 }
 
-/// Remove a file or directory. `Ok(false)` means it was not there to begin
-/// with, which is a success for our purposes, not an error.
 fn remove_path(path: &Path) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
@@ -286,7 +237,6 @@ fn remove_path(path: &Path) -> Result<bool, String> {
     result.map(|_| true).map_err(|e| format!("cannot remove {}: {e}", path.display()))
 }
 
-/// One-line summary of a completed uninstall.
 pub fn summarise(results: &[Removed]) -> String {
     let failed = results.iter().filter(|r| r.error.is_some()).count();
     match (results.len(), failed) {
@@ -300,7 +250,6 @@ pub fn summarise(results: &[Removed]) -> String {
 mod tests {
     use super::*;
 
-    /// A scratch `$HOME` that cleans itself up.
     struct TempHome(PathBuf);
 
     impl TempHome {
@@ -353,7 +302,7 @@ mod tests {
         let home = TempHome::new("empty");
         for found in survey(home.path()) {
             if found.target == Target::Service {
-                continue; // depends on the real machine's unit file
+                continue;
             }
             assert!(!found.present, "{:?} should be absent: {found:?}", found.target);
         }
@@ -390,13 +339,11 @@ mod tests {
 
         assert!(!home.path().join(".local/bin/openmicro").exists());
         assert!(!home.path().join(".cache/openmicro").exists());
-        // Not selected, so it must survive.
         assert!(home.path().join(".config/openmicro/config.toml").exists());
     }
 
     #[test]
     fn remove_runs_in_a_safe_order_regardless_of_selection_order() {
-        // The service must be handled first so nothing holds the binaries open.
         let home = TempHome::new("order");
         let results = remove(&[Target::Cache, Target::Service, Target::Binaries], home.path());
         let order: Vec<Target> = results.iter().map(|r| r.target).collect();

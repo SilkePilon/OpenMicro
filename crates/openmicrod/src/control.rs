@@ -23,19 +23,10 @@ pub struct SnapSession {
 pub struct Snapshot {
     pub sessions: Vec<SnapSession>,
     pub owner: Option<String>,
-    /// Battery percentage (0..=100) when known, else None (e.g. mock transport).
     pub battery: Option<u8>,
-    /// Whether the device reports charging. Often unknown over plain BLE
-    /// Battery Service, in which case it is false.
     pub charging: bool,
-    /// Live LED brightness (0..=255). Carried so the TUI config panel can seed
-    /// itself from the daemon's real config instead of a hardcoded UI default
-    /// (Fix 1 of the final-branch review: opening `[c]` used to show/clobber
-    /// the wrong values).
     pub brightness: u8,
-    /// Live per-state LED colors, for the same reason.
     pub colors: openmicro_proto::AgentColors,
-    /// Live idle-sleep threshold in minutes (0 disables), for the same reason.
     pub sleep_minutes: u32,
 }
 
@@ -75,13 +66,6 @@ pub fn snapshot(engine: &Engine, battery: Option<openmicro_proto::Battery>) -> S
     }
 }
 
-/// Persist the given brightness + colors to config, preserving the on-disk
-/// transport (and any other) fields by loading the current config first.
-///
-/// This performs blocking synchronous filesystem I/O (read + write + rename),
-/// so it must NOT be called while any engine/device lock is held. Callers
-/// capture the fields to persist, drop their guards, and then invoke this.
-/// Best-effort: errors are logged, not propagated.
 fn persist(brightness: u8, colors: openmicro_proto::AgentColors, sleep_minutes: u32) {
     persist_to(&crate::config::default_path(), brightness, colors, sleep_minutes);
 }
@@ -141,7 +125,6 @@ pub async fn serve(
         };
         let (read_half, mut write_half) = stream.into_split();
 
-        // Snapshot writer: 1/sec.
         let engine_w = engine.clone();
         let battery_w = battery.clone();
         tokio::spawn(async move {
@@ -161,7 +144,6 @@ pub async fn serve(
             }
         });
 
-        // Command reader: newline-JSON `Command`s from the client.
         let engine_r = engine.clone();
         let device_r = device.clone();
         let persist_tx = persist_tx.clone();
@@ -172,7 +154,6 @@ pub async fn serve(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                // Lock order: engine -> device (mirrors ingress).
                 {
                     let mut eng = engine_r.lock().await;
                     let mut dev = device_r.lock().await;
@@ -204,9 +185,6 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_carries_live_config() {
-        // Fix 1: the snapshot must reflect the engine's real brightness/colors/
-        // sleep_minutes, not a UI-side default, so the TUI config panel can seed
-        // itself from the daemon instead of hardcoded constants.
         let mut engine = Engine::new(77);
         let mut dev = MockDevice::new();
         engine

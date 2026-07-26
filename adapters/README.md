@@ -27,7 +27,8 @@ Any integration just needs to run, on a lifecycle transition:
 openmicro-hook push --agent <name> --session <id> --state <state>
 ```
 
-- `--agent` — a short stable name for the agent (`claude`, `codex`, `grok`, …).
+- `--agent` — a short stable name for the agent (`claude`, `codex`, `grok`,
+  `opencode`, …).
   It groups a tool's sessions on the macropad.
 - `--session` — a stable id for the conversation/session. Reuse the same id for
   the life of a session so its macropad slot stays put. If the agent gives you
@@ -73,6 +74,7 @@ these and call `push` directly.
 | [Claude Code](./claude-code/install.md) | Hooks, JSON on stdin (`claude-hook`)   | Confirmed                          |
 | [Codex CLI](./codex/install.md)         | `notify` program (`codex-notify`)      | Confirmed                          |
 | [Grok Code](./grok-code/install.md)     | Claude-compatible hooks, JSON on stdin | Confirmed mechanism; see caveats   |
+| [opencode](./opencode/install.md)       | Plugin file in its plugin directory    | Confirmed against opencode 1.17    |
 
 ## Verifying any adapter
 

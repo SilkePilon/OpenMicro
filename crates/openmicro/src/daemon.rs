@@ -1,38 +1,20 @@
-//! Talking to (and about) the `openmicrod` background service.
-//!
-//! Two independent questions, deliberately kept apart because they disagree
-//! more often than you would expect:
-//!
-//! * **Is it running?** Answered by connecting to the control socket. That is
-//!   the only thing that actually matters to the rest of the app, and it is
-//!   true whether the daemon was started by systemd, by hand, or from a
-//!   different session.
-//! * **Is it installed as a service?** Answered by looking for the systemd user
-//!   unit. This is what decides whether "start it for me" is even on offer.
-
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Name of the systemd user unit that runs the daemon.
 pub const UNIT: &str = "openmicrod.service";
 
-/// Unit file location relative to `$HOME`, when `$XDG_CONFIG_HOME` is unset.
 pub const UNIT_REL: &str = ".config/systemd/user/openmicrod.service";
 
-/// How long to wait for the socket to appear after asking systemd to start.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long to wait for the socket to disappear after asking systemd to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where the daemon publishes its control socket.
 pub fn socket_path() -> PathBuf {
     openmicro_proto::paths::control_socket()
 }
 
-/// Path of the systemd user unit, honouring `$XDG_CONFIG_HOME`.
 pub fn unit_path() -> PathBuf {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir).join("systemd/user").join(UNIT),
@@ -40,23 +22,14 @@ pub fn unit_path() -> PathBuf {
     }
 }
 
-/// True when something is listening on `path`.
-///
-/// Takes the path rather than reading the environment so it is testable without
-/// mutating process-wide state. A stale socket file left behind by a crashed
-/// daemon does not count: this connects rather than stats, so only a live
-/// listener answers.
 pub fn is_socket_live(path: &std::path::Path) -> bool {
     UnixStream::connect(path).is_ok()
 }
 
-/// True when something is listening on the control socket.
 pub fn is_running() -> bool {
     is_socket_live(&socket_path())
 }
 
-/// The error shown when the daemon cannot be started because no service is
-/// installed. Pure, so the wording is pinned by a test.
 fn missing_unit_error(unit: &std::path::Path) -> String {
     format!(
         "no systemd user unit at {}. Run packaging/install.sh from an OpenMicro \
@@ -65,18 +38,14 @@ fn missing_unit_error(unit: &std::path::Path) -> String {
     )
 }
 
-/// True when the systemd user unit is installed.
 pub fn unit_installed() -> bool {
     unit_path().is_file()
 }
 
-/// True when systemd is usable at all (it is not, in a container or on a
-/// non-systemd distro, and the UI should say so rather than offering to fail).
 pub fn have_systemctl() -> bool {
     crate::flash::which(&["systemctl"]).is_some()
 }
 
-/// Everything the UI needs to describe the daemon in one line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Status {
     pub running: bool,
@@ -85,7 +54,6 @@ pub struct Status {
 }
 
 impl Status {
-    /// One-line human summary.
     pub fn describe(&self) -> String {
         match (self.running, self.unit_installed, self.enabled) {
             (true, _, true) => "running, starts on login".to_string(),
@@ -96,7 +64,6 @@ impl Status {
     }
 }
 
-/// Read the daemon's current status.
 pub fn status() -> Status {
     Status {
         running: is_running(),
@@ -105,7 +72,6 @@ pub fn status() -> Status {
     }
 }
 
-/// True when the unit is enabled to start at login.
 fn is_enabled() -> bool {
     if !have_systemctl() {
         return false;
@@ -117,7 +83,6 @@ fn is_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Run one `systemctl --user <verb> openmicrod.service` and return its output.
 pub fn systemctl(verb: &str) -> Result<Vec<String>, String> {
     if !have_systemctl() {
         return Err(
@@ -142,12 +107,6 @@ pub fn systemctl(verb: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Start the daemon and wait until it is actually answering.
-///
-/// `systemctl start` returning success only means systemd forked it; the
-/// socket is what the rest of the app depends on, so that is what we wait for.
-/// Reporting success before the socket exists would make the very next screen
-/// show "disconnected".
 pub fn start() -> Result<Vec<String>, String> {
     if is_running() {
         return Ok(vec!["daemon is already running.".to_string()]);
@@ -172,7 +131,6 @@ pub fn start() -> Result<Vec<String>, String> {
     ))
 }
 
-/// Stop the daemon.
 pub fn stop() -> Result<Vec<String>, String> {
     if !is_running() && !unit_installed() {
         return Ok(vec!["daemon is not running.".to_string()]);
@@ -180,7 +138,6 @@ pub fn stop() -> Result<Vec<String>, String> {
     systemctl("stop")
 }
 
-/// Enable the unit so it starts on login, and start it now.
 pub fn enable() -> Result<Vec<String>, String> {
     if !unit_installed() {
         return Err(format!("no systemd user unit at {}.", unit_path().display()));
@@ -190,22 +147,10 @@ pub fn enable() -> Result<Vec<String>, String> {
     Ok(log)
 }
 
-/// Stop the daemon and stop it starting at login.
 pub fn disable() -> Result<Vec<String>, String> {
     systemctl("disable")
 }
 
-/// Run `job` with the daemon stopped, then start it again.
-///
-/// The daemon holds the device's serial port for as long as it is up, and two
-/// readers on one character device split the byte stream between them. Anything
-/// that talks to the device directly has to have the port to itself, so this
-/// stands the daemon down for the duration and puts it back afterwards.
-///
-/// A daemon that was not running is left alone — including afterwards, so this
-/// never *starts* a service the user had deliberately stopped. Restarting is
-/// best-effort: `job`'s result is what matters, and a failure to bring the
-/// daemon back is appended to the log rather than masking it.
 pub fn with_paused<T>(job: impl FnOnce() -> Result<T, String>) -> Result<(T, Vec<String>), String> {
     if !is_running() {
         return job().map(|value| (value, Vec::new()));
@@ -232,10 +177,6 @@ pub fn with_paused<T>(job: impl FnOnce() -> Result<T, String>) -> Result<(T, Vec
     result.map(|value| (value, log))
 }
 
-/// Wait for the socket to go away after asking systemd to stop.
-///
-/// `systemctl stop` returns once systemd is satisfied, which is not quite the
-/// same instant the daemon's file descriptors are closed.
 fn wait_until_stopped() {
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
@@ -246,7 +187,6 @@ fn wait_until_stopped() {
     }
 }
 
-/// Restart the daemon, waiting for the socket again.
 pub fn restart() -> Result<Vec<String>, String> {
     let mut log = systemctl("restart")?;
     let deadline = Instant::now() + START_TIMEOUT;
@@ -279,9 +219,6 @@ mod tests {
 
     #[test]
     fn running_is_decided_by_connecting_not_by_a_leftover_socket_file() {
-        // A crashed daemon leaves the socket file behind. A stat-based check
-        // would call that "running" and every later screen would then show a
-        // disconnected daemon it thought was up.
         let dir = std::env::temp_dir().join(format!("openmicro-daemon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

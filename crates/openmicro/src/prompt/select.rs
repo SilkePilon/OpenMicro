@@ -1,21 +1,9 @@
-//! The clack `select` and `confirm` prompts.
-//!
-//! Frames are pure functions over `(options, cursor, window)` so layout and
-//! palette can be asserted byte-for-byte in tests; the event loops at the
-//! bottom are the only impure code. Palette per spec: cyan gutter while the
-//! prompt is live, gray once committed — getting that split wrong is the most
-//! visible way to diverge from `npx skills add`.
-
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::render::{gutter, Theme};
 use super::term::{is_cancel_key, next_event, FrameZone, PromptEvent, RawGuard};
 use super::{Cancelled, SelectOption, Ui};
 
-/// Clack's sliding window: sticky until the cursor nears an edge, then
-/// scrolls just enough. The magic numbers are clack's own — scroll begins
-/// once `cursor >= start + max_items - 3` going down, `cursor < start + 2`
-/// going up — and the spec pins them, so do not "fix" the asymmetry.
 pub(crate) fn clack_window_start(
     prev: usize,
     cursor: usize,
@@ -34,10 +22,6 @@ pub(crate) fn clack_window_start(
     }
 }
 
-/// One option row in the clack palette. Active: green radio, underlined
-/// label (spec: "active row label — underline (not recoloured)"), dim
-/// parenthesised hint. Inactive: everything dim, hint omitted — clack only
-/// shows the hint on the row the cursor is on.
 fn option_row(t: &Theme, label: &str, hint: Option<&str>, active: bool) -> String {
     if active {
         let hint = hint
@@ -57,9 +41,6 @@ fn option_row(t: &Theme, label: &str, hint: Option<&str>, active: bool) -> Strin
     }
 }
 
-/// The footer hint line: `dim('↑/↓') to navigate • dim('Enter:') confirm`.
-/// Only the key names are dim; the verbs stay plain (spec quotes the exact
-/// mix). The separator uses the theme bullet so `TERM=linux` stays ASCII.
 fn select_footer(t: &Theme) -> String {
     format!(
         "{}/{} to navigate {} {} confirm",
@@ -70,9 +51,6 @@ fn select_footer(t: &Theme) -> String {
     )
 }
 
-/// Active select frame. `start` is the sliding-window origin; overflow is
-/// marked by a literal dim `...` replacing the first/last visible row —
-/// clack's own convention, not a count.
 pub(crate) fn select_frame(
     t: &Theme,
     message: &str,
@@ -103,10 +81,6 @@ pub(crate) fn select_frame(
     lines
 }
 
-/// Collapsed frame once the prompt is resolved. Submitted: green `◇`, dim
-/// value. Cancelled: red `■`, strikethrough dim value, plus a trailing bare
-/// gutter (clack emits it so the cancel notice that follows stays attached
-/// to the rail). Gutter turns gray — the prompt is now transcript.
 pub(crate) fn select_done_frame(
     t: &Theme,
     message: &str,
@@ -134,8 +108,6 @@ pub(crate) fn select_done_frame(
     lines
 }
 
-/// Active confirm frame. The choice renders inline on one row:
-/// `green(●) Yes dim(/) dim(○) dim(No)` (mirrored when No is active).
 pub(crate) fn confirm_frame(t: &Theme, message: &str, value: bool) -> Vec<String> {
     let pick = |label: &str, active: bool| {
         if active {
@@ -162,8 +134,6 @@ pub(crate) fn confirm_frame(t: &Theme, message: &str, value: bool) -> Vec<String
     ]
 }
 
-/// Pure key transition for select. Clack wraps at both ends (unlike the
-/// search prompt, which clamps — the spec is explicit that they differ).
 pub(crate) enum NavAction {
     Moved,
     Submit,
@@ -189,8 +159,6 @@ pub(crate) fn select_handle_key(cursor: &mut usize, len: usize, key: &KeyEvent) 
     }
 }
 
-/// Window height for the live terminal: clack keeps a minimum of 5 rows and
-/// otherwise fits the screen minus the frame's fixed chrome (4 rows).
 fn live_max_items() -> usize {
     let rows = crossterm::terminal::size().map(|(_, r)| r as usize).unwrap_or(24);
     rows.saturating_sub(4).max(5)
@@ -202,8 +170,6 @@ pub(crate) fn run_select<T: Clone>(
     options: &[SelectOption<T>],
 ) -> Result<T, Cancelled> {
     if options.is_empty() || !ui.tty {
-        // Nothing to choose, or no terminal to choose on: treat as cancelled
-        // rather than blocking forever on a pipe.
         return Err(Cancelled);
     }
     let t = ui.theme();
@@ -274,7 +240,6 @@ pub(crate) fn run_confirm(ui: &mut Ui, message: &str, initial: bool) -> Result<b
                         let _ = zone.draw(&mut ui.out, &done, ui.columns);
                         return Ok(value);
                     }
-                    // Any arrow toggles, exactly like clack's confirm.
                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
                     | KeyCode::Char('h') | KeyCode::Char('l') => value = !value,
                     _ => {}
@@ -309,9 +274,6 @@ mod tests {
         ]);
     }
 
-    /// Live palette: cyan gutter and step symbol, green active radio,
-    /// underlined active label — asserted with explicit codes because the
-    /// cyan/gray gutter split is the most visible fidelity failure.
     #[test]
     fn select_active_frame_palette() {
         let t = theme();
@@ -320,7 +282,6 @@ mod tests {
         assert!(f[2].starts_with("\x1b[36m│\x1b[39m"), "gutter: {:?}", f[2]);
         assert!(f[2].contains("\x1b[32m●\x1b[39m \x1b[4mAlpha\x1b[24m"), "row: {:?}", f[2]);
         assert!(f[2].contains("\x1b[2m(first)\x1b[22m"), "hint: {:?}", f[2]);
-        // Inactive rows are dim glyph + dim label, no hint.
         assert!(f[3].contains("\x1b[2m○\x1b[22m \x1b[2mBeta\x1b[22m"), "row: {:?}", f[3]);
         assert_eq!(*f.last().unwrap(), "\x1b[36m└\x1b[39m");
     }
@@ -330,29 +291,21 @@ mod tests {
         let t = theme();
         let items: Vec<(&str, Option<&str>)> =
             vec![("a", None), ("b", None), ("c", None), ("d", None), ("e", None), ("f", None), ("g", None)];
-        // Window of 5 starting at 1: overflow on both sides.
         let f = plain(&select_frame(&t, "m", &items, 3, 1, 5));
         assert_eq!(f[2], "│  ...");
         assert_eq!(f[6], "│  ...");
-        // Rows between the ellipses are real options.
         assert_eq!(f[4], "│  ● d");
     }
 
-    /// Spec: the window scrolls once `cursor >= n - 3` and holds a minimum
-    /// of five rows; it is sticky in between.
     #[test]
     fn clack_window_scrolls_at_cursor_ge_max_minus_three() {
         assert_eq!(clack_window_start(0, 0, 10, 5), 0);
         assert_eq!(clack_window_start(0, 1, 10, 5), 0);
-        // cursor 2 == max-3: scrolls.
         assert_eq!(clack_window_start(0, 2, 10, 5), 0);
         assert_eq!(clack_window_start(0, 3, 10, 5), 1);
         assert_eq!(clack_window_start(1, 4, 10, 5), 2);
-        // Never scrolls past the end.
         assert_eq!(clack_window_start(4, 9, 10, 5), 5);
-        // Scrolling back up engages once cursor < start + 2.
         assert_eq!(clack_window_start(5, 6, 10, 5), 4);
-        // A list that fits never scrolls.
         assert_eq!(clack_window_start(3, 4, 5, 5), 0);
     }
 

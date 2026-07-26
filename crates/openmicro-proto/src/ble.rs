@@ -1,18 +1,9 @@
-//! BLE GATT identifiers for the OpenMicro custom service.
-//! Canonical UUID string forms are in the doc comments; both host (bluer) and
-//! firmware (trouble) build their UUID types from these u128 values.
-
-/// Custom service: 9e7a0001-0000-4000-8000-0026bb765291
 pub const OPENMICRO_SERVICE_UUID: u128 = 0x9e7a0001_0000_4000_8000_0026bb765291;
-/// LED frame write char (host->device): 9e7a0002-0000-4000-8000-0026bb765291
 pub const LED_CHAR_UUID: u128 = 0x9e7a0002_0000_4000_8000_0026bb765291;
-/// Input event notify char (device->host): 9e7a0003-0000-4000-8000-0026bb765291
 pub const INPUT_CHAR_UUID: u128 = 0x9e7a0003_0000_4000_8000_0026bb765291;
-/// Standard Battery Service / Battery Level.
 pub const BATTERY_SERVICE_UUID: u16 = 0x180F;
 pub const BATTERY_LEVEL_UUID: u16 = 0x2A19;
 
-/// Advertised device name prefix used for discovery fallback.
 pub const ADV_NAME_PREFIX: &str = "OpenMicro";
 
 #[cfg(test)]

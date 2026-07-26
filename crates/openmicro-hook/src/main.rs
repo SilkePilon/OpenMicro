@@ -13,7 +13,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Push a raw {agent,session,state} event (the universal adapter contract).
     Push {
         #[arg(long)]
         agent: String,
@@ -22,25 +21,17 @@ enum Command {
         #[arg(long)]
         state: String,
     },
-    /// Read a Claude Code (or Claude-compatible) hook JSON from stdin, extract
-    /// `session_id`, and push a state event. `--agent` lets Claude-compatible
-    /// agents (e.g. Grok Code) reuse this stdin mechanism; it defaults to claude.
     ClaudeHook {
         #[arg(long)]
         state: String,
         #[arg(long, default_value = "claude")]
         agent: String,
     },
-    /// Read a Codex CLI `notify` JSON (first positional arg, else stdin), map its
-    /// event `type` to a state, and push a codex event.
     CodexNotify {
-        /// The JSON payload Codex passes as the trailing positional argument.
         payload: Option<String>,
     },
 }
 
-/// Extract `session_id` from a Claude Code hook JSON object; fall back to
-/// `"default"` when stdin is empty, not JSON, or lacks a non-empty `session_id`.
 fn session_from_claude_hook(stdin_json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(stdin_json.trim())
         .ok()
@@ -53,12 +44,6 @@ fn session_from_claude_hook(stdin_json: &str) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// Map a Codex `notify` payload's event `type` to one of the daemon states.
-///
-/// Codex's confirmed notify event is `agent-turn-complete` (fired when the turn
-/// finishes and the agent waits for input) -> `idle`. Anything that reads as an
-/// approval/notification request -> `awaiting_approval`; everything else (a
-/// known in-progress/start event, or an unrecognised type) -> `working`.
 fn codex_event_to_state(payload_json: &str) -> &'static str {
     let ty = serde_json::from_str::<serde_json::Value>(payload_json.trim())
         .ok()
@@ -85,10 +70,6 @@ fn codex_event_to_state(payload_json: &str) -> &'static str {
     }
 }
 
-/// Extract a stable session id from a Codex notify payload; Codex currently
-/// exposes none (the payload carries only a per-turn `turn-id`), so this returns
-/// `"default"` unless a `session_id`/`session-id` field is present in a future
-/// payload.
 fn session_from_codex(payload_json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(payload_json.trim())
         .ok()
@@ -108,8 +89,6 @@ fn read_stdin() -> String {
     buf
 }
 
-/// Best-effort: connect to the daemon socket and write one newline-JSON line.
-/// If the daemon is down, silently succeed so hooks never block the agent.
 const PUSH_WRITE_TIMEOUT: Duration = Duration::from_millis(300);
 const PUSH_DEADLINE: Duration = Duration::from_millis(500);
 
@@ -153,7 +132,6 @@ fn main() {
             push("codex", &session, state);
         }
     }
-    // Always exit 0 — never block the agent.
 }
 
 #[cfg(test)]

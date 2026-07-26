@@ -1,6 +1,3 @@
-//! Idle-sleep timer: tracks the last activity time and, after enough idle
-//! minutes, tells the engine to blank the LEDs.
-
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,11 +7,8 @@ use tokio::time::interval;
 use crate::device::DeviceLink;
 use crate::engine::Engine;
 
-/// How often the sleeper wakes to check the idle duration.
 const TICK: Duration = Duration::from_secs(15);
 
-/// Shared "last activity" clock. Cloned into every input path; each processed
-/// hook event or physical input calls [`ActivityClock::touch`].
 #[derive(Clone)]
 pub struct ActivityClock(Arc<Mutex<Instant>>);
 
@@ -23,12 +17,10 @@ impl ActivityClock {
         ActivityClock(Arc::new(Mutex::new(Instant::now())))
     }
 
-    /// Record activity now.
     pub fn touch(&self) {
         *self.0.lock().unwrap() = Instant::now();
     }
 
-    /// How long since the last `touch`.
     pub fn idle(&self) -> Duration {
         self.0.lock().unwrap().elapsed()
     }
@@ -40,10 +32,6 @@ impl Default for ActivityClock {
     }
 }
 
-/// Pure decision: should the engine be put to sleep now?
-///
-/// False when sleeping is disabled (`sleep_minutes == 0`) or the engine is
-/// already asleep; otherwise true once idle reaches `sleep_minutes` minutes.
 pub fn should_sleep(idle: Duration, sleep_minutes: u32, already_asleep: bool) -> bool {
     if already_asleep || sleep_minutes == 0 {
         return false;
@@ -51,7 +39,6 @@ pub fn should_sleep(idle: Duration, sleep_minutes: u32, already_asleep: bool) ->
     idle >= Duration::from_secs(sleep_minutes as u64 * 60)
 }
 
-/// Run the idle-sleep loop until cancelled. Locks engine before device.
 pub async fn serve(
     clock: ActivityClock,
     engine: Arc<AsyncMutex<Engine>>,
@@ -88,7 +75,6 @@ mod tests {
 
     #[test]
     fn sleeps_once_idle_reaches_threshold() {
-        // 3 minutes = 180s.
         assert!(!should_sleep(Duration::from_secs(179), 3, false));
         assert!(should_sleep(Duration::from_secs(180), 3, false));
         assert!(should_sleep(Duration::from_secs(600), 3, false));

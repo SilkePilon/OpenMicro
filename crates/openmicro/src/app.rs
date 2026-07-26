@@ -1,14 +1,3 @@
-//! The application: one command, one menu.
-//!
-//! `openmicro` takes no subcommands. Everything — setting the device up,
-//! flashing firmware, wiring coding agents, running the daemon, removing the
-//! whole thing again — happens inside this menu loop, in the style described by
-//! `docs/tui-style.md`.
-//!
-//! The shape is a linear prompt transcript rather than a full-screen app: each
-//! action appends its own record and returns to the menu, so the terminal ends
-//! up holding a readable history of what was done.
-
 use std::path::PathBuf;
 
 use crate::agents::{self, AgentKind, HookStatus};
@@ -22,7 +11,6 @@ use crate::prompt::{Cancelled, Item, MultiOpts, SelectOption, Ui};
 use crate::uninstall::{self, Target};
 use crate::wldevice::{self, UsbMode};
 
-/// The wordmark, in figlet's ANSI Shadow typeface to match `npx skills`.
 pub const WORDMARK: [&str; 6] = [
     " ██████╗ ██████╗ ███████╗███╗   ██╗███╗   ███╗██╗ ██████╗██████╗  ██████╗ ",
     "██╔═══██╗██╔══██╗██╔════╝████╗  ██║████╗ ████║██║██╔════╝██╔══██╗██╔═══██╗",
@@ -32,11 +20,8 @@ pub const WORDMARK: [&str; 6] = [
     " ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝     ╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝ ",
 ];
 
-/// Terminal width below which the wordmark is skipped rather than wrapped into
-/// nonsense.
 const WORDMARK_MIN_COLUMNS: usize = 78;
 
-/// What the user picked from the top-level menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Setup,
@@ -50,11 +35,6 @@ enum Action {
     Quit,
 }
 
-/// A cheap read of the things the menu describes.
-///
-/// Deliberately USB-only: a Bluetooth scan takes seconds, and redrawing the
-/// menu after every action must feel instant. The guided setup does the slow,
-/// thorough probe behind a spinner instead.
 #[derive(Clone)]
 struct Snapshot {
     usb: UsbMode,
@@ -94,9 +74,6 @@ impl Snapshot {
 
     fn firmware_hint(&self) -> String {
         match (&self.image, &self.cached_version) {
-            // Only the downloaded image carries a version. `resolve_image`
-            // prefers a local source build, and calling that build by the last
-            // downloaded release's name would name the wrong binary.
             (Some(p), Some(v)) if *p == firmware::cache_image() => format!("{v} downloaded"),
             (Some(p), _) => format!("image at {}", short_path(p)),
             (None, _) => "no image yet".to_string(),
@@ -113,7 +90,6 @@ impl Snapshot {
     }
 }
 
-/// Abbreviate a path with `~` so menu hints stay on one line.
 fn short_path(path: &std::path::Path) -> String {
     let home = agents::home();
     match path.strip_prefix(&home) {
@@ -122,19 +98,14 @@ fn short_path(path: &std::path::Path) -> String {
     }
 }
 
-/// Entry point. Returns once the user quits.
 pub fn run() -> anyhow::Result<()> {
     let mut ui = Ui::new();
     if ui.columns() >= WORDMARK_MIN_COLUMNS {
         ui.banner(&WORDMARK);
     }
-    // Black on cyan, like `skills`' own badge. Colour 0 is black in the 256
-    // palette; the toolkit has no dedicated `black` helper.
     let badge = ui.style().bg_cyan(&ui.style().fg256(0, " openmicro "));
     ui.intro(&badge);
 
-    // Offer to start the daemon before the menu, since almost everything else
-    // is more useful with it running.
     if let Err(Cancelled) = offer_to_start_daemon(&mut ui) {
         ui.cancel("Cancelled");
         return Ok(());
@@ -158,8 +129,6 @@ pub fn run() -> anyhow::Result<()> {
             Action::Quit => break,
         };
         if outcome.is_err() {
-            // Cancelling one action returns to the menu rather than quitting;
-            // quitting is its own menu entry, so a stray Esc never loses work.
             ui.warn("Cancelled — back to the menu.");
         }
     }
@@ -168,7 +137,6 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The top-level menu, with live state in the hints.
 fn main_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<Action, Cancelled> {
     let options = vec![
         SelectOption::new(Action::Setup, "Set up my macropad")
@@ -195,10 +163,6 @@ fn main_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<Action, Cancelled> {
     ui.select("What do you want to do?", &options)
 }
 
-/// Ask once, at startup, whether to start a daemon that is installed but down.
-///
-/// Silent when there is nothing to offer: no service installed means the
-/// question would only be noise, and the menu says so anyway.
 fn offer_to_start_daemon(ui: &mut Ui) -> Result<(), Cancelled> {
     let status = daemon::status();
     if status.running || !status.unit_installed {
@@ -211,11 +175,6 @@ fn offer_to_start_daemon(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Run a fallible job behind a spinner and report its output.
-///
-/// Everything slow in this app has the same shape — spin, produce log lines or
-/// an error, print them — so it lives in one place and every action reports
-/// success and failure the same way.
 fn run_job<F>(ui: &mut Ui, busy: &str, done: &str, job: F) -> bool
 where
     F: FnOnce() -> Result<Vec<String>, String>,
@@ -233,9 +192,6 @@ where
         }
         Err(e) => {
             spinner.error(busy);
-            // Tool output is mostly progress chatter; only the last line is the
-            // failure. Rendering all of it as errors buries the one that matters
-            // in a wall of red markers.
             let lines: Vec<&str> = e.lines().filter(|l| !l.trim().is_empty()).collect();
             if let Some((last, rest)) = lines.split_last() {
                 for line in rest {
@@ -248,12 +204,6 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Guided setup
-// ---------------------------------------------------------------------------
-
-/// The path the user is meant to take: device to working, asking as little as
-/// possible along the way.
 fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     ui.note(
         "Before you start",
@@ -266,7 +216,6 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         return Ok(());
     }
 
-    // 1. Find the device.
     let mut spinner = ui.spinner();
     spinner.start("Looking for your macropad");
     let seen = probe::probe();
@@ -288,8 +237,6 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         }
     }
 
-    // 2. Get it into bootloader mode. No buttons: the firmware is asked to
-    //    reboot itself.
     if wldevice::usb_mode() != UsbMode::Bootloader {
         if !ui.confirm("Reboot it into bootloader mode so it can be flashed?", true)? {
             return Ok(());
@@ -304,7 +251,6 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         }
     }
 
-    // 3. Get an image, then write it.
     if obtain_firmware(ui)?.is_none() {
         return Ok(());
     }
@@ -319,7 +265,6 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     finish_setup(ui)
 }
 
-/// The tail of the guided setup: agents, then the daemon.
 fn finish_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     agents_flow(ui)?;
     let status = daemon::status();
@@ -331,12 +276,6 @@ fn finish_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Firmware
-// ---------------------------------------------------------------------------
-
-/// Make sure a firmware image exists, building or downloading one if not.
-/// Returns `None` when the user backed out or nothing could be obtained.
 fn obtain_firmware(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     if let Ok(existing) = flash::resolve_image(None) {
         let hint = match firmware::cached_version() {
@@ -354,13 +293,10 @@ fn obtain_firmware(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     firmware_source(ui)
 }
 
-/// Download a published release or build from source.
 fn firmware_source(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let sources = firmware::Sources::detect();
     let mut options = Vec::new();
     if sources.can_download() {
-        // A forced URL bypasses the release list entirely, so there is no
-        // version to pick — say where the image will come from instead.
         if sources.forced {
             options.push(
                 SelectOption::new("forced", "Download the configured image")
@@ -409,7 +345,6 @@ fn firmware_source(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     }
 }
 
-/// Fetch the release list and let the user pick a version.
 fn download_release(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let mut spinner = ui.spinner();
     spinner.start("Fetching the list of firmware versions");
@@ -452,8 +387,6 @@ fn download_release(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let Some(release) = ui.select("Which version?", &options)? else {
         return Ok(None);
     };
-    // A release with no flashable asset is still listed — its hint says why —
-    // but picking it must say so rather than silently behaving like "Back".
     if let Some(why) = release.blocker() {
         ui.warn(why);
         return Ok(None);
@@ -469,7 +402,6 @@ fn download_release(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     Ok(path)
 }
 
-/// The firmware submenu.
 fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
     let ready = snapshot.usb == UsbMode::Bootloader;
     let options = vec![
@@ -513,10 +445,6 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Put the vendor's firmware back on the device.
-///
-/// Work Louder publish unencrypted merged images to a public GitHub repo, so
-/// going back is just a download.
 fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
     let Some(image) = download_stock(ui)? else {
         return Ok(());
@@ -547,7 +475,6 @@ fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Fetch the vendor's published stock firmware, letting the user pick a version.
 fn download_stock(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let mut spinner = ui.spinner();
     spinner.start("Fetching Work Louder's firmware releases");
@@ -599,11 +526,6 @@ fn download_stock(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     Ok(path)
 }
 
-/// Warn when another process will fight us for the serial port.
-///
-/// Worth interrupting for: ModemManager opening the port mid-transfer kills a
-/// 4 MiB backup partway through with an error that reads like a hardware fault.
-/// Returns false when the user would rather stop and fix it first.
 fn port_is_clear(ui: &mut Ui) -> Result<bool, Cancelled> {
     let Some(warning) = flash::port_contention() else {
         return Ok(true);
@@ -612,20 +534,12 @@ fn port_is_clear(ui: &mut Ui) -> Result<bool, Cancelled> {
     ui.confirm("Try anyway?", false)
 }
 
-/// Start the firmware that was just written.
-///
-/// Flashing deliberately leaves the device in the bootloader: entering it set
-/// the force-download bit, which survives a reset, so a device that simply
-/// rebooted would come straight back to download mode and never run the
-/// firmware that was just written. Clearing the bit and resetting is what
-/// actually starts it.
 fn start_firmware(ui: &mut Ui) {
     run_job(ui, "Starting the new firmware", "Device restarted", || {
         wldevice::exit_bootloader(None)
     });
 }
 
-/// Put the device into bootloader mode if it is not already, asking first.
 fn ensure_bootloader(ui: &mut Ui) -> Result<bool, Cancelled> {
     match wldevice::usb_mode() {
         UsbMode::Bootloader => Ok(true),
@@ -647,11 +561,6 @@ fn ensure_bootloader(ui: &mut Ui) -> Result<bool, Cancelled> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agents
-// ---------------------------------------------------------------------------
-
-/// Detect coding agents and wire up the ones the user picks.
 fn agents_flow(ui: &mut Ui) -> Result<(), Cancelled> {
     let home = agents::home();
     let rows = agents::detect(&home);
@@ -731,11 +640,6 @@ fn agents_flow(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Install several agents, reporting every outcome.
-///
-/// One failure does not abort the rest — the user picked several and deserves
-/// the ones that worked — but the overall result is an error so the UI can
-/// never show a clean success for a partial run.
 fn install_agents(kinds: &[AgentKind], home: &std::path::Path) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut failed = false;
@@ -754,10 +658,6 @@ fn install_agents(kinds: &[AgentKind], home: &std::path::Path) -> Result<Vec<Str
         Ok(lines)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Daemon and device
-// ---------------------------------------------------------------------------
 
 fn daemon_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
     let running = snapshot.daemon.running;
@@ -859,7 +759,6 @@ fn device_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Multi-line description of a probe result, for the note box.
 fn describe_probe(seen: &probe::Probe) -> String {
     let usb = match seen.usb {
         flash::DeviceState::Bootloader => "in bootloader mode, ready to flash",
@@ -891,12 +790,6 @@ fn describe_probe(seen: &probe::Probe) -> String {
     format!("{summary}\n\nUSB:       {usb}\nBluetooth: {ble}\nFirmware:  {firmware}")
 }
 
-// ---------------------------------------------------------------------------
-// Live view
-// ---------------------------------------------------------------------------
-
-/// Build the live-view frame. Pure, so the layout is testable without a
-/// daemon, a terminal, or a device.
 fn live_frame(
     style: &crate::prompt::Style,
     snap: &client::SnapshotDto,
@@ -924,7 +817,6 @@ fn live_frame(
             let id = format!("{}:{}", session.agent, session.session);
             let slot = session.slot.map(|s| format!("key {s}")).unwrap_or_else(|| "—".into());
             let row = format!("{:<8}  {:<18}  {}", slot, session.agent, session.state);
-            // The focused session is the one the macropad is actually showing.
             if id == owner {
                 lines.push(format!("{bar}  {} {}", style.green("▸"), style.bold(&row)));
             } else {
@@ -937,11 +829,6 @@ fn live_frame(
     lines
 }
 
-/// Watch agent state change in place until a key is pressed.
-///
-/// This is the one screen that is not a prompt: it redraws on a timer rather
-/// than on input. It uses the same frame machinery as the prompts, so it
-/// collapses into the transcript the same way when it exits.
 fn live_status(ui: &mut Ui) -> Result<(), Cancelled> {
     if !daemon::is_running() {
         ui.warn("The background service isn't running, so there is nothing to watch yet.");
@@ -950,9 +837,6 @@ fn live_status(ui: &mut Ui) -> Result<(), Cancelled> {
 
     let snap = std::sync::Arc::new(std::sync::Mutex::new(client::SnapshotDto::default()));
     let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Dropped when this function returns, which is what stops the reader. Without
-    // it every visit to this screen left another thread reconnecting forever, and
-    // the daemon spawns a 1 Hz writer task per connection.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_snapshot_reader(snap.clone(), connected.clone(), stop.clone());
 
@@ -990,13 +874,6 @@ fn live_status(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Follow the daemon's control socket in the background, keeping `snap` fresh
-/// until `stop` is set.
-///
-/// The read itself blocks, so the flag is only checked between lines and between
-/// reconnects; the thread therefore outlives the screen by at most one snapshot
-/// (the daemon writes at 1 Hz). What matters is that it does not outlive it
-/// forever, which is what leaked a thread and a daemon-side task per visit.
 fn spawn_snapshot_reader(
     snap: std::sync::Arc<std::sync::Mutex<client::SnapshotDto>>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1028,22 +905,12 @@ fn spawn_snapshot_reader(
     });
 }
 
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
-
-/// Brightness, per-state colours and the idle-sleep timeout.
-///
-/// Every change is sent to the daemon, which applies it live and persists it,
-/// so there is no separate save step.
 fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
     if !daemon::is_running() {
         ui.warn("The background service isn't running, so settings can't be applied.");
         return Ok(());
     }
 
-    // Seed the hints from the daemon's live config so the menu shows what the
-    // settings currently are, not just what they could be.
     let current = read_current_settings();
     let options = vec![
         SelectOption::new("brightness", "Brightness").with_hint(match &current {
@@ -1077,9 +944,6 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
             send_command(ui, &openmicro_proto::Command::SetBrightness(value), "Brightness set");
         }
         "colour" => {
-            // Colour identifies *which agent*, not what it is doing — the
-            // effect and the underglow motion carry the state. So this picks a
-            // colour per agent, and the hint shows what it is now.
             let agents: Vec<SelectOption<openmicro_proto::AgentKind>> = [
                 openmicro_proto::AgentKind::Claude,
                 openmicro_proto::AgentKind::Codex,
@@ -1140,15 +1004,10 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
     Ok(())
 }
 
-/// Brightness as a percentage of the 0..=255 range, for display.
 fn percent(brightness: u8) -> u16 {
     brightness as u16 * 100 / 255
 }
 
-/// Read one snapshot from the daemon, for the settings menu's current values.
-///
-/// Returns `None` rather than an error: not knowing the current brightness is
-/// not worth interrupting the user over, and the menu says "unknown".
 fn read_current_settings() -> Option<client::SnapshotDto> {
     use std::io::BufRead;
     let stream = std::os::unix::net::UnixStream::connect(daemon::socket_path()).ok()?;
@@ -1157,7 +1016,6 @@ fn read_current_settings() -> Option<client::SnapshotDto> {
     client::parse_snapshot(&line)
 }
 
-/// Human name for one of the preset colours.
 fn colour_name(rgb: &openmicro_proto::Rgb) -> String {
     match (rgb.r, rgb.g, rgb.b) {
         (255, 255, 255) => "White".into(),
@@ -1170,7 +1028,6 @@ fn colour_name(rgb: &openmicro_proto::Rgb) -> String {
     }
 }
 
-/// Send one command to the daemon over the control socket.
 fn send_command(ui: &mut Ui, command: &openmicro_proto::Command, done: &str) {
     use std::io::Write;
 
@@ -1191,11 +1048,6 @@ fn send_command(ui: &mut Ui, command: &openmicro_proto::Command, done: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Uninstall
-// ---------------------------------------------------------------------------
-
-/// Remove OpenMicro from the machine, one informed choice at a time.
 fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
     let home = agents::home();
     let found = uninstall::survey(&home);
@@ -1242,8 +1094,6 @@ fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
         return Ok(());
     }
 
-    // Name the actual paths: "Settings" is not enough to consent to deleting a
-    // directory, and the user cannot see what the label covers otherwise.
     let manifest = targets
         .iter()
         .map(|t| {
@@ -1309,7 +1159,6 @@ mod tests {
         let home = agents::home();
         let inside = home.join(".cache/openmicro/x.bin");
         assert_eq!(short_path(&inside), "~/.cache/openmicro/x.bin");
-        // A path outside HOME is shown in full rather than mangled.
         assert_eq!(short_path(std::path::Path::new("/etc/hosts")), "/etc/hosts");
     }
 
@@ -1367,9 +1216,6 @@ mod tests {
         let with_path = Snapshot { image: Some(PathBuf::from("/tmp/fw.bin")), ..base.clone() };
         assert!(with_path.firmware_hint().contains("/tmp/fw.bin"));
 
-        // A version is only claimed for the downloaded image. `resolve_image`
-        // prefers a local source build, and naming that build after the last
-        // release downloaded would name the wrong binary.
         let downloaded = Snapshot {
             image: Some(firmware::cache_image()),
             cached_version: Some("v1.2.0".to_string()),

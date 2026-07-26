@@ -1,59 +1,40 @@
-//! Pure frame builders for the non-interactive blocks: banner, intro, outro,
-//! cancel, the log variants and the note box.
-//!
-//! Everything here is a function from inputs to `Vec<String>` (one logical
-//! line per entry, no trailing newlines) so the exact bytes can be asserted
-//! in unit tests without a terminal. The terminal-facing code in `term.rs`
-//! only ever joins and writes these.
-
 use super::style::{Style, BANNER_GRADIENT};
 use super::symbols::Symbols;
 use super::width::{display_width, wrap};
 
-/// Style + glyph set bundled, because every frame builder needs both and the
-/// pairing (colour on/off, unicode on/off) is decided once in `Ui::new`.
 #[derive(Clone, Copy)]
 pub(crate) struct Theme {
     pub style: Style,
     pub sym: &'static Symbols,
 }
 
-/// The five log flavours. They differ *only* in the symbol and its colour —
-/// the spec is explicit — so they share one frame builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogKind {
     Info,
     Success,
-    Step,
     Warn,
     Error,
 }
 
 impl LogKind {
-    /// The coloured symbol for this variant: info blue `●`, success green
-    /// `◆`, step green `◇`, warn yellow `▲`, error red `■`.
     pub(crate) fn symbol(self, t: &Theme) -> String {
         match self {
             LogKind::Info => t.style.blue(t.sym.info),
             LogKind::Success => t.style.green(t.sym.success),
-            LogKind::Step => t.style.green(t.sym.step_submit),
             LogKind::Warn => t.style.yellow(t.sym.warn),
             LogKind::Error => t.style.red(t.sym.error),
         }
     }
 }
 
-/// A committed (gray) bare gutter line.
 pub(crate) fn gutter(t: &Theme) -> String {
     t.style.gray(t.sym.bar)
 }
 
-/// `gray('┌') + '  ' + msg`.
 pub(crate) fn intro_frame(t: &Theme, msg: &str) -> Vec<String> {
     vec![format!("{}  {msg}", t.style.gray(t.sym.bar_start))]
 }
 
-/// `gray('│')`, then `gray('└') + '  ' + msg`, then a blank line.
 pub(crate) fn outro_frame(t: &Theme, msg: &str) -> Vec<String> {
     vec![
         gutter(t),
@@ -62,7 +43,6 @@ pub(crate) fn outro_frame(t: &Theme, msg: &str) -> Vec<String> {
     ]
 }
 
-/// `gray('└') + '  ' + red(msg)`, then a blank line.
 pub(crate) fn cancel_frame(t: &Theme, msg: &str) -> Vec<String> {
     vec![
         format!("{}  {}", t.style.gray(t.sym.bar_end), t.style.red(msg)),
@@ -70,10 +50,6 @@ pub(crate) fn cancel_frame(t: &Theme, msg: &str) -> Vec<String> {
     ]
 }
 
-/// One bare gutter line, then `symbol + '  ' + first line`, continuation
-/// lines behind the gutter. An empty line renders as the bare prefix with no
-/// trailing spaces (the spec calls this out; trailing blanks would show up as
-/// selectable whitespace when copying from the terminal).
 pub(crate) fn log_frame(t: &Theme, kind: LogKind, msg: &str) -> Vec<String> {
     let mut lines = vec![gutter(t)];
     for (i, ln) in msg.split('\n').enumerate() {
@@ -87,13 +63,7 @@ pub(crate) fn log_frame(t: &Theme, kind: LogKind, msg: &str) -> Vec<String> {
     lines
 }
 
-/// The note box. Geometry per spec: content is `["", ...wrapped, ""]`,
-/// `n = width(title)`, `t = max(widest content line, n) + 2`. The top-left
-/// corner *is* the step symbol and the bottom-left is `├` so the rail
-/// continues into the next step.
 pub(crate) fn note_frame(t: &Theme, title: &str, body: &str, columns: usize) -> Vec<String> {
-    // The spec wraps the body at `columns - 6`; clamp so a pathologically
-    // narrow terminal still produces a box instead of underflowing.
     let wrap_width = columns.saturating_sub(6).max(10);
     let mut content = vec![String::new()];
     content.extend(wrap(body, wrap_width));
@@ -130,10 +100,6 @@ pub(crate) fn note_frame(t: &Theme, title: &str, body: &str, columns: usize) -> 
     lines
 }
 
-/// Banner: one blank line, then each row in the static vertical gray
-/// gradient, one 256-colour per row, light at the top. Rows beyond the sixth
-/// keep the darkest shade — the wordmark is six rows, but do not corrupt a
-/// taller one.
 pub(crate) fn banner_frame(style: Style, rows: &[&str]) -> Vec<String> {
     let mut lines = vec![String::new()];
     for (i, row) in rows.iter().enumerate() {
@@ -147,7 +113,6 @@ pub(crate) fn banner_frame(style: Style, rows: &[&str]) -> Vec<String> {
 pub(crate) mod test_util {
     use super::*;
 
-    /// Colour+unicode theme used by frame snapshot tests across modules.
     pub(crate) fn theme() -> Theme {
         Theme {
             style: Style::new(true),
@@ -155,7 +120,6 @@ pub(crate) mod test_util {
         }
     }
 
-    /// Strip ANSI from a frame for readable layout assertions.
     pub(crate) fn plain(lines: &[String]) -> Vec<String> {
         lines
             .iter()
@@ -182,7 +146,6 @@ mod tests {
         let t = theme();
         let f = outro_frame(&t, "Done");
         assert_eq!(plain(&f), vec!["│", "└  Done", ""]);
-        // Gutter and corner are gray (committed palette), not cyan.
         assert!(f[0].starts_with("\x1b[90m"));
         assert!(f[1].starts_with("\x1b[90m└\x1b[39m"));
     }
@@ -195,15 +158,11 @@ mod tests {
         assert_eq!(f[1], "");
     }
 
-    /// Spec: variants change only the symbol — info blue ●, success green ◆,
-    /// step green ◇, warn yellow ▲, error red ■. Assert the colour codes
-    /// explicitly.
     #[test]
     fn log_variant_symbols_and_colours_match_spec() {
         let t = theme();
         assert_eq!(LogKind::Info.symbol(&t), "\x1b[34m●\x1b[39m");
         assert_eq!(LogKind::Success.symbol(&t), "\x1b[32m◆\x1b[39m");
-        assert_eq!(LogKind::Step.symbol(&t), "\x1b[32m◇\x1b[39m");
         assert_eq!(LogKind::Warn.symbol(&t), "\x1b[33m▲\x1b[39m");
         assert_eq!(LogKind::Error.symbol(&t), "\x1b[31m■\x1b[39m");
     }
@@ -223,9 +182,6 @@ mod tests {
         assert!(!f[1].ends_with(' '));
     }
 
-    /// The box maths from the spec worked by hand: title "Note" (n=4), body
-    /// "hi" → content ["", "hi", ""], widest 2, t = max(2,4)+2 = 6. Header
-    /// dashes t-n-1 = 1, body pad to 6, footer t+2 = 8 dashes.
     #[test]
     fn note_box_geometry_and_corners() {
         let t = theme();
@@ -238,7 +194,6 @@ mod tests {
             "│        │",
             "├────────╯",
         ]);
-        // All rows of the box share one right edge.
         let widths: Vec<usize> = f[1..].iter().map(|l| display_width(l)).collect();
         assert!(widths.iter().all(|w| *w == widths[0]), "ragged box: {f:?}");
     }
@@ -246,7 +201,6 @@ mod tests {
     #[test]
     fn note_header_dash_run_never_drops_below_one() {
         let t = theme();
-        // A title far wider than the body must still get one dash before ╮.
         let f = plain(&note_frame(&t, "A very long note title", "x", 80));
         assert!(f[1].contains(" ─╮"), "header was {:?}", f[1]);
     }

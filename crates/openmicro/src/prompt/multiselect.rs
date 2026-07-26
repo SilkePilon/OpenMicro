@@ -1,14 +1,3 @@
-//! The hand-rolled searchable multi-select — the one prompt in `npx skills
-//! add` that is *not* clack (`src/prompts/search-multiselect.ts` there), with
-//! its own palette: the gutter is dim (not cyan) in every state, and the
-//! active step glyph is green (not cyan).
-//!
-//! The state machine ([`MultiState`] + [`handle_key`]) and the frame builder
-//! ([`active_frame`]) are pure so every layout rule the spec calls out —
-//! fixed-count section dashes, the single combined overflow line, the
-//! cursor-centred window, the silent `required` failure — is asserted in
-//! tests below. The event loop at the bottom only shuttles keys and writes.
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::render::Theme;
@@ -16,21 +5,12 @@ use super::term::{is_cancel_key, next_event, FrameZone, PromptEvent, RawGuard};
 use super::width::wrap_clipped;
 use super::{Cancelled, Item, MultiOpts, Ui};
 
-/// Fixed dash runs for the section headers. The spec is emphatic that these
-/// are literal counts from the original tool, not width-filled: two leading
-/// dashes, then 12 trailing on the locked header and 29 on the list header.
-/// There is deliberately no alignment between the two.
 const LEADING_DASHES: usize = 2;
 const LOCKED_TRAILING_DASHES: usize = 12;
 const LIST_TRAILING_DASHES: usize = 29;
 
-/// Locked-section text appended after the title, exactly as the original
-/// renders it (`── Claude Code ── always included ────────────`).
 const LOCKED_SUFFIX: &str = "always included";
 
-/// Live prompt state. `selected` keeps *insertion order* because the
-/// `Selected:` summary and the return value both present choices in the
-/// order the user made them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MultiState {
     pub query: String,
@@ -39,9 +19,6 @@ pub(crate) struct MultiState {
 }
 
 impl MultiState {
-    /// Case-insensitive substring filter over label *and* value — no fuzzy
-    /// matching, no highlight, per spec. Returns indices into `items` so the
-    /// frame builder can reach hints/details without cloning.
     pub(crate) fn filtered(&self, items: &[Item]) -> Vec<usize> {
         if self.query.is_empty() {
             return (0..items.len()).collect();
@@ -66,20 +43,13 @@ impl MultiState {
     }
 }
 
-/// Outcome of one keypress.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// State may have changed; redraw.
     Redraw,
     Submit,
     Cancel,
 }
 
-/// Pure key transition. Arrows clamp (no wraparound), space toggles, any
-/// printable character appends to the query and resets the cursor to 0,
-/// backspace pops and also resets. A `required` prompt swallows Enter
-/// silently while nothing is selected — the spec insists there is no error
-/// message.
 pub(crate) fn handle_key(
     state: &mut MultiState,
     key: &KeyEvent,
@@ -136,9 +106,6 @@ pub(crate) fn handle_key(
     }
 }
 
-/// The cursor-centred window the spec spells out:
-/// `start = clamp(cursor - maxVisible/2, 0, len - maxVisible)`. This is
-/// deliberately different from clack's sticky window in `select.rs`.
 pub(crate) fn centered_window(cursor: usize, len: usize, max_visible: usize) -> (usize, usize) {
     if len <= max_visible {
         return (0, len);
@@ -149,8 +116,6 @@ pub(crate) fn centered_window(cursor: usize, len: usize, max_visible: usize) -> 
     (start, start + max_visible)
 }
 
-/// `Selected:` summary body: up to three labels, then ` +N more`. The caller
-/// decides the styling because the empty case restyles the whole line.
 fn summary_body(labels: &[String]) -> String {
     let shown = labels.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
     if labels.len() > 3 {
@@ -160,9 +125,6 @@ fn summary_body(labels: &[String]) -> String {
     }
 }
 
-/// Map selected values back to display labels, falling back to the raw value
-/// for entries not present in `items` (e.g. seeded `initial_selected` values
-/// that a filter change later removed from the catalogue).
 fn selected_labels(selected: &[String], items: &[Item]) -> Vec<String> {
     selected
         .iter()
@@ -176,8 +138,6 @@ fn selected_labels(selected: &[String], items: &[Item]) -> Vec<String> {
         .collect()
 }
 
-/// Everything the active frame needs, bundled so the builder stays a single
-/// pure function with a testable signature.
 pub(crate) struct MultiView<'a> {
     pub message: &'a str,
     pub items: &'a [Item],
@@ -186,7 +146,6 @@ pub(crate) struct MultiView<'a> {
     pub columns: usize,
 }
 
-/// Build the full active frame, top to bottom, per the spec's layout block.
 pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
     let s = t.style;
     let sym = t.sym;
@@ -194,12 +153,9 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
     let dash = |n: usize| sym.bar_h.repeat(n);
     let mut lines = Vec::new();
 
-    // Header: green step glyph (the search prompt's one departure from the
-    // clack palette) and a bold message.
     lines.push(format!("{}  {}", s.green(sym.step_active), s.bold(v.message)));
     lines.push(bar.clone());
 
-    // Locked section: fixed-count dashes, bullet rows, `…and N more`.
     if let Some(locked) = &v.opts.locked {
         lines.push(format!(
             "{bar}  {} {} {} {} {}",
@@ -225,7 +181,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
         lines.push(bar.clone());
     }
 
-    // List section header, search line, key help.
     if let Some(title) = &v.opts.list_title {
         lines.push(format!(
             "{bar}  {} {} {}",
@@ -235,8 +190,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
         ));
     }
     if v.opts.searchable {
-        // The caret is a fake `inverse(' ')` glued to the end of the query;
-        // there is no left/right text cursor to move.
         lines.push(format!("{bar}  Search: {}{}", v.state.query, s.inverse(" ")));
     }
     lines.push(format!(
@@ -248,7 +201,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
     ));
     lines.push(bar.clone());
 
-    // The item window.
     let filtered = v.state.filtered(v.items);
     let cursor = v.state.cursor.min(filtered.len().saturating_sub(1));
     if filtered.is_empty() {
@@ -264,8 +216,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
             } else {
                 " ".to_string()
             };
-            // Glyph palette: selected green; hovered-but-unselected cyan;
-            // otherwise dim. Same glyph either way — only the colour moves.
             let glyph = if is_selected {
                 s.green(sym.radio_active)
             } else if at_cursor {
@@ -285,8 +235,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
                 .unwrap_or_default();
             lines.push(format!("{bar} {pointer} {glyph} {label}{hint}"));
         }
-        // One combined overflow line for both directions, joined by two
-        // spaces, all dim — never two separate lines.
         let mut overflow = Vec::new();
         if start > 0 {
             overflow.push(format!("{} {start} more", sym.arrow_up));
@@ -300,9 +248,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
     }
     lines.push(bar.clone());
 
-    // Fixed-height detail pane: always `detail_lines` body rows so the frame
-    // height never changes as the cursor moves over items with and without
-    // details.
     if v.opts.show_detail {
         lines.push(format!("{bar}  Description"));
         let detail = filtered
@@ -320,8 +265,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
         lines.push(bar.clone());
     }
 
-    // Selected summary: green label with up to three names, or a fully dim
-    // `Selected: (none)` when nothing is picked.
     let labels = selected_labels(&v.state.selected, v.items);
     if labels.is_empty() {
         lines.push(format!("{bar}  {}", s.dim("Selected: (none)")));
@@ -336,9 +279,6 @@ pub(crate) fn active_frame(t: &Theme, v: &MultiView<'_>) -> Vec<String> {
     lines
 }
 
-/// Collapsed frame. Submitted: green `◇`, one dim line joining the
-/// selection, and *no* `└` footer — the rail runs straight into the next
-/// step. Cancelled: red `■` with a dim struck-through `Cancelled`.
 pub(crate) fn done_frame(
     t: &Theme,
     message: &str,
@@ -379,8 +319,6 @@ pub(crate) fn run(
         return Err(Cancelled);
     }
     let t = ui.theme();
-    // The original never hides the cursor in this prompt (the visible caret
-    // is a fake inverse space); keep that quirk.
     let _guard = RawGuard::new(false).map_err(|_| Cancelled)?;
     let mut zone = FrameZone::new();
     let mut state = MultiState {
@@ -456,9 +394,6 @@ mod tests {
         }
     }
 
-    /// Full-frame snapshot with a locked section: fixed dash counts (2
-    /// leading, 12 trailing locked, 29 trailing list), bullet rows capped by
-    /// `max_shown` with `…and N more`, dim-gutter rail, `└` footer.
     #[test]
     fn frame_with_locked_section_matches_spec_layout() {
         let t = theme();
@@ -509,7 +444,6 @@ mod tests {
         );
     }
 
-    /// The dash runs are literal counts, never width-filled.
     #[test]
     fn section_dash_counts_are_fixed() {
         let t = theme();
@@ -532,8 +466,6 @@ mod tests {
         assert!(!list.ends_with(&"─".repeat(30)), "list: {list:?}");
     }
 
-    /// Search-prompt palette: dim gutter, green (not cyan) active step, cyan
-    /// pointer, inverse-space caret — asserted with explicit codes.
     #[test]
     fn search_prompt_palette_differs_from_clack() {
         let t = theme();
@@ -577,7 +509,6 @@ mod tests {
             query: "alph".to_string(),
             ..MultiState::default()
         };
-        // Matches value of item 0 and label of item 1, not item 2.
         assert_eq!(state.filtered(&its), vec![0, 1]);
     }
 
@@ -600,19 +531,16 @@ mod tests {
         assert!(f.iter().any(|l| l.contains("Search: ta")));
     }
 
-    /// The window is cursor-centred, and overflow in both directions shares
-    /// one dim line joined by two spaces.
     #[test]
     fn scrolled_frame_shows_combined_overflow_line() {
         let t = theme();
         let its = items(10);
-        let opts = base_opts(); // max_visible 3
+        let opts = base_opts();
         let state = MultiState {
             cursor: 5,
             ..MultiState::default()
         };
         let f = plain(&active_frame(&t, &view("Add", &its, &state, &opts)));
-        // start = clamp(5 - 1, 0, 7) = 4 → rows 4..7, 4 above, 3 below.
         assert!(f.iter().any(|l| l.contains("Item 5")));
         let overflow = f.iter().find(|l| l.contains("more")).unwrap();
         assert_eq!(overflow.as_str(), "│  ↑ 4 more  ↓ 3 more");
@@ -668,7 +596,6 @@ mod tests {
         let state = MultiState::default();
         let f = active_frame(&t, &view("Add", &its, &state, &opts));
         let summary = f.iter().find(|l| l.contains("Selected:")).unwrap();
-        // Fully dim: no green anywhere on the line.
         assert!(summary.contains("\x1b[2mSelected: (none)\x1b[22m"), "{summary:?}");
         assert!(!summary.contains("\x1b[32m"), "{summary:?}");
     }
@@ -687,15 +614,11 @@ mod tests {
         assert!(summary.contains("\x1b[32mSelected:\x1b[39m"), "{summary:?}");
     }
 
-    /// The detail pane must render exactly `detail_lines` body rows whether
-    /// the current item has a long detail, a short one, or none, so the
-    /// frame height never changes as the cursor moves.
     #[test]
     fn detail_pane_height_is_fixed() {
         let t = theme();
         let mut its = items(2);
         its[0].detail = Some("word ".repeat(60));
-        // its[1] has no detail.
         let opts = MultiOpts {
             show_detail: true,
             detail_lines: 2,
@@ -709,7 +632,6 @@ mod tests {
         let f_long = plain(&active_frame(&t, &view("Add", &its, &long, &opts)));
         let f_none = plain(&active_frame(&t, &view("Add", &its, &none, &opts)));
         assert_eq!(f_long.len(), f_none.len(), "frame height moved with cursor");
-        // The clipped detail carries the truncation ellipsis.
         assert!(f_long.iter().any(|l| l.ends_with('…')), "{f_long:?}");
     }
 
@@ -788,7 +710,6 @@ mod tests {
         let t = theme();
         let its = items(3);
         let f = done_frame(&t, "Add agents", &its, &["val1".into(), "val0".into()], false);
-        // Selection order, not catalogue order.
         assert_eq!(plain(&f), vec!["◇  Add agents", "│  Item 1, Item 0"]);
         assert!(f[0].starts_with("\x1b[32m◇\x1b[39m"), "symbol: {:?}", f[0]);
         assert!(

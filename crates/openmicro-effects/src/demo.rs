@@ -1,58 +1,29 @@
-//! A scripted walk through every state the board can show.
-//!
-//! # Why this exists
-//!
-//! The BLE GATT server is not wired yet, so on real hardware the device can only
-//! ever reach [`Link::NoDaemon`] and [`Link::Offline`] — the two states it works
-//! out for itself. Everything the *host* drives (agent colours, the spinner, the
-//! decision row) is implemented and unit-tested but has no way to arrive.
-//!
-//! This module fabricates those frames locally so the design can be seen on the
-//! device before the link exists. It is a demo, not a fallback: nothing selects
-//! it automatically, because a board inventing agent states it cannot know would
-//! be actively misleading.
-//!
-//! It lives here rather than in the firmware so the script itself is testable —
-//! and because building the frames means going through `status`, which is the
-//! point: if the demo looks right, the real path renders the same way.
-
 use openmicro_proto::{AgentColors, AgentKind, AgentState, LedFrame, SLOT_COUNT};
 
 use crate::status::{self, Link};
 
-/// How long each scene holds. Long enough to take in a slow `Breath` swell
-/// (3.4 s nominal) without the walk becoming tedious.
 pub const SCENE_MS: u32 = 4000;
 
-/// Brightness the demo renders at.
-/// Full scale. Output is gamma-encoded before it reaches the LEDs, so anything
-/// noticeably below this reads as dim on the real device.
 pub const DEMO_BRIGHTNESS: u8 = 255;
 
-/// What the board is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
-    /// A state the device works out for itself; the ring animates, keys dark.
     Local(Link),
-    /// A frame as the daemon would have sent it.
     Host(LedFrame),
 }
 
-/// One step of the walk, with a label for the serial log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
     pub label: &'static str,
     pub scene: Scene,
 }
 
-/// Number of scenes in the script.
 pub const SCENE_COUNT: usize = 8;
 
 fn one(kind: AgentKind, state: AgentState) -> LedFrame {
     many(&[(kind, state)], 0)
 }
 
-/// A frame with `sessions` occupying slots 0.., focused on `focus`.
 fn many(sessions: &[(AgentKind, AgentState)], focus: usize) -> LedFrame {
     let colors = AgentColors::default();
     let mut frame = LedFrame::BLANK;
@@ -70,7 +41,6 @@ fn many(sessions: &[(AgentKind, AgentState)], focus: usize) -> LedFrame {
     frame
 }
 
-/// The `index`th scene, wrapping.
 pub fn scene(index: usize) -> Step {
     match index % SCENE_COUNT {
         0 => Step { label: "offline — no host at all", scene: Scene::Local(Link::Offline) },
@@ -117,7 +87,6 @@ pub fn scene(index: usize) -> Step {
     }
 }
 
-/// The scene index at `t_ms`, and the scene.
 pub fn scene_at(t_ms: u32) -> (usize, Step) {
     let index = (t_ms / SCENE_MS) as usize % SCENE_COUNT;
     (index, scene(index))
@@ -130,9 +99,6 @@ mod tests {
 
     #[test]
     fn the_script_covers_every_link_state_and_every_agent_state() {
-        // The demo's whole job is to show the design, so anything the design can
-        // express must appear somewhere in the walk — otherwise it ships
-        // unverified by eye.
         let mut motions = std::vec::Vec::new();
         let mut colors = std::vec::Vec::new();
         let mut saw_actions = false;
@@ -171,7 +137,6 @@ mod tests {
 
     #[test]
     fn the_index_is_always_in_range() {
-        // `t_ms` is a wrapping clock, so nothing may index off the end.
         for t in [0u32, 1, SCENE_MS - 1, u32::MAX, u32::MAX - 1] {
             let (i, _) = scene_at(t);
             assert!(i < SCENE_COUNT, "index {i} out of range at t={t}");
@@ -185,14 +150,11 @@ mod tests {
         assert_eq!(f.slots[0].color, AgentKind::Claude.brand());
         assert_eq!(f.slots[1].color, AgentKind::Codex.brand());
         assert_eq!(f.slots[2].color, AgentKind::Grok.brand());
-        // ...and the ring follows the focused one, not an average of them.
         assert_eq!(f.glow.color, AgentKind::Claude.brand());
     }
 
     #[test]
     fn every_host_scene_carries_a_usable_brightness() {
-        // A frame with brightness 0 would render the action keys invisible and
-        // the demo would look broken rather than empty.
         for i in 0..SCENE_COUNT {
             if let Scene::Host(f) = scene(i).scene {
                 assert!(f.brightness > 0, "scene {i} has zero brightness");
@@ -204,7 +166,6 @@ mod tests {
     fn the_waiting_scene_lights_all_three_decision_keys() {
         let Scene::Host(f) = scene(7).scene else { panic!("scene 7 should be a host frame") };
         assert!(f.actions.approve && f.actions.deny);
-        // The transparent-keycap light flashes in the agent's colour.
         assert_eq!(f.status.color, AgentKind::Claude.brand());
         assert_eq!(f.status.effect, openmicro_proto::Effect::Pulse);
         assert_eq!(f.glow.motion, Motion::Alert);
