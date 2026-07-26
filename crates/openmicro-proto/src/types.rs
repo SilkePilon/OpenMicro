@@ -34,6 +34,7 @@ pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    Opencode,
     /// Anything the adapters do not recognise. Deliberately not folded into
     /// one of the above: a mystery agent should look like a mystery, not
     /// impersonate Claude.
@@ -49,6 +50,8 @@ impl AgentKind {
             Self::Codex
         } else if name.eq_ignore_ascii_case("grok") {
             Self::Grok
+        } else if name.eq_ignore_ascii_case("opencode") {
+            Self::Opencode
         } else {
             Self::Other
         }
@@ -66,6 +69,7 @@ impl AgentKind {
             Self::Claude => Rgb { r: 255, g: 120, b: 30 },
             Self::Codex => Rgb { r: 230, g: 230, b: 230 },
             Self::Grok => Rgb { r: 160, g: 60, b: 255 },
+            Self::Opencode => Rgb { r: 0, g: 200, b: 190 },
             Self::Other => Rgb { r: 120, g: 120, b: 120 },
         }
     }
@@ -75,6 +79,7 @@ impl AgentKind {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Grok => "Grok",
+            Self::Opencode => "opencode",
             Self::Other => "agent",
         }
     }
@@ -204,6 +209,7 @@ pub struct AgentColors {
     pub claude: Rgb,
     pub codex: Rgb,
     pub grok: Rgb,
+    pub opencode: Rgb,
     pub other: Rgb,
 }
 
@@ -213,6 +219,7 @@ impl Default for AgentColors {
             claude: AgentKind::Claude.brand(),
             codex: AgentKind::Codex.brand(),
             grok: AgentKind::Grok.brand(),
+            opencode: AgentKind::Opencode.brand(),
             other: AgentKind::Other.brand(),
         }
     }
@@ -224,6 +231,7 @@ impl AgentColors {
             AgentKind::Claude => self.claude,
             AgentKind::Codex => self.codex,
             AgentKind::Grok => self.grok,
+            AgentKind::Opencode => self.opencode,
             AgentKind::Other => self.other,
         }
     }
@@ -233,6 +241,7 @@ impl AgentColors {
             AgentKind::Claude => self.claude = rgb,
             AgentKind::Codex => self.codex = rgb,
             AgentKind::Grok => self.grok = rgb,
+            AgentKind::Opencode => self.opencode = rgb,
             AgentKind::Other => self.other = rgb,
         }
     }
@@ -375,7 +384,13 @@ mod tests {
         // The whole point of brand colours is telling sessions apart at a
         // glance. Two agents within a few units of each other would defeat it,
         // so assert a real separation rather than mere inequality.
-        let kinds = [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok, AgentKind::Other];
+        let kinds = [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Grok,
+            AgentKind::Opencode,
+            AgentKind::Other,
+        ];
         for (i, a) in kinds.iter().enumerate() {
             for b in kinds.iter().skip(i + 1) {
                 let (x, y) = (a.brand(), b.brand());

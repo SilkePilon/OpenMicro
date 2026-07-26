@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -109,19 +110,27 @@ fn read_stdin() -> String {
 
 /// Best-effort: connect to the daemon socket and write one newline-JSON line.
 /// If the daemon is down, silently succeed so hooks never block the agent.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_millis(300);
+const PUSH_DEADLINE: Duration = Duration::from_millis(500);
+
 fn push(agent: &str, session: &str, state: &str) {
-    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let path = format!("{rt}/openmicro.sock");
-    if let Ok(mut stream) = UnixStream::connect(&path) {
-        let mut line = serde_json::json!({
-            "agent": agent,
-            "session": session,
-            "state": state,
-        })
-        .to_string();
-        line.push('\n');
-        let _ = stream.write_all(line.as_bytes());
-    }
+    let path = openmicro_proto::paths::hook_socket();
+    let mut line = serde_json::json!({
+        "agent": agent,
+        "session": session,
+        "state": state,
+    })
+    .to_string();
+    line.push('\n');
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(mut stream) = UnixStream::connect(&path) {
+            let _ = stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT));
+            let _ = stream.write_all(line.as_bytes());
+        }
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(PUSH_DEADLINE);
 }
 
 fn main() {

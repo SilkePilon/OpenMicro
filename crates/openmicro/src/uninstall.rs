@@ -22,21 +22,19 @@ pub enum Target {
     AgentHooks,
     /// `~/.config/openmicro` — settings and the first-run marker.
     Config,
-    /// `~/.cache/openmicro` — downloaded firmware images.
+    /// Downloaded firmware images, in `~/.cache/openmicro` and
+    /// `~/.local/share/openmicro`.
     Cache,
-    /// `~/.local/share/openmicro` — the stock-firmware backup.
-    StockBackup,
 }
 
 /// Every target, in the order they should be offered and removed. Service first
-/// so nothing is holding files open, backup last because it is the dangerous one.
-pub const ALL_TARGETS: [Target; 6] = [
+/// so nothing is holding files open.
+pub const ALL_TARGETS: [Target; 5] = [
     Target::Service,
     Target::Binaries,
     Target::AgentHooks,
     Target::Config,
     Target::Cache,
-    Target::StockBackup,
 ];
 
 impl Target {
@@ -48,23 +46,13 @@ impl Target {
             Target::AgentHooks => "Coding-agent hooks",
             Target::Config => "Settings",
             Target::Cache => "Downloaded firmware",
-            Target::StockBackup => "Stock-firmware backup",
         }
     }
 
-    /// Whether removing this can be undone by reinstalling.
-    ///
-    /// The stock-firmware backup is the only one that cannot be recreated: it
-    /// is a dump of this particular device. Losing it no longer strands anyone
-    /// on custom firmware — Work Louder publish their images, so a restore is
-    /// still possible — but it is the user's data and nobody else has a copy.
-    pub fn is_irreversible(self) -> bool {
-        self == Target::StockBackup
-    }
-
-    /// Whether this is selected by default in the picker.
+    /// Whether this is selected by default in the picker. Everything here can be
+    /// put back by reinstalling, so everything is.
     pub fn default_selected(self) -> bool {
-        !self.is_irreversible()
+        true
     }
 
     /// Stable id used as the multiselect value.
@@ -75,7 +63,6 @@ impl Target {
             Target::AgentHooks => "hooks",
             Target::Config => "config",
             Target::Cache => "cache",
-            Target::StockBackup => "backup",
         }
     }
 
@@ -153,35 +140,29 @@ fn survey_one(target: Target, home: &Path) -> Found {
                 paths,
             }
         }
-        Target::Config => dir_target(target, home.join(".config/openmicro"), "settings"),
+        Target::Config => dir_target(target, cache_dirs_of(target, home), "settings"),
+        Target::Cache => dir_target(target, cache_dirs_of(target, home), "re-downloadable"),
+    }
+}
+
+/// The directories a plain directory target owns.
+fn cache_dirs_of(target: Target, home: &Path) -> Vec<PathBuf> {
+    match target {
         Target::Cache => {
-            dir_target(target, home.join(".cache/openmicro"), "re-downloadable")
+            vec![home.join(".cache/openmicro"), home.join(".local/share/openmicro")]
         }
-        Target::StockBackup => {
-            let dir = home.join(".local/share/openmicro");
-            let backup = crate::flash::backup_path();
-            let present = dir.exists();
-            let detail = if backup.is_file() {
-                let size = std::fs::metadata(&backup).map(|m| m.len()).unwrap_or(0);
-                format!("{} MiB — a dump of this device, not re-creatable", size / (1024 * 1024))
-            } else if present {
-                "no backup image inside".to_string()
-            } else {
-                "nothing saved".to_string()
-            };
-            Found { target, present, paths: vec![dir], detail }
-        }
+        _ => vec![home.join(".config/openmicro")],
     }
 }
 
 /// Describe a plain directory target.
-fn dir_target(target: Target, dir: PathBuf, when_present: &str) -> Found {
-    let present = dir.exists();
+fn dir_target(target: Target, dirs: Vec<PathBuf>, when_present: &str) -> Found {
+    let present = dirs.iter().any(|d| d.exists());
     Found {
         target,
         present,
         detail: if present { when_present.to_string() } else { "nothing saved".to_string() },
-        paths: vec![dir],
+        paths: dirs,
     }
 }
 
@@ -270,16 +251,20 @@ fn remove_one(target: Target, home: &Path) -> Removed {
                 lines.push("no agent hooks were installed".to_string());
             }
         }
-        Target::Config | Target::Cache | Target::StockBackup => {
-            let dir = match target {
-                Target::Config => home.join(".config/openmicro"),
-                Target::Cache => home.join(".cache/openmicro"),
-                _ => home.join(".local/share/openmicro"),
-            };
-            match remove_path(&dir) {
-                Ok(true) => lines.push(format!("removed {}", dir.display())),
-                Ok(false) => lines.push("nothing to remove".to_string()),
-                Err(e) => error = Some(e),
+        Target::Config | Target::Cache => {
+            let mut removed_any = false;
+            for dir in cache_dirs_of(target, home) {
+                match remove_path(&dir) {
+                    Ok(true) => {
+                        removed_any = true;
+                        lines.push(format!("removed {}", dir.display()));
+                    }
+                    Ok(false) => {}
+                    Err(e) => error = Some(e),
+                }
+            }
+            if !removed_any && error.is_none() {
+                lines.push("nothing to remove".to_string());
             }
         }
     }
@@ -344,14 +329,9 @@ mod tests {
     }
 
     #[test]
-    fn only_the_stock_backup_is_irreversible_and_unselected_by_default() {
+    fn every_target_is_selected_by_default() {
         for t in ALL_TARGETS {
-            assert_eq!(
-                t.is_irreversible(),
-                t == Target::StockBackup,
-                "{t:?} irreversibility"
-            );
-            assert_eq!(t.default_selected(), !t.is_irreversible(), "{t:?} default");
+            assert!(t.default_selected(), "{t:?} default");
         }
     }
 

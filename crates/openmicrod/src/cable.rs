@@ -51,9 +51,12 @@ impl CableDevice {
     }
 
     pub fn open_at(port: &Path, input_tx: UnboundedSender<InputEvent>) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(port)
             .map_err(|e| format!("can't open {}: {e}", port.display()))?;
 
@@ -154,6 +157,9 @@ fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputE
                     }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
                 // The device went away. Sleep rather than spin; the daemon's
@@ -162,6 +168,32 @@ fn read_loop(handle: Arc<Mutex<std::fs::File>>, input_tx: UnboundedSender<InputE
             }
         }
     }
+}
+
+const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn write_all_before(
+    file: &mut std::fs::File,
+    mut buf: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match file.write(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    file.flush()
 }
 
 #[async_trait]
@@ -183,7 +215,8 @@ impl DeviceLink for CableDevice {
             .lock()
             .map_err(|_| "serial handle poisoned".to_string())
             .and_then(|mut f| {
-                f.write_all(&framed[..n]).and_then(|_| f.flush()).map_err(|e| e.to_string())
+                let deadline = std::time::Instant::now() + WRITE_DEADLINE;
+                write_all_before(&mut f, &framed[..n], deadline).map_err(|e| e.to_string())
             });
 
         if let Err(e) = result {
@@ -309,6 +342,35 @@ mod tests {
         assert_eq!(got, Some(frame), "the bytes written were not a valid frame");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stalled_write_errors_at_the_deadline_instead_of_blocking() {
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) }, 0);
+        let _read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let filler = [0u8; 4096];
+        loop {
+            match write_end.write(&filler) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected error filling the pipe: {e}"),
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(50);
+        let err = write_all_before(&mut write_end, b"stuck", deadline)
+            .expect_err("a full pipe must error out, not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline did not bound the write"
+        );
     }
 
     #[test]

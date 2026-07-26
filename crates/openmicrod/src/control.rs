@@ -83,13 +83,43 @@ pub fn snapshot(engine: &Engine, battery: Option<openmicro_proto::Battery>) -> S
 /// capture the fields to persist, drop their guards, and then invoke this.
 /// Best-effort: errors are logged, not propagated.
 fn persist(brightness: u8, colors: openmicro_proto::AgentColors, sleep_minutes: u32) {
-    let mut cfg = crate::config::load();
+    persist_to(&crate::config::default_path(), brightness, colors, sleep_minutes);
+}
+
+fn persist_to(
+    path: &std::path::Path,
+    brightness: u8,
+    colors: openmicro_proto::AgentColors,
+    sleep_minutes: u32,
+) {
+    let mut cfg = match crate::config::load_existing_from(path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("openmicrod: {e}; refusing to overwrite it");
+            return;
+        }
+    };
     cfg.brightness = brightness;
     cfg.colors = colors;
     cfg.sleep_minutes = sleep_minutes;
-    if let Err(e) = cfg.save() {
+    if let Err(e) = cfg.save_to(path) {
         eprintln!("openmicrod: failed to persist config: {e}");
     }
+}
+
+fn spawn_persist_writer(engine: Arc<Mutex<Engine>>) -> tokio::sync::mpsc::UnboundedSender<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            while rx.try_recv().is_ok() {}
+            let (brightness, colors, sleep_minutes) = engine.lock().await.to_config_fields();
+            let _ = tokio::task::spawn_blocking(move || {
+                persist(brightness, colors, sleep_minutes)
+            })
+            .await;
+        }
+    });
+    tx
 }
 
 pub async fn serve(
@@ -100,6 +130,7 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    let persist_tx = spawn_persist_writer(engine.clone());
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -133,6 +164,7 @@ pub async fn serve(
         // Command reader: newline-JSON `Command`s from the client.
         let engine_r = engine.clone();
         let device_r = device.clone();
+        let persist_tx = persist_tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(read_half).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -140,26 +172,13 @@ pub async fn serve(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                // Lock order: engine -> device (mirrors ingress). Apply the
-                // command under the locks, capture the fields to persist, then
-                // drop both guards BEFORE doing any blocking filesystem I/O so
-                // other tasks (snapshot writer, ingress hook events) aren't
-                // stalled waiting on the engine lock.
-                let (brightness, colors, sleep_minutes) = {
+                // Lock order: engine -> device (mirrors ingress).
+                {
                     let mut eng = engine_r.lock().await;
                     let mut dev = device_r.lock().await;
                     eng.apply_command(cmd, &mut *dev).await;
-                    let fields = eng.to_config_fields();
-                    drop(dev);
-                    drop(eng);
-                    fields
-                };
-                // No engine/device lock is held here: run the sync read/write
-                // /rename off the async runtime so it can't block other tasks.
-                let _ = tokio::task::spawn_blocking(move || {
-                    persist(brightness, colors, sleep_minutes)
-                })
-                .await;
+                }
+                let _ = persist_tx.send(());
             }
         });
     }
@@ -221,5 +240,56 @@ mod tests {
         let snap = snapshot(&engine, None);
         assert_eq!(snap.battery, None);
         assert!(!snap.charging);
+    }
+
+    #[test]
+    fn persist_to_refuses_to_overwrite_a_broken_config() {
+        let dir = std::env::temp_dir().join(format!("omctl-broken-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = "brightness = \"nope\"";
+        std::fs::write(&path, broken).unwrap();
+
+        persist_to(&path, 42, openmicro_proto::AgentColors::default(), 5);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            broken,
+            "a broken config file was overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_to_preserves_unrelated_fields() {
+        let dir = std::env::temp_dir().join(format!("omctl-keep-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "transport = \"ble\"\nbrightness = 10\n").unwrap();
+
+        persist_to(&path, 42, openmicro_proto::AgentColors::default(), 5);
+
+        let cfg =
+            crate::config::Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.transport, crate::config::Transport::Ble);
+        assert_eq!(cfg.brightness, 42);
+        assert_eq!(cfg.sleep_minutes, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_to_writes_a_missing_config() {
+        let dir = std::env::temp_dir().join(format!("omctl-new-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        persist_to(&path, 42, openmicro_proto::AgentColors::default(), 5);
+
+        let cfg =
+            crate::config::Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.brightness, 42);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

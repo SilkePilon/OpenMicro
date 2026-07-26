@@ -192,10 +192,18 @@ pub fn usb_mode() -> UsbMode {
     let seen = usb_mode_raw();
     // Only pay for the probe when the id cannot settle it; the check costs up to
     // ~600 ms of waiting for a bootloader that will never reply.
-    if seen == UsbMode::Bootloader {
-        return resolve_ambiguous(seen, crate::display::firmware_answers());
+    if seen != UsbMode::Bootloader {
+        return seen;
     }
-    seen
+    // A running daemon is already the answer. It only ever connects to live
+    // firmware, and probing behind its back would put two readers on one
+    // character device — each taking a share of the bytes, so the daemon could
+    // swallow our banner (menu reports "bootloader mode" for a working device)
+    // and we could swallow its key presses.
+    if crate::daemon::is_running() {
+        return resolve_ambiguous(seen, true);
+    }
+    resolve_ambiguous(seen, crate::display::firmware_answers())
 }
 
 /// esptool argv that just talks to whatever is on the port, without resetting

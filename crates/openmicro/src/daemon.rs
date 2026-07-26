@@ -24,10 +24,12 @@ pub const UNIT_REL: &str = ".config/systemd/user/openmicrod.service";
 /// How long to wait for the socket to appear after asking systemd to start.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to wait for the socket to disappear after asking systemd to stop.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Where the daemon publishes its control socket.
 pub fn socket_path() -> PathBuf {
-    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(rt).join("openmicro-ctl.sock")
+    openmicro_proto::paths::control_socket()
 }
 
 /// Path of the systemd user unit, honouring `$XDG_CONFIG_HOME`.
@@ -191,6 +193,57 @@ pub fn enable() -> Result<Vec<String>, String> {
 /// Stop the daemon and stop it starting at login.
 pub fn disable() -> Result<Vec<String>, String> {
     systemctl("disable")
+}
+
+/// Run `job` with the daemon stopped, then start it again.
+///
+/// The daemon holds the device's serial port for as long as it is up, and two
+/// readers on one character device split the byte stream between them. Anything
+/// that talks to the device directly has to have the port to itself, so this
+/// stands the daemon down for the duration and puts it back afterwards.
+///
+/// A daemon that was not running is left alone — including afterwards, so this
+/// never *starts* a service the user had deliberately stopped. Restarting is
+/// best-effort: `job`'s result is what matters, and a failure to bring the
+/// daemon back is appended to the log rather than masking it.
+pub fn with_paused<T>(job: impl FnOnce() -> Result<T, String>) -> Result<(T, Vec<String>), String> {
+    if !is_running() {
+        return job().map(|value| (value, Vec::new()));
+    }
+    if !unit_installed() {
+        return Err(format!(
+            "the background service is running but was not started by systemd, so it \
+             cannot be paused to free the serial port. Stop it by hand, then retry \
+             (no unit at {}).",
+            unit_path().display()
+        ));
+    }
+
+    let mut log = vec!["paused the background service".to_string()];
+    stop()?;
+    wait_until_stopped();
+
+    let result = job();
+
+    match start() {
+        Ok(_) => log.push("background service running again".to_string()),
+        Err(e) => log.push(format!("could not restart the background service: {e}")),
+    }
+    result.map(|value| (value, log))
+}
+
+/// Wait for the socket to go away after asking systemd to stop.
+///
+/// `systemctl stop` returns once systemd is satisfied, which is not quite the
+/// same instant the daemon's file descriptors are closed.
+fn wait_until_stopped() {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        if !is_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Restart the daemon, waiting for the socket again.

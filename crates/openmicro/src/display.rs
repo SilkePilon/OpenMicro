@@ -232,12 +232,18 @@ pub fn firmware_answers() -> bool {
 }
 
 /// Send `mode` to whichever port the device is on.
-pub fn send(mode: Mode) -> Result<String, String> {
+///
+/// The daemon is stood down for the write and started again afterwards: it holds
+/// the same port, and two readers on one character device take a share of the
+/// bytes each. Demo and identify keep running across the restart because the
+/// firmware ignores host frames in those modes.
+pub fn send(mode: Mode) -> Result<Vec<String>, String> {
     let port = find_port().ok_or_else(|| {
         "No serial port found. Is the device plugged in with a cable?".to_string()
     })?;
-    send_to(&port, mode)?;
-    Ok(format!("{} mode, via {}", mode.label(), port.display()))
+    let (_, mut log) = crate::daemon::with_paused(|| send_to(&port, mode))?;
+    log.push(format!("{} mode, via {}", mode.label(), port.display()));
+    Ok(log)
 }
 
 #[cfg(test)]

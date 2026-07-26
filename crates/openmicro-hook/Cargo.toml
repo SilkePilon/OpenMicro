@@ -4,5 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+openmicro-proto = { path = "../openmicro-proto", features = ["std"] }
 serde_json.workspace = true
 clap.workspace = true

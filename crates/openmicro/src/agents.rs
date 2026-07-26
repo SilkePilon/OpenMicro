@@ -29,6 +29,33 @@ pub const HOOK_EVENTS: [(&str, &str); 4] = [
 /// The `notify` line the Codex CLI adapter needs as a **root** key.
 pub const CODEX_NOTIFY_LINE: &str = r#"notify = ["openmicro-hook", "codex-notify"]"#;
 
+/// The whole opencode plugin, written verbatim to
+/// [`AgentKind::config_rel`]. opencode auto-loads every file in its plugin
+/// directory, so unlike the other adapters there is nothing to merge: the file
+/// is ours entirely, installing overwrites it and uninstalling deletes it.
+pub const OPENCODE_PLUGIN: &str = r#"// Installed by OpenMicro (openmicro > Coding agents). Safe to delete.
+const AGENT = "opencode"
+
+function push(session, state) {
+  try {
+    Bun.spawn(
+      ["openmicro-hook", "push", "--agent", AGENT, "--session", session || "default", "--state", state],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+    ).unref()
+  } catch (_) {}
+}
+
+export const OpenMicro = async () => ({
+  "chat.message": async ({ sessionID }) => push(sessionID, "thinking"),
+  "tool.execute.before": async ({ sessionID }) => push(sessionID, "working"),
+  "permission.ask": async (permission) => push(permission.sessionID, "awaiting_approval"),
+  event: async ({ event }) => {
+    if (event.type === "session.idle") push(event.properties.sessionID, "idle")
+    else if (event.type === "permission.replied") push(event.properties.sessionID, "working")
+  },
+})
+"#;
+
 /// Substring that identifies a hook command as ours, used to keep installation
 /// idempotent (we never append a second copy of our own hook).
 const HOOK_MARKER: &str = "openmicro-hook";
@@ -39,11 +66,12 @@ pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
 /// Every adapter, in display order.
-pub const ALL_AGENTS: [AgentKind; 3] =
-    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok];
+pub const ALL_AGENTS: [AgentKind; 4] =
+    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok, AgentKind::Opencode];
 
 /// How an agent's hooks are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +81,8 @@ pub enum Mechanism {
     ClaudeHooks { agent_flag: Option<&'static str> },
     /// Codex CLI `notify` root key in a TOML config.
     CodexNotify,
+    /// A plugin file dropped into opencode's plugin directory.
+    OpencodePlugin,
 }
 
 impl AgentKind {
@@ -62,6 +92,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Grok => "grok",
+            AgentKind::Opencode => "opencode",
         }
     }
 
@@ -71,6 +102,7 @@ impl AgentKind {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex CLI",
             AgentKind::Grok => "Grok Code",
+            AgentKind::Opencode => "opencode",
         }
     }
 
@@ -80,6 +112,7 @@ impl AgentKind {
             AgentKind::Claude => ".claude/settings.json",
             AgentKind::Codex => ".codex/config.toml",
             AgentKind::Grok => ".grok/user-settings.json",
+            AgentKind::Opencode => ".config/opencode/plugin/openmicro.js",
         }
     }
 
@@ -89,6 +122,7 @@ impl AgentKind {
             AgentKind::Claude => &[".claude", ".claude.json"],
             AgentKind::Codex => &[".codex"],
             AgentKind::Grok => &[".grok"],
+            AgentKind::Opencode => &[".config/opencode", ".opencode"],
         }
     }
 
@@ -99,6 +133,7 @@ impl AgentKind {
             AgentKind::Claude => &["claude"],
             AgentKind::Codex => &["codex"],
             AgentKind::Grok => &["grok", "grok-cli"],
+            AgentKind::Opencode => &["opencode"],
         }
     }
 
@@ -108,6 +143,7 @@ impl AgentKind {
             AgentKind::Claude => Mechanism::ClaudeHooks { agent_flag: None },
             AgentKind::Grok => Mechanism::ClaudeHooks { agent_flag: Some("grok") },
             AgentKind::Codex => Mechanism::CodexNotify,
+            AgentKind::Opencode => Mechanism::OpencodePlugin,
         }
     }
 
@@ -147,11 +183,20 @@ pub fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// True if one of the agent's config markers exists under `home`.
+///
+/// Split out from [`is_present`] because it is the only half that respects the
+/// `home` argument — the other consults the real `PATH`, which no scratch
+/// directory can control, so a test written against `is_present` passes or fails
+/// depending on what happens to be installed on the machine running it.
+pub fn has_marker(kind: AgentKind, home: &Path) -> bool {
+    kind.markers().iter().any(|m| home.join(m).exists())
+}
+
 /// True if the agent looks installed: a config marker exists, or one of its
 /// executables is on `PATH`.
 pub fn is_present(kind: AgentKind, home: &Path) -> bool {
-    kind.markers().iter().any(|m| home.join(m).exists())
-        || crate::flash::which(kind.binaries()).is_some()
+    has_marker(kind, home) || crate::flash::which(kind.binaries()).is_some()
 }
 
 /// Read an agent's config file, returning `""` when it does not exist yet
@@ -193,7 +238,38 @@ pub fn hook_status(kind: AgentKind, home: &Path) -> HookStatus {
                 Ok(_) => HookStatus::Missing,
             }
         }
+        Mechanism::OpencodePlugin => {
+            let contents = match read_config(kind, home) {
+                Ok(c) => c,
+                Err(e) => return HookStatus::Blocked(e),
+            };
+            if opencode_plugin_installed(&contents) {
+                HookStatus::Installed
+            } else if contents.is_empty() || opencode_plugin_is_ours(&contents) {
+                HookStatus::Missing
+            } else {
+                HookStatus::Blocked(format!(
+                    "{} already exists and was not written by OpenMicro.",
+                    home.join(kind.config_rel()).display()
+                ))
+            }
+        }
     }
+}
+
+/// True when the file at [`AgentKind::config_rel`] is our current plugin.
+///
+/// An older OpenMicro plugin counts as *not* installed, so re-running the
+/// installer refreshes it rather than reporting "already installed" and leaving
+/// a stale file behind.
+pub fn opencode_plugin_installed(existing: &str) -> bool {
+    existing == OPENCODE_PLUGIN
+}
+
+/// True when the file is one of ours, current or not. Only these are deleted on
+/// uninstall — a plugin the user wrote themselves is left alone.
+fn opencode_plugin_is_ours(existing: &str) -> bool {
+    existing.contains(HOOK_MARKER)
 }
 
 /// Build the picker rows for every adapter: presence, hook status, target path.
@@ -325,14 +401,22 @@ pub fn remove_claude_hooks(existing: &str) -> Result<String, String> {
         return Ok(existing.to_string()); // nothing of ours to remove
     };
 
+    // Only keys this pass actually emptied are dropped. An event the user left
+    // empty on purpose is theirs, and was never ours to tidy away.
+    let mut emptied: Vec<String> = Vec::new();
     for (event, _) in HOOK_EVENTS {
         let Some(groups) = hooks.get_mut(event).and_then(|g| g.as_array_mut()) else {
             continue;
         };
+        let before = groups.len();
         groups.retain(|g| !group_has_openmicro_hook(g));
+        if groups.is_empty() && before > 0 {
+            emptied.push(event.to_string());
+        }
     }
-    // Drop keys we emptied, but never one the user had other hooks in.
-    hooks.retain(|_, v| !v.as_array().is_some_and(|a| a.is_empty()));
+    for event in emptied {
+        hooks.remove(&event);
+    }
     let hooks_empty = hooks.is_empty();
     if hooks_empty {
         obj.remove("hooks");
@@ -400,6 +484,13 @@ pub fn uninstall(kind: AgentKind, home: &Path) -> Result<InstallReport, String> 
     let stripped = match kind.mechanism() {
         Mechanism::ClaudeHooks { .. } => remove_claude_hooks(&existing)?,
         Mechanism::CodexNotify => remove_codex_notify(&existing)?,
+        Mechanism::OpencodePlugin => {
+            if opencode_plugin_is_ours(&existing) {
+                String::new()
+            } else {
+                existing.clone()
+            }
+        }
     };
     if stripped == existing {
         return Ok(InstallReport { kind, path, changed: false, backup: None });
@@ -535,6 +626,17 @@ pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
     let merged = match kind.mechanism() {
         Mechanism::ClaudeHooks { agent_flag } => merge_claude_hooks(&existing, agent_flag)?,
         Mechanism::CodexNotify => insert_codex_notify(&existing)?,
+        Mechanism::OpencodePlugin => {
+            if existing.is_empty() || opencode_plugin_is_ours(&existing) {
+                OPENCODE_PLUGIN.to_string()
+            } else {
+                return Err(format!(
+                    "{} already exists and was not written by OpenMicro. \
+                     Move it aside, then re-run.",
+                    path.display()
+                ));
+            }
+        }
     };
 
     if merged == existing {
@@ -906,14 +1008,94 @@ mod tests {
         assert_eq!(claude.status, HookStatus::Missing);
         assert!(claude.config_path.ends_with(".claude/settings.json"));
 
-        let grok = rows.iter().find(|r| r.kind == AgentKind::Grok).unwrap();
-        assert!(!grok.present, "no ~/.grok in this scratch home");
+        // Presence is asserted through `has_marker`, not `present`: the latter
+        // also consults the real PATH, so whether this passes would depend on
+        // what the machine running the tests happens to have installed.
+        assert!(has_marker(AgentKind::Claude, home.path()));
+        assert!(!has_marker(AgentKind::Grok, home.path()));
+        assert!(!has_marker(AgentKind::Opencode, home.path()));
     }
 
     #[test]
     fn detect_covers_every_adapter() {
         let home = TempHome::new("all");
         assert_eq!(detect(home.path()).len(), ALL_AGENTS.len());
+    }
+
+    #[test]
+    fn the_opencode_plugin_runs_the_hook_for_all_four_states() {
+        // The plugin is the whole adapter, so its text is the contract. If a
+        // state stops being pushed the macropad silently shows stale colours.
+        for state in ["thinking", "working", "awaiting_approval", "idle"] {
+            assert!(OPENCODE_PLUGIN.contains(state), "no {state} transition in the plugin");
+        }
+        assert!(OPENCODE_PLUGIN.contains(HOOK_MARKER));
+        assert!(OPENCODE_PLUGIN.contains("session.idle"));
+        assert!(OPENCODE_PLUGIN.contains("permission.ask"));
+    }
+
+    #[test]
+    fn installing_opencode_writes_the_plugin_and_uninstalling_deletes_it() {
+        let home = TempHome::new("opencode");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Missing);
+        let report = install(AgentKind::Opencode, home.path()).unwrap();
+        assert!(report.changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OPENCODE_PLUGIN);
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Installed);
+
+        assert!(!install(AgentKind::Opencode, home.path()).unwrap().changed);
+
+        assert!(uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert!(!path.exists(), "uninstall must take the plugin file with it");
+        assert!(!uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+    }
+
+    #[test]
+    fn a_stale_openmicro_plugin_is_refreshed_rather_than_reported_installed() {
+        let home = TempHome::new("opencode-stale");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// old openmicro-hook plugin\n").unwrap();
+
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Missing);
+        assert!(install(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OPENCODE_PLUGIN);
+    }
+
+    #[test]
+    fn someone_elses_opencode_plugin_is_never_overwritten_or_deleted() {
+        let home = TempHome::new("opencode-foreign");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let theirs = "export const Mine = async () => ({})\n";
+        std::fs::write(&path, theirs).unwrap();
+
+        assert!(matches!(
+            hook_status(AgentKind::Opencode, home.path()),
+            HookStatus::Blocked(_)
+        ));
+        assert!(install(AgentKind::Opencode, home.path()).is_err());
+        assert!(!uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+    }
+
+    #[test]
+    fn removing_our_hooks_leaves_an_event_the_user_deliberately_emptied() {
+        // `"SessionStart": []` is the user's, not ours. Tidying it away on
+        // uninstall would edit a file we were asked to put back as we found it.
+        let existing = serde_json::json!({
+            "hooks": {
+                "SessionStart": [],
+                "Stop": [ { "hooks": [ { "type": "command", "command": "openmicro-hook x" } ] } ]
+            }
+        })
+        .to_string();
+        let out = remove_claude_hooks(&existing).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["hooks"].get("SessionStart").is_some(), "{out}");
+        assert!(parsed["hooks"].get("Stop").is_none(), "{out}");
     }
 
     #[test]

@@ -94,8 +94,11 @@ impl Snapshot {
 
     fn firmware_hint(&self) -> String {
         match (&self.image, &self.cached_version) {
-            (Some(_), Some(v)) => format!("{v} downloaded"),
-            (Some(p), None) => format!("image at {}", short_path(p)),
+            // Only the downloaded image carries a version. `resolve_image`
+            // prefers a local source build, and calling that build by the last
+            // downloaded release's name would name the wrong binary.
+            (Some(p), Some(v)) if *p == firmware::cache_image() => format!("{v} downloaded"),
+            (Some(p), _) => format!("image at {}", short_path(p)),
             (None, _) => "no image yet".to_string(),
         }
     }
@@ -173,8 +176,13 @@ fn main_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<Action, Cancelled> {
         SelectOption::new(Action::Live, "Watch agent activity").with_hint(
             if snapshot.daemon.running { "live view" } else { "needs the service running" },
         ),
-        SelectOption::new(Action::Settings, "Lights and sleep")
-            .with_hint("brightness, per-state colours, idle timeout"),
+        SelectOption::new(Action::Settings, "Lights and sleep").with_hint(
+            if snapshot.daemon.running {
+                "brightness, per-agent colours, idle timeout"
+            } else {
+                "needs the service running"
+            },
+        ),
         SelectOption::new(Action::Firmware, "Firmware").with_hint(snapshot.firmware_hint()),
         SelectOption::new(Action::Agents, "Coding agents").with_hint(snapshot.agents_hint()),
         SelectOption::new(Action::Daemon, "Background service")
@@ -249,14 +257,10 @@ where
 fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     ui.note(
         "Before you start",
-        "OpenMicro replaces the firmware on your macropad with its own build.\n\
+        "OpenMicro replaces the firmware on your macropad with its own build. The\n\
+         vendor does not support this, and it may void your warranty.\n\
          \n\
-         This is not something the vendor supports, and it may void your warranty.\n\
-         \n\
-         Going back is straightforward: Work Louder publish their firmware openly,\n\
-         and Firmware > Restore the stock firmware downloads and writes it. Taking\n\
-         a backup first is still offered, since that keeps your exact current image\n\
-         rather than a stock one.",
+         To go back, use Firmware > Restore the stock firmware.",
     );
     if !ui.confirm("Understood — continue?", false)? {
         return Ok(());
@@ -275,10 +279,7 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         }
         (UsbMode::Absent, _) => {
             spinner.error("No macropad found");
-            ui.error(
-                "Connect it over USB with a data-capable cable — charge-only cables \
-                 enumerate nothing.",
-            );
+            ui.error("No macropad on USB. Connect it with a data-capable cable.");
             return Ok(());
         }
         (UsbMode::Bootloader, _) => spinner.stop("Found it, already in bootloader mode"),
@@ -303,19 +304,7 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
         }
     }
 
-    // 3. Offer the backup while we still can — after flashing it is too late.
-    let backup = flash::backup_path();
-    if backup.is_file() {
-        ui.step(&format!("Stock firmware already backed up to {}", short_path(&backup)));
-    } else if ui.confirm("Back up your current firmware first? (optional)", false)?
-        && port_is_clear(ui)?
-    {
-        run_job(ui, "Reading the stock firmware", "Stock firmware saved", || {
-            flash::backup(None, None).map(|(_, lines)| lines)
-        });
-    }
-
-    // 4. Get an image, then write it.
+    // 3. Get an image, then write it.
     if obtain_firmware(ui)?.is_none() {
         return Ok(());
     }
@@ -325,14 +314,7 @@ fn guided_setup(ui: &mut Ui) -> Result<(), Cancelled> {
     if !run_job(ui, "Flashing", "Firmware written", || flash::flash_capture(None, None)) {
         return Ok(());
     }
-    // The write deliberately leaves the device in the bootloader: entering it
-    // set the force-download bit, which survives a reset, so a device that
-    // simply rebooted here would come straight back to download mode and never
-    // run the firmware that was just written. Clearing the bit and resetting is
-    // what actually starts it.
-    run_job(ui, "Starting the new firmware", "Device restarted", || {
-        wldevice::exit_bootloader(None)
-    });
+    start_firmware(ui);
 
     finish_setup(ui)
 }
@@ -422,10 +404,7 @@ fn firmware_source(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
             });
             Ok(built)
         }
-        "blocked" => {
-            ui.warn("Install the Xtensa toolchain first: cargo install espup && espup install");
-            Ok(None)
-        }
+        "blocked" => Ok(None),
         _ => Ok(None),
     }
 }
@@ -465,11 +444,7 @@ fn download_release(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
             if Some(&r.tag) == default.as_ref() {
                 hint.push_str("  (recommended)");
             }
-            SelectOption::new(
-                r.blocker().is_none().then(|| r.clone()),
-                r.label(),
-            )
-            .with_hint(hint)
+            SelectOption::new(Some(r.clone()), r.label()).with_hint(hint)
         })
         .chain(std::iter::once(SelectOption::new(None, "Back")))
         .collect();
@@ -477,6 +452,12 @@ fn download_release(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let Some(release) = ui.select("Which version?", &options)? else {
         return Ok(None);
     };
+    // A release with no flashable asset is still listed — its hint says why —
+    // but picking it must say so rather than silently behaving like "Back".
+    if let Some(why) = release.blocker() {
+        ui.warn(why);
+        return Ok(None);
+    }
 
     let mut path = None;
     run_job(ui, &format!("Downloading {}", release.tag), "Firmware downloaded", || {
@@ -500,14 +481,8 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
         } else {
             "will reboot into bootloader mode first".to_string()
         }),
-        SelectOption::new("backup", "Back up the stock firmware")
-            .with_hint("optional — keeps your exact current image"),
         SelectOption::new("restore", "Restore the stock firmware")
-            .with_hint(if flash::backup_path().is_file() {
-                "download Work Louder's, or use your backup"
-            } else {
-                "downloads Work Louder's published firmware"
-            }),
+            .with_hint("downloads Work Louder's published firmware"),
         SelectOption::new("back", "Back"),
     ];
 
@@ -529,23 +504,8 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                     flash::flash_capture(None, None)
                 })
             {
-    // The write deliberately leaves the device in the bootloader: entering it
-    // set the force-download bit, which survives a reset, so a device that
-    // simply rebooted here would come straight back to download mode and never
-    // run the firmware that was just written. Clearing the bit and resetting is
-    // what actually starts it.
-                run_job(ui, "Starting the new firmware", "Device restarted", || {
-                    wldevice::exit_bootloader(None)
-                });
+                start_firmware(ui);
             }
-        }
-        "backup" => {
-            if !ensure_bootloader(ui)? || !port_is_clear(ui)? {
-                return Ok(());
-            }
-            run_job(ui, "Reading the stock firmware", "Stock firmware saved", || {
-                flash::backup(None, None).map(|(_, lines)| lines)
-            });
         }
         "restore" => restore_stock(ui)?,
         _ => {}
@@ -556,32 +516,10 @@ fn firmware_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
 /// Put the vendor's firmware back on the device.
 ///
 /// Work Louder publish unencrypted merged images to a public GitHub repo, so
-/// going back no longer depends on having taken a backup first — that was the
-/// single scariest thing about installing OpenMicro. A backup, if one exists,
-/// is still offered because it is the user's *exact* image including their
-/// settings, which a stock release is not.
+/// going back is just a download.
 fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
-    let backup = flash::backup_path();
-    let mut options = vec![SelectOption::new(
-        "official",
-        "Download Work Louder's firmware",
-    )
-    .with_hint("published releases — no backup needed")];
-    if backup.is_file() {
-        options.push(
-            SelectOption::new("backup", "Use my own backup")
-                .with_hint(short_path(&backup)),
-        );
-    }
-    options.push(SelectOption::new("back", "Back"));
-
-    let image = match ui.select("Which stock firmware?", &options)? {
-        "official" => match download_stock(ui)? {
-            Some(path) => path,
-            None => return Ok(()),
-        },
-        "backup" => backup,
-        _ => return Ok(()),
+    let Some(image) = download_stock(ui)? else {
+        return Ok(());
     };
 
     ui.note(
@@ -600,7 +538,7 @@ fn restore_stock(ui: &mut Ui) -> Result<(), Cancelled> {
     }
     let image_for_job = image.clone();
     if run_job(ui, "Restoring the stock firmware", "Stock firmware restored", move || {
-        flash::restore(Some(&image_for_job), None)
+        flash::restore(&image_for_job, None)
     }) {
         run_job(ui, "Starting the vendor firmware", "Device restarted", || {
             wldevice::exit_bootloader(None)
@@ -638,8 +576,7 @@ fn download_stock(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
                 Some(_) => "no merged image in this release".to_string(),
                 None => format!("{} KiB", r.asset_size / 1024),
             };
-            SelectOption::new(r.blocker().is_none().then(|| r.clone()), r.label())
-                .with_hint(hint)
+            SelectOption::new(Some(r.clone()), r.label()).with_hint(hint)
         })
         .chain(std::iter::once(SelectOption::new(None, "Back")))
         .collect();
@@ -647,6 +584,10 @@ fn download_stock(ui: &mut Ui) -> Result<Option<PathBuf>, Cancelled> {
     let Some(release) = ui.select("Which vendor version?", &options)? else {
         return Ok(None);
     };
+    if let Some(why) = release.blocker() {
+        ui.warn(why);
+        return Ok(None);
+    }
 
     let mut path = None;
     run_job(ui, &format!("Downloading {}", release.tag), "Vendor firmware downloaded", || {
@@ -669,6 +610,19 @@ fn port_is_clear(ui: &mut Ui) -> Result<bool, Cancelled> {
     };
     ui.note("Something else is using the serial port", &warning);
     ui.confirm("Try anyway?", false)
+}
+
+/// Start the firmware that was just written.
+///
+/// Flashing deliberately leaves the device in the bootloader: entering it set
+/// the force-download bit, which survives a reset, so a device that simply
+/// rebooted would come straight back to download mode and never run the
+/// firmware that was just written. Clearing the bit and resetting is what
+/// actually starts it.
+fn start_firmware(ui: &mut Ui) {
+    run_job(ui, "Starting the new firmware", "Device restarted", || {
+        wldevice::exit_bootloader(None)
+    });
 }
 
 /// Put the device into bootloader mode if it is not already, asking first.
@@ -729,8 +683,7 @@ fn agents_flow(ui: &mut Ui) -> Result<(), Cancelled> {
                 .with_hint(short_path(&r.config_path))
                 .with_detail(if r.present {
                     format!(
-                        "Detected on this computer. Its hooks will be merged into {}, \
-                         keeping everything already in there.",
+                        "Detected here. Merged into {}; your existing settings are kept.",
                         short_path(&r.config_path)
                     )
                 } else {
@@ -814,7 +767,11 @@ fn daemon_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
         SelectOption::new("restart", "Restart it"),
         SelectOption::new(
             "enable",
-            if snapshot.daemon.enabled { "Stop starting it at login" } else { "Start it at login" },
+            if snapshot.daemon.enabled {
+                "Stop starting it at login"
+            } else {
+                "Start it at login (starts it now too)"
+            },
         ),
         SelectOption::new("back", "Back"),
     ];
@@ -848,10 +805,10 @@ fn device_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
             .with_hint(match snapshot.usb {
                 UsbMode::Bootloader => "already there",
                 UsbMode::Absent => "device not connected",
-                UsbMode::App(_) => "sends sys.bootloader over USB",
+                UsbMode::App(_) => "asks the firmware to reboot",
             }),
         SelectOption::new("exit", "Leave bootloader mode").with_hint(match snapshot.usb {
-            UsbMode::Bootloader => "clears the download-boot flag and resets",
+            UsbMode::Bootloader => "restarts it into its firmware",
             _ => "not in bootloader mode",
         }),
         SelectOption::new("lights", "What the lights are doing")
@@ -873,12 +830,9 @@ fn device_menu(ui: &mut Ui, snapshot: &Snapshot) -> Result<(), Cancelled> {
                     .with_hint("back to showing real agent state"),
             ];
             let mode = ui.select("What should the lights do?", &modes)?;
-            // Sent straight down USB-Serial-JTAG rather than through the daemon:
-            // the daemon talks to the device over BLE, and that is not wired yet.
-            match display::send(mode) {
-                Ok(msg) => ui.success(&msg),
-                Err(e) => ui.warn(&e),
-            }
+            run_job(ui, "Switching the lights", &format!("{} mode", mode.label()), || {
+                display::send(mode)
+            });
         }
         "check" => {
             let mut spinner = ui.spinner();
@@ -996,7 +950,11 @@ fn live_status(ui: &mut Ui) -> Result<(), Cancelled> {
 
     let snap = std::sync::Arc::new(std::sync::Mutex::new(client::SnapshotDto::default()));
     let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_snapshot_reader(snap.clone(), connected.clone());
+    // Dropped when this function returns, which is what stops the reader. Without
+    // it every visit to this screen left another thread reconnecting forever, and
+    // the daemon spawns a 1 Hz writer task per connection.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_snapshot_reader(snap.clone(), connected.clone(), stop.clone());
 
     let style = ui.style();
     let bar = style.dim(ui.symbols().bar);
@@ -1025,27 +983,38 @@ fn live_status(ui: &mut Ui) -> Result<(), Cancelled> {
         Ok(())
     })();
 
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = result {
         ui.error(&format!("live view stopped: {e}"));
     }
     Ok(())
 }
 
-/// Follow the daemon's control socket in the background, keeping `snap` fresh.
+/// Follow the daemon's control socket in the background, keeping `snap` fresh
+/// until `stop` is set.
+///
+/// The read itself blocks, so the flag is only checked between lines and between
+/// reconnects; the thread therefore outlives the screen by at most one snapshot
+/// (the daemon writes at 1 Hz). What matters is that it does not outlive it
+/// forever, which is what leaked a thread and a daemon-side task per visit.
 fn spawn_snapshot_reader(
     snap: std::sync::Arc<std::sync::Mutex<client::SnapshotDto>>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::io::BufRead;
     use std::sync::atomic::Ordering;
 
     std::thread::spawn(move || {
         let path = daemon::socket_path();
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             match std::os::unix::net::UnixStream::connect(&path) {
                 Ok(stream) => {
                     connected.store(true, Ordering::Relaxed);
                     for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
                         if let Some(parsed) = client::parse_snapshot(&line) {
                             *snap.lock().unwrap() = parsed;
                         }
@@ -1115,6 +1084,7 @@ fn settings_menu(ui: &mut Ui) -> Result<(), Cancelled> {
                 openmicro_proto::AgentKind::Claude,
                 openmicro_proto::AgentKind::Codex,
                 openmicro_proto::AgentKind::Grok,
+                openmicro_proto::AgentKind::Opencode,
                 openmicro_proto::AgentKind::Other,
             ]
             .into_iter()
@@ -1239,18 +1209,9 @@ fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
     let items: Vec<Item> = present
         .iter()
         .map(|f| {
-            let detail = if f.target.is_irreversible() {
-                format!(
-                    "Cannot be re-created — it is a dump of this device. {} \
-                     (Work Louder's own firmware can still be downloaded.)",
-                    f.detail
-                )
-            } else {
-                format!("{} Reinstalling OpenMicro restores this.", f.detail)
-            };
             Item::new(f.target.id(), f.target.label())
                 .with_hint(f.detail.clone())
-                .with_detail(detail)
+                .with_detail("Reinstalling OpenMicro restores this.".to_string())
         })
         .collect();
 
@@ -1275,21 +1236,7 @@ fn uninstall_flow(ui: &mut Ui) -> Result<(), Cancelled> {
         return Ok(());
     }
 
-    let mut targets: Vec<Target> = chosen.iter().filter_map(|id| Target::from_id(id)).collect();
-
-    // The backup gets its own question. It is the one thing here that cannot be
-    // undone by reinstalling, so a single "remove these?" is not enough consent.
-    if targets.contains(&Target::StockBackup) {
-        ui.warn(
-            "You chose to delete the stock-firmware backup. It is the only copy of this \
-             device's exact original image; Work Louder's published firmware can still be \
-             downloaded, but your own snapshot cannot be re-created.",
-        );
-        if !ui.confirm("Delete the stock-firmware backup as well?", false)? {
-            targets.retain(|t| *t != Target::StockBackup);
-            ui.info("Keeping the backup; removing everything else.");
-        }
-    }
+    let targets: Vec<Target> = chosen.iter().filter_map(|id| Target::from_id(id)).collect();
     if targets.is_empty() {
         ui.info("Nothing left to remove.");
         return Ok(());
@@ -1420,12 +1367,24 @@ mod tests {
         let with_path = Snapshot { image: Some(PathBuf::from("/tmp/fw.bin")), ..base.clone() };
         assert!(with_path.firmware_hint().contains("/tmp/fw.bin"));
 
-        let with_version = Snapshot {
+        // A version is only claimed for the downloaded image. `resolve_image`
+        // prefers a local source build, and naming that build after the last
+        // release downloaded would name the wrong binary.
+        let downloaded = Snapshot {
+            image: Some(firmware::cache_image()),
+            cached_version: Some("v1.2.0".to_string()),
+            ..base.clone()
+        };
+        assert!(downloaded.firmware_hint().contains("v1.2.0"));
+
+        let source_build = Snapshot {
             image: Some(PathBuf::from("/tmp/fw.bin")),
             cached_version: Some("v1.2.0".to_string()),
             ..base
         };
-        assert!(with_version.firmware_hint().contains("v1.2.0"));
+        let hint = source_build.firmware_hint();
+        assert!(hint.contains("/tmp/fw.bin"), "{hint}");
+        assert!(!hint.contains("v1.2.0"), "a source build is not the downloaded release: {hint}");
     }
 
     #[test]

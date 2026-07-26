@@ -416,7 +416,14 @@ pub fn build() -> Result<(PathBuf, Vec<String>), String> {
 /// release list is not consulted at all.
 pub fn download(version: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
     if let Some(url) = forced_url() {
-        return download_from(&url, &format!("({FIRMWARE_URL_ENV})"));
+        let result = download_from(&url, &format!("({FIRMWARE_URL_ENV})"));
+        if result.is_ok() {
+            // The cached image is now a completely different binary. Leaving the
+            // old release tag behind would have the menu offer "use the firmware
+            // I already have — version vX" for something that is not vX.
+            let _ = std::fs::remove_file(cache_version_file());
+        }
+        return result;
     }
     let releases = fetch_releases()?;
     let release = pick_release(&releases, version)?;

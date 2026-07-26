@@ -19,12 +19,6 @@ use config::Transport;
 use device::MockDevice;
 use engine::Engine;
 
-fn runtime_dir() -> std::path::PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = config::load();
@@ -154,9 +148,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let rt = runtime_dir();
-    let hook_path = rt.join("openmicro.sock");
-    let ctl_path = rt.join("openmicro-ctl.sock");
+    let hook_path = openmicro_proto::paths::hook_socket();
+    let ctl_path = openmicro_proto::paths::control_socket();
 
     {
         let engine = engine.clone();

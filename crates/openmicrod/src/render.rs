@@ -6,7 +6,7 @@
 //! not there to ask, so there is exactly one definition of what amber means.
 
 use openmicro_effects::status;
-use openmicro_proto::{AgentColors, AgentKind, AgentState, Glow, LedFrame, LedSlot, SLOT_COUNT};
+use openmicro_proto::{AgentColors, AgentKind, AgentState, LedFrame, LedSlot, SLOT_COUNT};
 
 /// One agent key's worth of state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +64,16 @@ pub fn render_frame(
     frame
 }
 
-/// The ring when the daemon has nothing to say yet.
-pub fn idle_glow(brightness: u8) -> Glow {
-    status::no_agents_glow(brightness)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use openmicro_proto::Glow;
+
+    /// The ring when the daemon has nothing to say yet.
+    fn idle_glow(brightness: u8) -> Glow {
+        status::no_agents_glow(brightness)
+    }
 
     use openmicro_proto::layout;
     use openmicro_proto::{AgentColors, Effect, Motion, Rgb};

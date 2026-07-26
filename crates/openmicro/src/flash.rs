@@ -22,14 +22,6 @@ pub const DEFAULT_IMAGE_REL: &str =
 /// esptool/espflash chip argument for this board.
 pub const CHIP: &str = "esp32s3";
 
-/// Where a full stock-firmware backup is written by [`backup`] and read back by
-/// [`restore`]. Keeping the original image is what makes going back to the
-/// stock firmware possible at all.
-pub const BACKUP_REL: &str = ".local/share/openmicro/stock-firmware.bin";
-
-/// Flash size dumped by [`backup`]: 4 MiB, the Micro 2's documented size.
-pub const FLASH_SIZE: &str = "0x400000";
-
 /// What (if anything) OpenMicro sees on the USB bus for the Micro 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
@@ -339,90 +331,15 @@ pub fn espflash_args(chip: &str, port: Option<&str>, image: &Path) -> Vec<String
     args
 }
 
-/// Build the `esptool` argument vector to read the whole flash into `dest` —
-/// the stock-firmware backup that makes a later [`restore`] possible.
+/// Put one of Work Louder's published firmware images back on the device.
 ///
-/// Carries the same reset options as [`esptool_args`], and for the same
-/// reason. Without them esptool ends the session with its default hard reset
-/// "via RTS pin", which this board does not have: on a real device that tore
-/// the link down partway through and the read died with "Packet content
-/// transfer stopped".
-pub fn backup_args(chip: &str, port: Option<&str>, dest: &Path, major: Option<u32>) -> Vec<String> {
-    let mut args = vec!["--chip".to_string(), chip.to_string()];
-    if let Some(p) = port {
-        args.push("--port".to_string());
-        args.push(p.to_string());
-    }
-    args.push("--before".to_string());
-    args.push("usb-reset".to_string());
-    args.push("--after".to_string());
-    args.push("watchdog-reset".to_string());
-    args.push(subcommand("read_flash", major));
-    args.push("0x0".to_string());
-    args.push(FLASH_SIZE.to_string());
-    args.push(dest.display().to_string());
-    args
-}
-
-/// Default path of the stock-firmware backup.
-pub fn backup_path() -> PathBuf {
-    crate::agents::home().join(BACKUP_REL)
-}
-
-/// Dump the device's entire flash to `dest` (default [`backup_path`]) so the
-/// original firmware can be put back later.
-///
-/// Requires `esptool` and a device in bootloader mode, exactly like flashing.
-/// Returns the captured output lines.
-pub fn backup(dest: Option<&Path>, port: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
-    let esptool = esptool_path().ok_or_else(|| {
-        "reading the stock firmware needs esptool. Install it: pip install esptool.".to_string()
-    })?;
-    require_bootloader()?;
-
-    let dest = dest.map(|p| p.to_path_buf()).unwrap_or_else(backup_path);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-
-    let args = backup_args(CHIP, port, &dest, esptool_major(&esptool));
-
-    // Reading 4 MiB over USB-Serial-JTAG is long enough that a single hiccup
-    // (a competing opener, a dropped packet) loses the whole thing. One retry
-    // costs a minute and saves the user starting over by hand.
-    let mut attempt = 0;
-    let lines = loop {
-        attempt += 1;
-        let output = Command::new(&esptool)
-            .args(&args)
-            .output()
-            .map_err(|e| format!("failed to launch esptool ({}): {e}", esptool.display()))?;
-        let mut lines = combine_output(&output.stdout, &output.stderr);
-        if output.status.success() {
-            break lines;
-        }
-        lines.push(format!("esptool exited with {}.", exit_desc(output.status.code())));
-        if attempt >= 2 || !is_transient_transfer_error(&lines) {
-            return Err(lines.join("\n"));
-        }
-    };
-    let mut lines = lines;
-    lines.push(format!("stock firmware saved to {}", dest.display()));
-    Ok((dest, lines))
-}
-
-/// Write a previously saved stock-firmware backup back to the device.
-///
-/// This is the "undo" for installing custom firmware. The image is either a
-/// backup [`backup`] took of this device, or one of Work Louder's own published
-/// releases — see `crate::firmware::fetch_stock_releases`.
-pub fn restore(image: Option<&Path>, port: Option<&str>) -> Result<Vec<String>, String> {
-    let path = image.map(|p| p.to_path_buf()).unwrap_or_else(backup_path);
+/// This is the "undo" for installing custom firmware — see
+/// `crate::firmware::fetch_stock_releases` for where the image comes from.
+pub fn restore(image: &Path, port: Option<&str>) -> Result<Vec<String>, String> {
+    let path = image.to_path_buf();
     if !path.is_file() {
         return Err(format!(
-            "no firmware image at {}. Download one of Work Louder's published \
-             releases, or point this at a backup you took earlier.",
+            "no firmware image at {}. Download one of Work Louder's published releases.",
             path.display()
         ));
     }
@@ -454,24 +371,12 @@ pub fn combine_output(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// True when a failure looks like a stalled transfer rather than a real fault.
-///
-/// esptool reports a dropped stream as "Packet content transfer stopped" or a
-/// timeout; both are worth one retry, whereas "no serial data received" means
-/// the device is not listening and retrying just wastes a minute.
-pub fn is_transient_transfer_error(lines: &[String]) -> bool {
-    let text = lines.join(" ").to_ascii_lowercase();
-    text.contains("packet content transfer stopped")
-        || text.contains("timed out waiting for packet")
-        || text.contains("corrupt data")
-}
-
 /// Warn about anything known to fight us for the serial port.
 ///
 /// ModemManager probes every new `ttyACM` device, and on this board that means
-/// it opens the very port a flash or a 4 MiB backup is streaming over. The
-/// symptom is a transfer that dies partway through with "Packet content
-/// transfer stopped", which looks like a hardware fault and is not one.
+/// it opens the very port a flash is streaming over. The symptom is a transfer
+/// that dies partway through with "Packet content transfer stopped", which looks
+/// like a hardware fault and is not one.
 ///
 /// Returns `None` when nothing is known to be in the way.
 pub fn port_contention() -> Option<String> {
@@ -488,12 +393,9 @@ pub fn port_contention() -> Option<String> {
     }
     Some(
         "ModemManager is running. It opens every new /dev/ttyACM* device, which \
-         interrupts flashing and firmware backups partway through (\"Packet content \
-         transfer stopped\").\n\n\
+         interrupts flashing partway through.\n\n\
          Stop it for now:\n    sudo systemctl stop ModemManager\n\n\
-         Or exclude the device permanently:\n    \
-         echo 'ATTRS{idVendor}==\"303a\", ENV{ID_MM_DEVICE_IGNORE}=\"1\"' | \
-         sudo tee /etc/udev/rules.d/99-openmicro.rules && sudo udevadm control --reload"
+         To exclude the device permanently, see docs/troubleshooting.md."
             .to_string(),
     )
 }
@@ -517,15 +419,11 @@ fn require_bootloader() -> Result<(), String> {
 
 /// Guidance shown when the device is plugged in but running its firmware.
 pub const BOOTLOADER_HINT_CONNECTED: &str =
-    "the Micro 2 is connected but running normally, not in bootloader mode. It uses native \
-     USB-Serial-JTAG with no auto-reset, so you must enter download mode by hand: hold the \
-     boot/power button while plugging in USB, then release once it re-enumerates.";
+    "the Micro 2 is connected but running normally, not in bootloader mode.";
 
 /// Guidance shown when no Micro 2 is on the bus at all.
 pub const BOOTLOADER_HINT_ABSENT: &str =
-    "no Micro 2 detected on USB. Plug it in with a data-capable USB cable, and to enter \
-     bootloader mode hold the boot/power button while connecting (native USB-Serial-JTAG has \
-     no auto-reset).";
+    "no Micro 2 detected on USB. Connect it with a data-capable cable.";
 
 /// Like [`flash`], but captures esptool's combined stdout/stderr and returns it
 /// as lines (for the TUI's scrollable output area) instead of streaming to the
@@ -773,34 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn backup_args_read_the_whole_flash() {
-        let args = backup_args("esp32s3", None, Path::new("/tmp/stock.bin"), Some(4));
-        assert_eq!(
-            args,
-            vec![
-                "--chip",
-                "esp32s3",
-                "--before",
-                "usb-reset",
-                "--after",
-                "watchdog-reset",
-                "read_flash",
-                "0x0",
-                FLASH_SIZE,
-                "/tmp/stock.bin"
-            ]
-        );
-    }
-
-    #[test]
-    fn backup_args_include_the_port_when_given() {
-        let args = backup_args("esp32s3", Some("/dev/ttyACM0"), Path::new("/tmp/s.bin"), Some(4));
-        assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]));
-    }
-
-    #[test]
-    fn restore_without_a_backup_refuses() {
-        let err = restore(Some(Path::new("/definitely/not/here/stock.bin")), None).unwrap_err();
+    fn restoring_a_missing_image_refuses() {
+        let err = restore(Path::new("/definitely/not/here/stock.bin"), None).unwrap_err();
         assert!(err.contains("no firmware image"), "{err}");
         assert!(err.contains("Work Louder"), "points at the vendor releases: {err}");
     }
@@ -823,28 +695,4 @@ mod tests {
         assert!(esptool_major(&path).is_some(), "could not parse esptool version");
     }
 
-    #[test]
-    fn backup_args_carry_the_same_reset_options_as_flashing() {
-        // Their absence is what killed a real 4 MiB read partway through:
-        // esptool ended the session with a hard reset "via RTS pin", which this
-        // board does not have.
-        let args = backup_args("esp32s3", None, Path::new("/tmp/s.bin"), Some(5));
-        assert!(args.windows(2).any(|w| w == ["--before", "usb-reset"]), "{args:?}");
-        assert!(args.windows(2).any(|w| w == ["--after", "watchdog-reset"]), "{args:?}");
-        assert!(args.contains(&"read-flash".to_string()), "{args:?}");
-    }
-
-    #[test]
-    fn transient_transfer_errors_are_told_apart_from_real_ones() {
-        let stalled = vec!["A fatal error occurred: Packet content transfer stopped".to_string()];
-        assert!(is_transient_transfer_error(&stalled));
-        let absent = vec!["No serial data received.".to_string()];
-        assert!(!is_transient_transfer_error(&absent), "retrying this just wastes a minute");
-        assert!(!is_transient_transfer_error(&[]));
-    }
-
-    #[test]
-    fn backup_path_is_under_the_users_data_dir() {
-        assert!(backup_path().ends_with(BACKUP_REL));
-    }
 }

@@ -69,6 +69,9 @@ pub struct BleDevice {
     /// connection.
     last_reconnect_attempt: Option<Instant>,
     input_tx: UnboundedSender<InputEvent>,
+    battery_tx: UnboundedSender<Battery>,
+    input_task: tokio::task::JoinHandle<()>,
+    battery_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BleDevice {
@@ -96,12 +99,14 @@ impl BleDevice {
         adapter.set_powered(true).await?;
 
         let handles = discover_and_resolve(&adapter).await?;
-        spawn_input_task(&handles.input, input_tx.clone()).await?;
-        if let Some(battery) = &handles.battery {
-            spawn_battery_task(battery, battery_tx).await?;
-        } else {
-            eprintln!("ble: device exposes no Battery Service; battery unavailable");
-        }
+        let input_task = spawn_input_task(&handles.input, input_tx.clone()).await?;
+        let battery_task = match &handles.battery {
+            Some(battery) => Some(spawn_battery_task(battery, battery_tx.clone()).await?),
+            None => {
+                eprintln!("ble: device exposes no Battery Service; battery unavailable");
+                None
+            }
+        };
 
         Ok(BleDevice {
             adapter,
@@ -110,6 +115,9 @@ impl BleDevice {
             connected: true,
             last_reconnect_attempt: None,
             input_tx,
+            battery_tx,
+            input_task,
+            battery_task,
         })
     }
 
@@ -123,7 +131,17 @@ impl BleDevice {
         for attempt in 0..max_attempts {
             match discover_and_resolve(&self.adapter).await {
                 Ok(handles) => {
-                    spawn_input_task(&handles.input, self.input_tx.clone()).await?;
+                    self.input_task.abort();
+                    if let Some(task) = self.battery_task.take() {
+                        task.abort();
+                    }
+                    self.input_task = spawn_input_task(&handles.input, self.input_tx.clone()).await?;
+                    self.battery_task = match &handles.battery {
+                        Some(battery) => {
+                            Some(spawn_battery_task(battery, self.battery_tx.clone()).await?)
+                        }
+                        None => None,
+                    };
                     self.led = handles.led;
                     self.connected = true;
                     return Ok(());
@@ -135,6 +153,15 @@ impl BleDevice {
             }
         }
         anyhow::bail!("ble: reconnect exhausted after {max_attempts} attempts")
+    }
+}
+
+impl Drop for BleDevice {
+    fn drop(&mut self) {
+        self.input_task.abort();
+        if let Some(task) = self.battery_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -219,9 +246,9 @@ async fn device_matches(device: &bluer::Device, service_uuid: Uuid) -> bool {
 async fn spawn_input_task(
     input: &Characteristic,
     input_tx: UnboundedSender<InputEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let mut notify = Box::pin(input.notify().await?);
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         while let Some(bytes) = notify.next().await {
             match InputEvent::decode(&bytes) {
                 Ok(ev) => {
@@ -232,8 +259,7 @@ async fn spawn_input_task(
                 Err(e) => eprintln!("ble: failed to decode InputEvent: {e}"),
             }
         }
-    });
-    Ok(())
+    }))
 }
 
 /// Read the initial battery level and subscribe to its notifications,
@@ -245,7 +271,7 @@ async fn spawn_input_task(
 async fn spawn_battery_task(
     battery: &Characteristic,
     battery_tx: UnboundedSender<Battery>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Best-effort initial read so the UI has a value before the first notify.
     if let Ok(bytes) = battery.read().await {
         if let Some(&pct) = bytes.first() {
@@ -253,7 +279,7 @@ async fn spawn_battery_task(
         }
     }
     let mut notify = Box::pin(battery.notify().await?);
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         while let Some(bytes) = notify.next().await {
             match bytes.first() {
                 Some(&pct) => {
@@ -264,8 +290,7 @@ async fn spawn_battery_task(
                 None => eprintln!("ble: empty battery-level notification"),
             }
         }
-    });
-    Ok(())
+    }))
 }
 
 #[async_trait]

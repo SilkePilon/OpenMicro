@@ -506,6 +506,9 @@ async fn led_render_task(
         while let Ok(frame) = LED_FRAME_CHANNEL.try_receive() {
             held = frame;
             LAST_FRAME_MS.store(t_ms, core::sync::atomic::Ordering::Relaxed);
+            if frame != LedFrame::BLANK {
+                touch_activity(t_ms);
+            }
         }
 
         let idle_for = t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed));
