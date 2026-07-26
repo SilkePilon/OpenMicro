@@ -653,6 +653,7 @@ dependencies = [
  "crossterm",
  "futures",
  "hidapi",
+ "libc",
  "openmicro-proto",
  "serde",
  "serde_json",
@@ -672,6 +673,7 @@ name = "openmicro-hook"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "openmicro-proto",
  "serde_json",
 ]
 
@@ -692,6 +694,8 @@ dependencies = [
  "async-trait",
  "bluer",
  "futures",
+ "libc",
+ "openmicro-effects",
  "openmicro-proto",
  "serde",
  "serde_json",

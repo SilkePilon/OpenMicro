@@ -1,65 +1,36 @@
-//! What is the macropad doing right now: is it plugged in, is it reachable over
-//! Bluetooth, and which firmware is it running?
-//!
-//! The setup wizard branches entirely on this, so the classification rules are
-//! pure functions over a [`Probe`] and the I/O that fills a `Probe` in is kept
-//! to one place. The BLE half needs a bounded scan (seconds), so callers run
-//! [`probe`] on a worker thread and keep rendering.
-
 use std::time::Duration;
 
 use openmicro_proto::ble::{ADV_NAME_PREFIX, OPENMICRO_SERVICE_UUID};
 
 use crate::flash::{self, DeviceState};
 
-/// How long a single BLE discovery scan runs before giving up.
 pub const BLE_SCAN: Duration = Duration::from_secs(4);
 
-/// What a BLE scan found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BleState {
-    /// A device advertising the OpenMicro GATT service (or the OpenMicro name
-    /// prefix) — this is our firmware, already running.
     OpenMicro,
-    /// A device whose advertised name looks like a Creator/Codex Micro but that
-    /// does **not** expose the OpenMicro service: the stock firmware.
-    /// Heuristic — the stock firmware's advertised name is not documented.
     StockLike,
-    /// Scanned successfully, saw no macropad.
     Absent,
-    /// No Bluetooth stack available (no adapter, `bluetoothd` not running, or
-    /// the scan could not start). Distinct from `Absent`: we learned nothing.
     Unavailable,
 }
 
-/// Advertised-name fragments (lowercased) that suggest a stock Micro 2.
 const STOCK_NAME_HINTS: [&str; 3] = ["creator micro", "codex micro", "micro 2"];
 
-/// How the host can currently reach the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Connection {
-    /// On the USB bus (either running or in bootloader mode).
     Cable,
-    /// Only over Bluetooth — flashing is impossible until a cable is attached.
     Ble,
-    /// Not reachable at all.
     None,
 }
 
-/// Which firmware the device appears to be running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareKind {
-    /// OpenMicro custom firmware (BLE service present).
     OpenMicro,
-    /// The vendor's stock firmware.
     Stock,
-    /// In ROM bootloader mode: no firmware is running, and it is ready to flash.
     Bootloader,
-    /// Nothing found, or nothing that identifies itself.
     Unknown,
 }
 
-/// One point-in-time observation of the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Probe {
     pub usb: DeviceState,
@@ -73,8 +44,6 @@ impl Default for Probe {
 }
 
 impl Probe {
-    /// How we can reach the device. A cable wins over BLE: it is the only
-    /// transport that can flash.
     pub fn connection(self) -> Connection {
         match self.usb {
             DeviceState::Bootloader | DeviceState::NormalDevice => Connection::Cable,
@@ -85,12 +54,6 @@ impl Probe {
         }
     }
 
-    /// Best guess at the running firmware.
-    ///
-    /// Bootloader mode is reported first: no firmware is running at all then,
-    /// and it is the state the whole flashing flow is waiting for. Otherwise
-    /// the OpenMicro BLE service is the only positive identification we have;
-    /// a device enumerating as the vendor's USB product id is stock.
     pub fn firmware(self) -> FirmwareKind {
         if self.usb == DeviceState::Bootloader {
             return FirmwareKind::Bootloader;
@@ -104,44 +67,24 @@ impl Probe {
         FirmwareKind::Unknown
     }
 
-    /// True when we can see the device at all.
     pub fn any_device(self) -> bool {
         self.connection() != Connection::None
     }
 }
 
-/// Take one observation: enumerate USB, then (only if that found nothing
-/// conclusive) scan BLE.
-///
-/// The BLE scan is skipped whenever USB already answers the question, because
-/// it costs seconds and holds the Bluetooth adapter — and a cabled device is
-/// exactly the case where the wizard needs to react quickly.
 pub fn probe() -> Probe {
     let usb = flash::classify_usb(&flash::detect_usb());
     let ble = match usb {
-        // A cabled device tells us everything the wizard branches on.
         DeviceState::Bootloader | DeviceState::NormalDevice => BleState::Unavailable,
         DeviceState::Absent => scan_ble(BLE_SCAN),
     };
     Probe { usb, ble }
 }
 
-/// Scan for a BLE macropad, blocking for at most `timeout`.
-///
-/// Runs its own single-threaded Tokio runtime so the synchronous TUI can call
-/// it from a worker thread without an async runtime of its own. Any failure to
-/// reach BlueZ is reported as [`BleState::Unavailable`] rather than an error:
-/// "we could not look" and "we looked and found nothing" lead to different
-/// wizard text, and conflating them would tell the user to plug in a cable for
-/// a device that is not even paired.
 pub fn scan_ble(timeout: Duration) -> BleState {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
         return BleState::Unavailable;
     };
-    // Hard outer bound. The discovery loop already stops at `timeout`, but the
-    // BlueZ handshake before it (session, adapter, set_powered) is unbounded
-    // D-Bus I/O — and a scan that never returns would wedge the wizard's poll
-    // loop, which only ever keeps one probe in flight.
     rt.block_on(async {
         match tokio::time::timeout(timeout * 2, scan_ble_async(timeout)).await {
             Ok(state) => state,
@@ -170,15 +113,11 @@ async fn scan_ble_async(timeout: Duration) -> BleState {
     let mut best = BleState::Absent;
     loop {
         match tokio::time::timeout_at(deadline, events.next()).await {
-            // Scan window elapsed, or the event stream ended.
             Err(_) | Ok(None) => break,
             Ok(Some(bluer::AdapterEvent::DeviceAdded(addr))) => {
                 let Ok(device) = adapter.device(addr) else { continue };
                 match classify_device(&device).await {
-                    // A positive OpenMicro identification is final.
                     BleState::OpenMicro => return BleState::OpenMicro,
-                    // Keep scanning: a stock-looking device may still turn out
-                    // to be sitting next to an OpenMicro one.
                     BleState::StockLike => best = BleState::StockLike,
                     _ => {}
                 }
@@ -189,7 +128,6 @@ async fn scan_ble_async(timeout: Duration) -> BleState {
     best
 }
 
-/// Classify one discovered BLE device.
 async fn classify_device(device: &bluer::Device) -> BleState {
     if let Ok(Some(uuids)) = device.uuids().await {
         if uuids.contains(&uuid::Uuid::from_u128(OPENMICRO_SERVICE_UUID)) {
@@ -201,10 +139,6 @@ async fn classify_device(device: &bluer::Device) -> BleState {
 }
 
 impl BleState {
-    /// Classify a device purely from its advertised name.
-    ///
-    /// Pure, so the (necessarily heuristic) stock-firmware matching is testable
-    /// without a Bluetooth adapter.
     pub fn from_name(name: &str) -> BleState {
         if name.starts_with(ADV_NAME_PREFIX) {
             return BleState::OpenMicro;
@@ -264,9 +198,6 @@ mod tests {
 
     #[test]
     fn no_bluetooth_stack_is_not_the_same_as_no_device() {
-        // Unavailable must not be reported as a reachable BLE connection: the
-        // wizard would otherwise tell the user to swap to a cable for a device
-        // it never actually saw.
         let probe = p(DeviceState::Absent, BleState::Unavailable);
         assert_eq!(probe.connection(), Connection::None);
         assert_eq!(probe.firmware(), FirmwareKind::Unknown);
@@ -295,7 +226,6 @@ mod tests {
 
     #[test]
     fn probe_does_not_panic_without_hardware() {
-        // No Micro 2 attached in CI/dev; probe() must still return a value.
         let probe = probe();
         assert!(matches!(
             probe.usb,

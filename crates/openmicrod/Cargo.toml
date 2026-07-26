@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 openmicro-proto = { path = "../openmicro-proto", features = ["std"] }
+# The visual design — which colour, which motion, for what — lives here so the
+# daemon and the firmware cannot disagree about it.
+openmicro-effects = { path = "../openmicro-effects" }
 serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 toml.workspace = true
@@ -14,3 +17,4 @@ async-trait.workspace = true
 bluer.workspace = true
 uuid.workspace = true
 futures.workspace = true
+libc.workspace = true

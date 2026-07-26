@@ -1,9 +1,3 @@
-//! Real Bluetooth Low Energy `DeviceLink` backend built on `bluer` (BlueZ).
-//!
-//! Talks to (future) OpenMicro firmware over the custom GATT service defined in
-//! `openmicro_proto::ble`. The daemon keeps `MockDevice` as the default; this
-//! backend is only used when the config selects `Transport::Ble`.
-
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -19,61 +13,41 @@ use openmicro_proto::{Battery, InputEvent, LedFrame};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-/// Expand a 16-bit Bluetooth SIG UUID to its full 128-bit form using the
-/// Bluetooth Base UUID (`0000xxxx-0000-1000-8000-00805f9b34fb`).
 fn bt_uuid16(v: u16) -> Uuid {
     Uuid::from_u128(0x0000_0000_0000_1000_8000_0080_5f9b_34fb_u128 | ((v as u128) << 96))
 }
 
 use crate::device::DeviceLink;
 
-/// How long a single discovery scan is allowed to run before giving up.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-/// Backoff is capped at this many seconds.
 const BACKOFF_CAP_SECS: u64 = 30;
-/// Minimum time between reconnect *attempts* triggered from `set_leds`. Bounds
-/// how often a down link can trigger a (bounded) discovery attempt, so a dead
-/// device can't turn every render into a stall.
 const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
-/// Hard cap on a single in-call reconnect attempt from `set_leds`, independent
-/// of `discover_and_resolve`'s own 15s discovery timeout. This is what bounds
-/// the worst-case time `set_leds` can hold its callers' locks while the link
-/// is down.
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Capped exponential backoff: `min(2^attempt, 30)` seconds.
-///
-/// Pure function so it can be unit-tested without a Bluetooth adapter.
 pub fn backoff_delay(attempt: u32) -> Duration {
     let secs = 2u64.checked_pow(attempt).unwrap_or(u64::MAX).min(BACKOFF_CAP_SECS);
     Duration::from_secs(secs)
 }
 
-/// A connected set of GATT characteristics. The battery level characteristic
-/// is optional: not every device exposes the standard Battery Service.
 struct Handles {
     led: Characteristic,
     input: Characteristic,
     battery: Option<Characteristic>,
 }
 
-/// BLE-backed device link.
 pub struct BleDevice {
     adapter: Adapter,
     led: Characteristic,
     last: LedFrame,
     connected: bool,
-    /// When the last reconnect attempt (successful or not) was made, used to
-    /// gate how often `set_leds` will retrigger discovery while the link is
-    /// down. `None` means no attempt has been made since the last successful
-    /// connection.
     last_reconnect_attempt: Option<Instant>,
     input_tx: UnboundedSender<InputEvent>,
+    battery_tx: UnboundedSender<Battery>,
+    input_task: tokio::task::JoinHandle<()>,
+    battery_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BleDevice {
-    /// True once at least `RECONNECT_COOLDOWN` has elapsed since the last
-    /// reconnect attempt (or no attempt has been made yet).
     fn reconnect_cooldown_elapsed(&self) -> bool {
         match self.last_reconnect_attempt {
             None => true,
@@ -83,10 +57,6 @@ impl BleDevice {
 }
 
 impl BleDevice {
-    /// Discover an OpenMicro device, connect, and resolve GATT handles.
-    ///
-    /// The caller owns the receiving half of `input_tx`; input notifications are
-    /// decoded on a background task and forwarded through the channel.
     pub async fn connect(
         input_tx: UnboundedSender<InputEvent>,
         battery_tx: UnboundedSender<Battery>,
@@ -96,12 +66,14 @@ impl BleDevice {
         adapter.set_powered(true).await?;
 
         let handles = discover_and_resolve(&adapter).await?;
-        spawn_input_task(&handles.input, input_tx.clone()).await?;
-        if let Some(battery) = &handles.battery {
-            spawn_battery_task(battery, battery_tx).await?;
-        } else {
-            eprintln!("ble: device exposes no Battery Service; battery unavailable");
-        }
+        let input_task = spawn_input_task(&handles.input, input_tx.clone()).await?;
+        let battery_task = match &handles.battery {
+            Some(battery) => Some(spawn_battery_task(battery, battery_tx.clone()).await?),
+            None => {
+                eprintln!("ble: device exposes no Battery Service; battery unavailable");
+                None
+            }
+        };
 
         Ok(BleDevice {
             adapter,
@@ -110,20 +82,27 @@ impl BleDevice {
             connected: true,
             last_reconnect_attempt: None,
             input_tx,
+            battery_tx,
+            input_task,
+            battery_task,
         })
     }
 
-    /// Re-run discovery and re-resolve handles using capped exponential backoff.
-    ///
-    /// Called from the `set_leds` failure path with a small `max_attempts`
-    /// (currently 1) so it can't stall the render path for the full
-    /// exponential-backoff cap; a fuller standalone supervisor (retrying in
-    /// the background, independent of any particular write) can come later.
     pub async fn reconnect(&mut self, max_attempts: u32) -> anyhow::Result<()> {
         for attempt in 0..max_attempts {
             match discover_and_resolve(&self.adapter).await {
                 Ok(handles) => {
-                    spawn_input_task(&handles.input, self.input_tx.clone()).await?;
+                    self.input_task.abort();
+                    if let Some(task) = self.battery_task.take() {
+                        task.abort();
+                    }
+                    self.input_task = spawn_input_task(&handles.input, self.input_tx.clone()).await?;
+                    self.battery_task = match &handles.battery {
+                        Some(battery) => {
+                            Some(spawn_battery_task(battery, self.battery_tx.clone()).await?)
+                        }
+                        None => None,
+                    };
                     self.led = handles.led;
                     self.connected = true;
                     return Ok(());
@@ -138,8 +117,15 @@ impl BleDevice {
     }
 }
 
-/// Scan for a device advertising our service (or whose name starts with the
-/// advertised prefix), connect, and locate the LED + INPUT characteristics.
+impl Drop for BleDevice {
+    fn drop(&mut self) {
+        self.input_task.abort();
+        if let Some(task) = self.battery_task.take() {
+            task.abort();
+        }
+    }
+}
+
 async fn discover_and_resolve(adapter: &Adapter) -> anyhow::Result<Handles> {
     let service_uuid = Uuid::from_u128(OPENMICRO_SERVICE_UUID);
     let device = tokio::time::timeout(DISCOVERY_TIMEOUT, find_device(adapter, service_uuid))
@@ -184,7 +170,6 @@ async fn discover_and_resolve(adapter: &Adapter) -> anyhow::Result<Handles> {
     }
 }
 
-/// Drive discovery until a matching device is found.
 async fn find_device(adapter: &Adapter, service_uuid: Uuid) -> anyhow::Result<bluer::Device> {
     let mut events = adapter.discover_devices().await?;
     while let Some(event) = events.next().await {
@@ -200,7 +185,6 @@ async fn find_device(adapter: &Adapter, service_uuid: Uuid) -> anyhow::Result<bl
     anyhow::bail!("ble: device discovery stream ended without a match")
 }
 
-/// A device matches if it advertises our service UUID or its name has our prefix.
 async fn device_matches(device: &bluer::Device, service_uuid: Uuid) -> bool {
     if let Ok(Some(uuids)) = device.uuids().await {
         if uuids.contains(&service_uuid) {
@@ -215,57 +199,47 @@ async fn device_matches(device: &bluer::Device, service_uuid: Uuid) -> bool {
     false
 }
 
-/// Subscribe to the INPUT characteristic and forward decoded events.
 async fn spawn_input_task(
     input: &Characteristic,
     input_tx: UnboundedSender<InputEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let mut notify = Box::pin(input.notify().await?);
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         while let Some(bytes) = notify.next().await {
             match InputEvent::decode(&bytes) {
                 Ok(ev) => {
                     if input_tx.send(ev).is_err() {
-                        break; // receiver dropped
+                        break;
                     }
                 }
                 Err(e) => eprintln!("ble: failed to decode InputEvent: {e}"),
             }
         }
-    });
-    Ok(())
+    }))
 }
 
-/// Read the initial battery level and subscribe to its notifications,
-/// forwarding each reading as a `Battery`.
-///
-/// The standard Battery Level characteristic (0x2A19) is a single byte, the
-/// percentage 0..=100. Plain BLE Battery Service carries no charging state, so
-/// `charging` is reported as `false`.
 async fn spawn_battery_task(
     battery: &Characteristic,
     battery_tx: UnboundedSender<Battery>,
-) -> anyhow::Result<()> {
-    // Best-effort initial read so the UI has a value before the first notify.
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     if let Ok(bytes) = battery.read().await {
         if let Some(&pct) = bytes.first() {
             let _ = battery_tx.send(Battery { pct, charging: false });
         }
     }
     let mut notify = Box::pin(battery.notify().await?);
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         while let Some(bytes) = notify.next().await {
             match bytes.first() {
                 Some(&pct) => {
                     if battery_tx.send(Battery { pct, charging: false }).is_err() {
-                        break; // receiver dropped
+                        break;
                     }
                 }
                 None => eprintln!("ble: empty battery-level notification"),
             }
         }
-    });
-    Ok(())
+    }))
 }
 
 #[async_trait]
@@ -280,20 +254,10 @@ impl DeviceLink for BleDevice {
             }
         };
 
-        // `set_leds` runs while the caller holds BOTH the engine and device
-        // mutexes (ingress/control/sleeper/input all lock engine->device), so
-        // everything below must be tightly bounded: a down link must not be
-        // able to stall the whole daemon.
-        //
-        // If we already know the link is down and haven't waited out the
-        // cooldown yet, skip the write entirely — don't even touch the
-        // (possibly stale) characteristic. The frame is already cached in
-        // `self.last` above, so `last_frame()` stays correct.
         if !self.connected && !self.reconnect_cooldown_elapsed() {
             return;
         }
 
-        // Prefer write-without-response for low-latency LED updates.
         let req = CharacteristicWriteRequest {
             op_type: WriteOp::Command,
             ..Default::default()
@@ -302,38 +266,12 @@ impl DeviceLink for BleDevice {
             eprintln!("ble: LED write failed, marking disconnected: {e}");
             let was_already_down = !self.connected;
             self.connected = false;
-            // Start (or restart) the cooldown clock on every failure, not
-            // just when we actually attempt discovery below. This is what
-            // guarantees at most one reconnect attempt per
-            // `RECONNECT_COOLDOWN`: the very next call, within the cooldown
-            // window, hits the top-of-function skip above instead of
-            // reaching this branch at all.
             self.last_reconnect_attempt = Some(Instant::now());
 
             if !was_already_down {
-                // First failure since we were last connected: just mark down
-                // and cache — no discovery attempt yet. This keeps a
-                // brand-new failure cheap; recovery is attempted starting
-                // from the next call, once the cooldown above has passed.
                 return;
             }
 
-            // Best-effort, bounded reconnect: a single attempt (not the full
-            // exponential-backoff supervisor `reconnect` supports), AND
-            // capped by a short outer timeout independent of
-            // `discover_and_resolve`'s own 15s discovery timeout. Together
-            // with the cooldown above, this bounds the worst-case lock hold
-            // to ~RECONNECT_ATTEMPT_TIMEOUT (2s), at most once per
-            // RECONNECT_COOLDOWN (5s) while the link stays down. On success,
-            // retry the write once; on any failure/timeout, the frame stays
-            // cached in `self.last` and `connected` stays false — the next
-            // `set_leds` call (after the cooldown) will attempt this same
-            // recovery again.
-            //
-            // NOTE: this talks to real BlueZ/adapter state and cannot be
-            // exercised without hardware in CI. Validated on hardware only.
-            // It must never fabricate success: a failed/timed-out retry here
-            // is reported exactly like an unrecovered failure today.
             match tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, self.reconnect(1)).await {
                 Ok(Ok(())) => {
                     if let Err(e) = self.led.write_ext(&bytes, &req).await {
@@ -371,21 +309,17 @@ mod tests {
         assert_eq!(backoff_delay(2), Duration::from_secs(4));
         assert_eq!(backoff_delay(3), Duration::from_secs(8));
         assert_eq!(backoff_delay(4), Duration::from_secs(16));
-        // Capped at 30s from here on.
         assert_eq!(backoff_delay(5), Duration::from_secs(30));
         assert_eq!(backoff_delay(10), Duration::from_secs(30));
-        // No overflow panic for large attempts.
         assert_eq!(backoff_delay(1000), Duration::from_secs(30));
     }
 
     #[test]
     fn bt_uuid16_expands_to_base_uuid() {
-        // Battery Service 0x180F -> 0000180f-0000-1000-8000-00805f9b34fb.
         assert_eq!(
             bt_uuid16(0x180F),
             Uuid::parse_str("0000180f-0000-1000-8000-00805f9b34fb").unwrap()
         );
-        // Battery Level 0x2A19.
         assert_eq!(
             bt_uuid16(0x2A19),
             Uuid::parse_str("00002a19-0000-1000-8000-00805f9b34fb").unwrap()

@@ -4,7 +4,6 @@ use openmicro_proto::LedFrame;
 #[async_trait]
 pub trait DeviceLink: Send {
     async fn set_leds(&mut self, frame: &LedFrame);
-    /// Used by tests and by future device backends; kept on the trait surface.
     #[allow(dead_code)]
     fn last_frame(&self) -> LedFrame;
 }

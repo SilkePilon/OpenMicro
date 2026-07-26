@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use openmicro_proto::AgentState;
+use openmicro_proto::{AgentKind, AgentState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
@@ -9,11 +9,23 @@ pub struct SessionKey {
     pub session: String,
 }
 
+impl SessionKey {
+    pub fn kind(&self) -> AgentKind {
+        AgentKind::from_name(&self.agent)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub key: SessionKey,
     pub state: AgentState,
     pub updated_ms: u64,
+}
+
+impl Session {
+    pub fn kind(&self) -> AgentKind {
+        self.key.kind()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -45,7 +57,6 @@ impl SessionStore {
         key
     }
 
-    /// Used by tests; part of the store's read API.
     #[allow(dead_code)]
     pub fn get(&self, key: &SessionKey) -> Option<&Session> {
         self.sessions.get(key)

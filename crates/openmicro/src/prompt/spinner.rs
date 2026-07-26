@@ -1,16 +1,3 @@
-//! The spinner — the only animation in the whole interface.
-//!
-//! Two independent motions share one 80 ms tick (120 ms in ASCII mode): the
-//! four-frame magenta glyph, and a trailing-dot counter that advances by
-//! 0.125 per tick and wraps above 4, showing `floor(counter)` dots capped at
-//! 3 — one more dot every 640 ms on a 2.56 s cycle. Both are pure functions
-//! of the tick count so they can be unit-tested without threads.
-//!
-//! Cleanup is the part that has to be paranoid: the render thread hides the
-//! cursor and holds raw mode (so Ctrl-C arrives as a key event we can catch
-//! and repaint on, instead of SIGINT killing the process mid-frame), and
-//! `Spinner`'s `Drop` restores everything even during panic unwinding.
-
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,43 +11,25 @@ use super::render::Theme;
 use super::term::is_cancel_key;
 use super::width::frame_rows;
 
-/// Unicode frames at 80 ms; ASCII fallback `• o O 0` at 120 ms (the `•` is
-/// the spec's own "ASCII" table entry, mirroring clack).
 const UNICODE_FRAMES: [&str; 4] = ["◒", "◐", "◓", "◑"];
 const ASCII_FRAMES: [&str; 4] = ["•", "o", "O", "0"];
 const UNICODE_TICK: Duration = Duration::from_millis(80);
 const ASCII_TICK: Duration = Duration::from_millis(120);
 
-/// Dots after `tick` completed ticks. The spec models this as a float
-/// counter (`+0.125` per tick, wrapping to 0 above 4, capped at 3); with a
-/// wrap at exactly 4.0 that is a 32-tick cycle of 8 ticks per dot count, so
-/// integer arithmetic reproduces it without float drift.
 pub(crate) fn dots_for_tick(tick: u64) -> usize {
     ((tick % 32) / 8) as usize
 }
 
-/// Trailing ASCII dots are stripped from an incoming message so the dot
-/// animation doesn't stack on top of literal ones — but a trailing `…` is
-/// kept, which is why the original shows `Parsing source….`.
 pub(crate) fn strip_trailing_dots(msg: &str) -> &str {
     msg.trim_end_matches('.')
 }
 
-/// State shared with the render thread. `rows` mirrors the last frame's
-/// physical row count so the finishing thread (which does not own the
-/// render loop's `FrameZone`) can erase the live frame before painting the
-/// final line.
 struct Shared {
     msg: Mutex<String>,
     stop: AtomicBool,
     rows: AtomicUsize,
 }
 
-/// A running (or about-to-run) spinner. Obtain via [`super::Ui::spinner`],
-/// then `start` / `message` / `stop` / `error` / `cancel`. Dropping a
-/// still-active spinner cancels it, so an early `?` return or a panic can
-/// never leave the terminal in raw mode with a hidden cursor and a stale
-/// frame.
 pub struct Spinner {
     theme: Theme,
     tty: bool,
@@ -90,9 +59,6 @@ impl Spinner {
         }
     }
 
-    /// Begin animating. On a non-tty there is nothing to animate: the final
-    /// `stop`/`error`/`cancel` line is the only output, keeping piped logs
-    /// clean.
     pub fn start(&mut self, msg: &str) {
         *self.shared.msg.lock().unwrap() = strip_trailing_dots(msg).to_string();
         self.active = true;
@@ -117,8 +83,6 @@ impl Spinner {
             let mut out = io::stdout();
             let mut tick_no: u64 = 0;
             let mut prev_rows = 0usize;
-            // Definite-assignment: every path to the reads below passes
-            // through the `last_lines = lines` store in this iteration.
             let mut last_lines: Vec<String>;
             loop {
                 if shared.stop.load(Ordering::SeqCst) {
@@ -137,8 +101,6 @@ impl Spinner {
                 shared.rows.store(prev_rows, Ordering::SeqCst);
                 last_lines = lines;
                 tick_no += 1;
-                // Sleep by polling the event queue so Ctrl-C (a key event in
-                // raw mode) and resizes are noticed mid-tick.
                 let deadline = Instant::now() + tick;
                 loop {
                     if shared.stop.load(Ordering::SeqCst) {
@@ -154,10 +116,6 @@ impl Spinner {
                             Ok(Event::Key(k))
                                 if k.kind != KeyEventKind::Release && is_cancel_key(&k) =>
                             {
-                                // Emergency exit: repaint as cancelled,
-                                // restore the terminal, and die with the
-                                // conventional SIGINT status. There is no
-                                // way to unwind the main thread from here.
                                 let final_line = format!(
                                     "{}  {msg}",
                                     theme.style.red(theme.sym.step_cancel)
@@ -172,8 +130,6 @@ impl Spinner {
                             }
                             Ok(Event::Resize(cols, _)) => {
                                 columns = cols as usize;
-                                // Re-count the frame we actually drew under
-                                // the new width so the next erase is exact.
                                 prev_rows = frame_rows(&last_lines, columns);
                                 shared.rows.store(prev_rows, Ordering::SeqCst);
                             }
@@ -185,25 +141,16 @@ impl Spinner {
         }));
     }
 
-    /// Swap the message mid-spin (trailing ASCII dots stripped, as on start).
-    pub fn message(&mut self, msg: &str) {
-        *self.shared.msg.lock().unwrap() = strip_trailing_dots(msg).to_string();
-    }
-
-    /// Successful finish: `green ◇  msg`.
     pub fn stop(&mut self, msg: &str) {
         let t = self.theme;
         self.finish(t.style.green(t.sym.step_submit), msg);
     }
 
-    /// Failure finish: red `▲` — the one place the error triangle is red
-    /// rather than yellow (spec: "yellow (red when a spinner errors)").
     pub fn error(&mut self, msg: &str) {
         let t = self.theme;
         self.finish(t.style.red(t.sym.step_error), msg);
     }
 
-    /// Cancelled finish: `red ■  msg`.
     pub fn cancel(&mut self, msg: &str) {
         let t = self.theme;
         self.finish(t.style.red(t.sym.step_cancel), msg);
@@ -235,7 +182,6 @@ impl Spinner {
             let _ = out.flush();
             let _ = terminal::disable_raw_mode();
         } else {
-            // Piped output: just the resolution line, newline-terminated.
             let _ = writeln!(out, "{symbol}  {msg}");
             let _ = out.flush();
         }
@@ -243,8 +189,6 @@ impl Spinner {
 }
 
 impl Drop for Spinner {
-    /// A spinner abandoned mid-flight (early return, panic unwind) must not
-    /// leave raw mode on and the cursor hidden; treat it as cancelled.
     fn drop(&mut self) {
         if self.active {
             self.cancel("");
@@ -252,8 +196,6 @@ impl Drop for Spinner {
     }
 }
 
-/// Erase `prev_rows` physical rows and write the new lines in one `write`
-/// (the same batched redraw the prompts use; per-row clearing flashes).
 fn draw_over(out: &mut impl Write, prev_rows: usize, lines: &[String]) -> io::Result<()> {
     let mut buf = String::new();
     if prev_rows > 0 {
@@ -271,9 +213,6 @@ fn draw_over(out: &mut impl Write, prev_rows: usize, lines: &[String]) -> io::Re
 mod tests {
     use super::*;
 
-    /// Re-simulate the spec's float-counter model literally and check the
-    /// integer implementation matches it tick for tick across several
-    /// cycles.
     #[test]
     fn dot_sequence_matches_float_counter_model() {
         let mut counter: f64 = 0.0;
@@ -291,8 +230,6 @@ mod tests {
         }
     }
 
-    /// One more dot every 8 ticks (640 ms at 80 ms/tick), wrapping to zero
-    /// after the 3-dot phase — a 32-tick / 2.56 s cycle.
     #[test]
     fn dots_step_every_eight_ticks_and_wrap_at_thirty_two() {
         assert_eq!(dots_for_tick(0), 0);
@@ -319,8 +256,6 @@ mod tests {
         assert_eq!(ASCII_TICK, Duration::from_millis(120));
     }
 
-    /// The rendered spinner line is `magenta frame`, exactly two spaces,
-    /// then the message — assert the colour code explicitly.
     #[test]
     fn spinner_line_is_magenta_frame_two_spaces_message() {
         let t = super::super::render::test_util::theme();

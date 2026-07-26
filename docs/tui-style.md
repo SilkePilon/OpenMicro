@@ -2,7 +2,7 @@
 
 OpenMicro's interface copies the look and feel of `npx skills add`
 (<https://github.com/vercel-labs/skills>). This file is the extracted spec, so
-the Rust implementation in `crates/openmicro/src/ui/` can be checked against it
+the Rust implementation in `crates/openmicro/src/prompt/` can be checked against it
 without going back to the JavaScript.
 
 Two renderers are in play there, and they do **not** share a palette:

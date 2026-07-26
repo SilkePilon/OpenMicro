@@ -1,24 +1,5 @@
-//! Coding-agent detection and hook/plugin installation.
-//!
-//! Every OpenMicro adapter ultimately does one thing: make the agent run
-//! `openmicro-hook` on lifecycle transitions (see `adapters/README.md`). This
-//! module turns those hand-written install docs into something the TUI can do
-//! *for* the user:
-//!
-//! * [`detect`] — which coding agents are actually installed on this machine,
-//!   and whether their OpenMicro hooks are already wired.
-//! * [`install`] — idempotently merge the hook config into the agent's own
-//!   settings file, keeping every other key the user has there.
-//!
-//! The file-mutating half is deliberately thin: all of the interesting logic
-//! ([`merge_claude_hooks`], [`insert_codex_notify`], and the `*_installed`
-//! predicates) is pure string-in/string-out so it is unit-tested without
-//! touching a real `~/.claude/settings.json`.
-
 use std::path::{Path, PathBuf};
 
-/// The four lifecycle transitions OpenMicro cares about, as
-/// `(Claude-compatible event name, OpenMicro state)`.
 pub const HOOK_EVENTS: [(&str, &str); 4] = [
     ("UserPromptSubmit", "thinking"),
     ("PreToolUse", "working"),
@@ -26,136 +7,138 @@ pub const HOOK_EVENTS: [(&str, &str); 4] = [
     ("Stop", "idle"),
 ];
 
-/// The `notify` line the Codex CLI adapter needs as a **root** key.
 pub const CODEX_NOTIFY_LINE: &str = r#"notify = ["openmicro-hook", "codex-notify"]"#;
 
-/// Substring that identifies a hook command as ours, used to keep installation
-/// idempotent (we never append a second copy of our own hook).
+pub const OPENCODE_PLUGIN: &str = r#"// Installed by OpenMicro (openmicro > Coding agents). Safe to delete.
+const AGENT = "opencode"
+
+function push(session, state) {
+  try {
+    Bun.spawn(
+      ["openmicro-hook", "push", "--agent", AGENT, "--session", session || "default", "--state", state],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+    ).unref()
+  } catch (_) {}
+}
+
+export const OpenMicro = async () => ({
+  "chat.message": async ({ sessionID }) => push(sessionID, "thinking"),
+  "tool.execute.before": async ({ sessionID }) => push(sessionID, "working"),
+  "permission.ask": async (permission) => push(permission.sessionID, "awaiting_approval"),
+  event: async ({ event }) => {
+    if (event.type === "session.idle") push(event.properties.sessionID, "idle")
+    else if (event.type === "permission.replied") push(event.properties.sessionID, "working")
+  },
+})
+"#;
+
 const HOOK_MARKER: &str = "openmicro-hook";
 
-/// A coding agent OpenMicro ships an adapter for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
-/// Every adapter, in display order.
-pub const ALL_AGENTS: [AgentKind; 3] =
-    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok];
+pub const ALL_AGENTS: [AgentKind; 4] =
+    [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok, AgentKind::Opencode];
 
-/// How an agent's hooks are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mechanism {
-    /// Claude Code-style JSON hooks; `agent_flag` is passed as `--agent` when
-    /// the agent is not Claude itself.
     ClaudeHooks { agent_flag: Option<&'static str> },
-    /// Codex CLI `notify` root key in a TOML config.
     CodexNotify,
+    OpencodePlugin,
 }
 
 impl AgentKind {
-    /// Short stable name used on the wire (`--agent`) and as the picker value.
     pub fn slug(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Grok => "grok",
+            AgentKind::Opencode => "opencode",
         }
     }
 
-    /// Human-facing name for the TUI list.
     pub fn label(self) -> &'static str {
         match self {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex CLI",
             AgentKind::Grok => "Grok Code",
+            AgentKind::Opencode => "opencode",
         }
     }
 
-    /// Config file (relative to `$HOME`) whose contents we merge into.
     pub fn config_rel(self) -> &'static str {
         match self {
             AgentKind::Claude => ".claude/settings.json",
             AgentKind::Codex => ".codex/config.toml",
             AgentKind::Grok => ".grok/user-settings.json",
+            AgentKind::Opencode => ".config/opencode/plugin/openmicro.js",
         }
     }
 
-    /// Paths (relative to `$HOME`) whose existence means the agent is installed.
     pub fn markers(self) -> &'static [&'static str] {
         match self {
             AgentKind::Claude => &[".claude", ".claude.json"],
             AgentKind::Codex => &[".codex"],
             AgentKind::Grok => &[".grok"],
+            AgentKind::Opencode => &[".config/opencode", ".opencode"],
         }
     }
 
-    /// Executable names that mean the agent is installed even without a config
-    /// directory yet (a fresh install that has never been run).
     pub fn binaries(self) -> &'static [&'static str] {
         match self {
             AgentKind::Claude => &["claude"],
             AgentKind::Codex => &["codex"],
             AgentKind::Grok => &["grok", "grok-cli"],
+            AgentKind::Opencode => &["opencode"],
         }
     }
 
-    /// How this agent's hooks are wired.
     pub fn mechanism(self) -> Mechanism {
         match self {
             AgentKind::Claude => Mechanism::ClaudeHooks { agent_flag: None },
             AgentKind::Grok => Mechanism::ClaudeHooks { agent_flag: Some("grok") },
             AgentKind::Codex => Mechanism::CodexNotify,
+            AgentKind::Opencode => Mechanism::OpencodePlugin,
         }
     }
 
-    /// Parse a slug back into a kind.
     pub fn from_slug(s: &str) -> Option<AgentKind> {
         ALL_AGENTS.into_iter().find(|a| a.slug() == s)
     }
 }
 
-/// Whether an agent's OpenMicro hooks are wired up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookStatus {
-    /// All of our hook entries are present.
     Installed,
-    /// The config is readable/absent and our hooks can be added.
     Missing,
-    /// Something in the config blocks a safe merge (unparseable, or a
-    /// conflicting `notify` key). The payload is shown to the user as-is.
     Blocked(String),
 }
 
-/// One row of the TUI's agent picker.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
     pub kind: AgentKind,
-    /// Whether the agent itself appears to be installed on this machine.
     pub present: bool,
-    /// Whether *our* hooks are already in its config.
     pub status: HookStatus,
-    /// Config file we would write (absolute).
     pub config_path: PathBuf,
 }
 
-/// `$HOME` as a path, falling back to `/` so callers never have to handle the
-/// (practically impossible) unset case with their own error branch.
 pub fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// True if the agent looks installed: a config marker exists, or one of its
-/// executables is on `PATH`.
-pub fn is_present(kind: AgentKind, home: &Path) -> bool {
+pub fn has_marker(kind: AgentKind, home: &Path) -> bool {
     kind.markers().iter().any(|m| home.join(m).exists())
-        || crate::flash::which(kind.binaries()).is_some()
 }
 
-/// Read an agent's config file, returning `""` when it does not exist yet
-/// (an absent file is a perfectly installable starting point).
+pub fn is_present(kind: AgentKind, home: &Path) -> bool {
+    has_marker(kind, home) || crate::flash::which(kind.binaries()).is_some()
+}
+
 fn read_config(kind: AgentKind, home: &Path) -> Result<String, String> {
     let path = home.join(kind.config_rel());
     match std::fs::read_to_string(&path) {
@@ -165,7 +148,6 @@ fn read_config(kind: AgentKind, home: &Path) -> Result<String, String> {
     }
 }
 
-/// Inspect an agent's current hook status without modifying anything.
 pub fn hook_status(kind: AgentKind, home: &Path) -> HookStatus {
     match kind.mechanism() {
         Mechanism::ClaudeHooks { agent_flag } => {
@@ -193,10 +175,33 @@ pub fn hook_status(kind: AgentKind, home: &Path) -> HookStatus {
                 Ok(_) => HookStatus::Missing,
             }
         }
+        Mechanism::OpencodePlugin => {
+            let contents = match read_config(kind, home) {
+                Ok(c) => c,
+                Err(e) => return HookStatus::Blocked(e),
+            };
+            if opencode_plugin_installed(&contents) {
+                HookStatus::Installed
+            } else if contents.is_empty() || opencode_plugin_is_ours(&contents) {
+                HookStatus::Missing
+            } else {
+                HookStatus::Blocked(format!(
+                    "{} already exists and was not written by OpenMicro.",
+                    home.join(kind.config_rel()).display()
+                ))
+            }
+        }
     }
 }
 
-/// Build the picker rows for every adapter: presence, hook status, target path.
+pub fn opencode_plugin_installed(existing: &str) -> bool {
+    existing == OPENCODE_PLUGIN
+}
+
+fn opencode_plugin_is_ours(existing: &str) -> bool {
+    existing.contains(HOOK_MARKER)
+}
+
 pub fn detect(home: &Path) -> Vec<AgentRow> {
     ALL_AGENTS
         .into_iter()
@@ -211,7 +216,6 @@ pub fn detect(home: &Path) -> Vec<AgentRow> {
         .collect()
 }
 
-/// The hook command string for one `(event, state)` pair.
 pub fn hook_command(state: &str, agent_flag: Option<&str>) -> String {
     match agent_flag {
         Some(a) => format!("openmicro-hook claude-hook --agent {a} --state {state}"),
@@ -219,8 +223,6 @@ pub fn hook_command(state: &str, agent_flag: Option<&str>) -> String {
     }
 }
 
-/// True if a JSON hooks config already contains an OpenMicro command for every
-/// one of [`HOOK_EVENTS`]. Empty/unparseable input is simply "not installed".
 pub fn claude_hooks_installed(existing: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(blank_to_empty_object(existing))
     else {
@@ -237,7 +239,6 @@ pub fn claude_hooks_installed(existing: &str) -> bool {
     })
 }
 
-/// True if a single matcher group already runs an `openmicro-hook` command.
 fn group_has_openmicro_hook(group: &serde_json::Value) -> bool {
     group
         .get("hooks")
@@ -251,8 +252,6 @@ fn group_has_openmicro_hook(group: &serde_json::Value) -> bool {
         })
 }
 
-/// Treat a whitespace-only config as an empty JSON object, so a brand new
-/// (or empty) `settings.json` merges instead of failing to parse.
 fn blank_to_empty_object(existing: &str) -> &str {
     if existing.trim().is_empty() {
         "{}"
@@ -261,17 +260,6 @@ fn blank_to_empty_object(existing: &str) -> &str {
     }
 }
 
-/// Merge OpenMicro's hooks into a Claude Code-style `settings.json`.
-///
-/// Pure: takes the current file contents, returns the new contents. Every
-/// unrelated key is preserved (serde_json's `preserve_order` feature keeps the
-/// user's key order too), existing hook entries for the same events are kept
-/// alongside ours, and re-running is a no-op — a group already invoking
-/// `openmicro-hook` is never duplicated.
-///
-/// Errors when the file is not a JSON **object**, or when `hooks` /
-/// `hooks.<event>` exist with an incompatible shape; in that case we refuse to
-/// touch the file rather than clobbering the user's config.
 pub fn merge_claude_hooks(existing: &str, agent_flag: Option<&str>) -> Result<String, String> {
     let mut root: serde_json::Value = serde_json::from_str(blank_to_empty_object(existing))
         .map_err(|e| format!("config is not valid JSON ({e}) — fix it by hand first"))?;
@@ -308,13 +296,6 @@ pub fn merge_claude_hooks(existing: &str, agent_flag: Option<&str>) -> Result<St
     Ok(out)
 }
 
-/// Strip OpenMicro's hook entries back out of a Claude Code-style config.
-///
-/// The exact inverse of [`merge_claude_hooks`], and equally conservative: only
-/// groups whose command mentions `openmicro-hook` are dropped, the user's own
-/// hooks for the same events stay, and an event array (or the `hooks` object)
-/// left empty by the removal is deleted so uninstalling leaves the file as it
-/// was found rather than littered with empty scaffolding.
 pub fn remove_claude_hooks(existing: &str) -> Result<String, String> {
     let mut root: serde_json::Value = serde_json::from_str(blank_to_empty_object(existing))
         .map_err(|e| format!("config is not valid JSON ({e}) — leaving it alone"))?;
@@ -322,24 +303,29 @@ pub fn remove_claude_hooks(existing: &str) -> Result<String, String> {
         return Err("config is valid JSON but not an object".to_string());
     };
     let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return Ok(existing.to_string()); // nothing of ours to remove
+        return Ok(existing.to_string());
     };
 
+    let mut emptied: Vec<String> = Vec::new();
     for (event, _) in HOOK_EVENTS {
         let Some(groups) = hooks.get_mut(event).and_then(|g| g.as_array_mut()) else {
             continue;
         };
+        let before = groups.len();
         groups.retain(|g| !group_has_openmicro_hook(g));
+        if groups.is_empty() && before > 0 {
+            emptied.push(event.to_string());
+        }
     }
-    // Drop keys we emptied, but never one the user had other hooks in.
-    hooks.retain(|_, v| !v.as_array().is_some_and(|a| a.is_empty()));
+    for event in emptied {
+        hooks.remove(&event);
+    }
     let hooks_empty = hooks.is_empty();
     if hooks_empty {
         obj.remove("hooks");
     }
 
     if obj.is_empty() {
-        // The file existed only to hold our hooks.
         return Ok(String::new());
     }
     let mut out = serde_json::to_string_pretty(&root)
@@ -348,24 +334,20 @@ pub fn remove_claude_hooks(existing: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Strip OpenMicro's `notify` line (and the comment we wrote above it) out of a
-/// Codex `config.toml`, leaving a `notify` that points anywhere else alone.
 pub fn remove_codex_notify(existing: &str) -> Result<String, String> {
     let Some((idx, line)) = root_notify_line(existing) else {
         return Ok(existing.to_string());
     };
     if !line.contains(HOOK_MARKER) {
-        return Ok(existing.to_string()); // someone else's notify; not ours to touch
+        return Ok(existing.to_string());
     }
 
     let lines: Vec<&str> = existing.lines().collect();
     let mut drop_from = idx;
-    // Also drop the comment we wrote immediately above it, and the blank line we
-    // inserted below, so removing leaves no trace.
     if idx > 0 && lines[idx - 1].trim_start().starts_with("# OpenMicro") {
         drop_from = idx - 1;
     }
-    let mut drop_to = idx; // inclusive
+    let mut drop_to = idx;
     if lines.get(idx + 1).is_some_and(|l| l.trim().is_empty()) {
         drop_to = idx + 1;
     }
@@ -385,11 +367,6 @@ pub fn remove_codex_notify(existing: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// Take OpenMicro's hooks back out of one agent's config.
-///
-/// Mirrors [`install`]: atomic write, and an untouched file when there was
-/// nothing of ours in it. A config that became empty is deleted outright rather
-/// than left as an empty file the agent might not expect.
 pub fn uninstall(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
     let path = home.join(kind.config_rel());
     let existing = read_config(kind, home)?;
@@ -400,6 +377,13 @@ pub fn uninstall(kind: AgentKind, home: &Path) -> Result<InstallReport, String> 
     let stripped = match kind.mechanism() {
         Mechanism::ClaudeHooks { .. } => remove_claude_hooks(&existing)?,
         Mechanism::CodexNotify => remove_codex_notify(&existing)?,
+        Mechanism::OpencodePlugin => {
+            if opencode_plugin_is_ours(&existing) {
+                String::new()
+            } else {
+                existing.clone()
+            }
+        }
     };
     if stripped == existing {
         return Ok(InstallReport { kind, path, changed: false, backup: None });
@@ -415,27 +399,21 @@ pub fn uninstall(kind: AgentKind, home: &Path) -> Result<InstallReport, String> 
         std::fs::rename(&tmp, &path)
             .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
     }
-    // The backup we took at install time has served its purpose.
     let backup = sibling(&path, ".openmicro.bak");
     let _ = std::fs::remove_file(&backup);
 
     Ok(InstallReport { kind, path, changed: true, backup: None })
 }
 
-/// True if a Codex `config.toml` already has a **root** `notify` key pointing at
-/// `openmicro-hook`.
 pub fn codex_notify_installed(existing: &str) -> bool {
     matches!(root_notify_line(existing), Some((_, line)) if line.contains(HOOK_MARKER))
 }
 
-/// Find the root-level `notify = ...` assignment: the first line that assigns
-/// `notify` **before** any `[table]` header (a `notify` inside a table is a
-/// different key and must be ignored). Returns `(line index, line)`.
 fn root_notify_line(existing: &str) -> Option<(usize, &str)> {
     for (i, line) in existing.lines().enumerate() {
         let t = line.trim_start();
         if t.starts_with('[') {
-            return None; // entered the first table; no root notify above it
+            return None;
         }
         if let Some(rest) = t.strip_prefix("notify") {
             if rest.trim_start().starts_with('=') {
@@ -446,14 +424,6 @@ fn root_notify_line(existing: &str) -> Option<(usize, &str)> {
     None
 }
 
-/// Add the OpenMicro `notify` root key to a Codex `config.toml`.
-///
-/// Pure: contents in, contents out. TOML requires root keys to appear *before*
-/// the first `[table]`, so the line is inserted at the top of the file (after
-/// any leading comments) rather than appended. Re-running is a no-op.
-///
-/// Errors when a root `notify` already points at something else — overwriting
-/// it would silently break whatever the user had wired up.
 pub fn insert_codex_notify(existing: &str) -> Result<String, String> {
     if let Some((_, line)) = root_notify_line(existing) {
         if line.contains(HOOK_MARKER) {
@@ -466,8 +436,6 @@ pub fn insert_codex_notify(existing: &str) -> Result<String, String> {
         ));
     }
 
-    // Insert after any leading comment/blank block so a file that opens with a
-    // header comment keeps reading naturally.
     let lines: Vec<&str> = existing.lines().collect();
     let mut at = 0;
     while at < lines.len() {
@@ -493,20 +461,15 @@ pub fn insert_codex_notify(existing: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// What [`install`] did.
 #[derive(Debug, Clone)]
 pub struct InstallReport {
     pub kind: AgentKind,
-    /// The config file written (or that would have been written).
     pub path: PathBuf,
-    /// False when the hooks were already present and nothing was rewritten.
     pub changed: bool,
-    /// Where the previous contents were saved, when we replaced an existing file.
     pub backup: Option<PathBuf>,
 }
 
 impl InstallReport {
-    /// One-line summary for the TUI log / CLI output.
     pub fn summary(&self) -> String {
         if !self.changed {
             return format!("{}: already installed ({})", self.kind.slug(), self.path.display());
@@ -523,11 +486,6 @@ impl InstallReport {
     }
 }
 
-/// Install (or verify) one agent's OpenMicro hooks under `home`.
-///
-/// Idempotent, non-destructive: the existing file is backed up to
-/// `<name>.openmicro.bak` before the merged version is written, the write is
-/// atomic (temp file + rename), and an unchanged config is not rewritten at all.
 pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
     let path = home.join(kind.config_rel());
     let existing = read_config(kind, home)?;
@@ -535,6 +493,17 @@ pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
     let merged = match kind.mechanism() {
         Mechanism::ClaudeHooks { agent_flag } => merge_claude_hooks(&existing, agent_flag)?,
         Mechanism::CodexNotify => insert_codex_notify(&existing)?,
+        Mechanism::OpencodePlugin => {
+            if existing.is_empty() || opencode_plugin_is_ours(&existing) {
+                OPENCODE_PLUGIN.to_string()
+            } else {
+                return Err(format!(
+                    "{} already exists and was not written by OpenMicro. \
+                     Move it aside, then re-run.",
+                    path.display()
+                ));
+            }
+        }
     };
 
     if merged == existing {
@@ -546,8 +515,6 @@ pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
 
-    // Back up the previous contents before replacing them. Only when the file
-    // actually existed — a first-time install has nothing to preserve.
     let backup = if path.exists() {
         let b = sibling(&path, ".openmicro.bak");
         std::fs::write(&b, &existing).map_err(|e| format!("cannot write {}: {e}", b.display()))?;
@@ -565,20 +532,12 @@ pub fn install(kind: AgentKind, home: &Path) -> Result<InstallReport, String> {
     Ok(InstallReport { kind, path, changed: true, backup })
 }
 
-/// A sibling path with `suffix` appended to the whole filename (extension
-/// included), e.g. `settings.json` + `.openmicro.bak` ->
-/// `settings.json.openmicro.bak`. Appending to the full name (rather than
-/// replacing the extension) keeps the original name recognisable and never
-/// collides with the live config.
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     name.push(suffix);
     path.with_file_name(name)
 }
 
-/// Locate the `openmicro-hook` binary the installed hooks will invoke.
-/// Hooks call it by bare name, so it has to be resolvable from the agent's
-/// environment — a `None` here is worth warning about before installing.
 pub fn hook_binary() -> Option<PathBuf> {
     crate::flash::which(&["openmicro-hook"])
 }
@@ -587,7 +546,6 @@ pub fn hook_binary() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A scratch `$HOME` that cleans itself up.
     struct TempHome(PathBuf);
 
     impl TempHome {
@@ -732,8 +690,6 @@ mod tests {
 
     #[test]
     fn codex_notify_inside_a_table_is_not_the_root_key() {
-        // `notify` under [some.table] is a different key entirely; we must still
-        // add the root one rather than reporting a conflict.
         let existing = "[mcp_servers.x]\nnotify = [\"other\"]\n";
         let out = insert_codex_notify(existing).unwrap();
         assert!(codex_notify_installed(&out), "{out}");
@@ -799,8 +755,6 @@ mod tests {
         let stop = after["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1);
         assert_eq!(stop[0]["hooks"][0]["command"], "notify-send done");
-        // The events where we were the only hook are gone entirely, not left
-        // behind as empty arrays.
         assert!(after["hooks"].get("PreToolUse").is_none(), "{after}");
     }
 
@@ -825,7 +779,6 @@ mod tests {
         assert!(!removed.contains("openmicro-hook"), "{removed}");
         assert!(!removed.contains("# OpenMicro"), "our comment must go too: {removed}");
         assert!(removed.contains("model = \"gpt\"") && removed.contains("[tui]"), "{removed}");
-        // Still parses as the same config it started as.
         assert_eq!(removed.trim(), original.trim());
     }
 
@@ -851,10 +804,8 @@ mod tests {
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["model"], "opus");
-        // The install-time backup is cleaned up with it.
         assert!(!home.path().join(".claude/settings.json.openmicro.bak").exists());
 
-        // Uninstalling twice is a no-op, not an error.
         assert!(!uninstall(AgentKind::Claude, home.path()).unwrap().changed);
     }
 
@@ -906,14 +857,99 @@ mod tests {
         assert_eq!(claude.status, HookStatus::Missing);
         assert!(claude.config_path.ends_with(".claude/settings.json"));
 
-        let grok = rows.iter().find(|r| r.kind == AgentKind::Grok).unwrap();
-        assert!(!grok.present, "no ~/.grok in this scratch home");
+        assert!(has_marker(AgentKind::Claude, home.path()));
+        assert!(!has_marker(AgentKind::Grok, home.path()));
+        assert!(!has_marker(AgentKind::Opencode, home.path()));
     }
 
     #[test]
     fn detect_covers_every_adapter() {
         let home = TempHome::new("all");
         assert_eq!(detect(home.path()).len(), ALL_AGENTS.len());
+    }
+
+    #[test]
+    fn the_shipped_plugin_file_matches_the_one_we_install() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../adapters/opencode/plugin.js");
+        let text = std::fs::read_to_string(&shipped)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", shipped.display()));
+        assert_eq!(
+            text, OPENCODE_PLUGIN,
+            "adapters/opencode/plugin.js has drifted from OPENCODE_PLUGIN"
+        );
+    }
+
+    #[test]
+    fn the_opencode_plugin_runs_the_hook_for_all_four_states() {
+        for state in ["thinking", "working", "awaiting_approval", "idle"] {
+            assert!(OPENCODE_PLUGIN.contains(state), "no {state} transition in the plugin");
+        }
+        assert!(OPENCODE_PLUGIN.contains(HOOK_MARKER));
+        assert!(OPENCODE_PLUGIN.contains("session.idle"));
+        assert!(OPENCODE_PLUGIN.contains("permission.ask"));
+    }
+
+    #[test]
+    fn installing_opencode_writes_the_plugin_and_uninstalling_deletes_it() {
+        let home = TempHome::new("opencode");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Missing);
+        let report = install(AgentKind::Opencode, home.path()).unwrap();
+        assert!(report.changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OPENCODE_PLUGIN);
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Installed);
+
+        assert!(!install(AgentKind::Opencode, home.path()).unwrap().changed);
+
+        assert!(uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert!(!path.exists(), "uninstall must take the plugin file with it");
+        assert!(!uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+    }
+
+    #[test]
+    fn a_stale_openmicro_plugin_is_refreshed_rather_than_reported_installed() {
+        let home = TempHome::new("opencode-stale");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// old openmicro-hook plugin\n").unwrap();
+
+        assert_eq!(hook_status(AgentKind::Opencode, home.path()), HookStatus::Missing);
+        assert!(install(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OPENCODE_PLUGIN);
+    }
+
+    #[test]
+    fn someone_elses_opencode_plugin_is_never_overwritten_or_deleted() {
+        let home = TempHome::new("opencode-foreign");
+        let path = home.path().join(AgentKind::Opencode.config_rel());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let theirs = "export const Mine = async () => ({})\n";
+        std::fs::write(&path, theirs).unwrap();
+
+        assert!(matches!(
+            hook_status(AgentKind::Opencode, home.path()),
+            HookStatus::Blocked(_)
+        ));
+        assert!(install(AgentKind::Opencode, home.path()).is_err());
+        assert!(!uninstall(AgentKind::Opencode, home.path()).unwrap().changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+    }
+
+    #[test]
+    fn removing_our_hooks_leaves_an_event_the_user_deliberately_emptied() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "SessionStart": [],
+                "Stop": [ { "hooks": [ { "type": "command", "command": "openmicro-hook x" } ] } ]
+            }
+        })
+        .to_string();
+        let out = remove_claude_hooks(&existing).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["hooks"].get("SessionStart").is_some(), "{out}");
+        assert!(parsed["hooks"].get("Stop").is_none(), "{out}");
     }
 
     #[test]

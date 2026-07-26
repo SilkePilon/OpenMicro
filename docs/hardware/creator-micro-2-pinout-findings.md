@@ -1,5 +1,20 @@
 # Creator Micro 2 / Codex Micro (ESP32-S3) — GPIO pinout FINDINGS
 
+> **Update (2026-07-26): the key layout and the vendor's own agent profile came
+> out of the same image.** Their firmware embeds a default `keymap.json` that
+> includes an OAI/agent profile — 13 keys in rows of **2, 4, 4, 3**, numbered
+> row-major, split into six `KV_OAI_AG*` (agent) keys and seven `KV_OAI_ACT*`
+> (action) keys. That six is where `SLOT_COUNT = 6` comes from. Their
+> `v.oai.rgbcfg` schema (`effect`/`brightness`/`speed`/`color`; targets
+> `backlight`/`underglow`/`ambient`; effects `solid`/`snake`/`rainbow`/
+> `gradient`/`shallow_breath`; flags `sk` → `syncKeysLighting` and `sa` →
+> `syncAmbientLighting`) is written up in [`../led-design.md`](../led-design.md).
+>
+> Still **not** recoverable statically, and still open: the WS2812 chain's
+> physical routing order (`layout::LED_FOR_KEY`) and the (drive, sense) → key-id
+> map. Both need the device: an LED walk for the first, key presses for the
+> second.
+
 Research date: 2026-07-24. This document supersedes the "everything is unknown"
 conclusion in `creator-micro-2-pinout-research.md`. **The full GPIO map was
 recovered by disassembling Work Louder's own official firmware image.**

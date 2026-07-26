@@ -2,10 +2,6 @@ use openmicro_proto::AgentState;
 
 use crate::session::{Session, SessionKey};
 
-/// Choose which session owns the deck. Rules, in order:
-/// 1. If any session is AwaitingApproval, the most-recently-updated such one wins (preempt).
-/// 2. Else if `pinned` names a live session, it wins.
-/// 3. Else the most-recently-updated session wins.
 pub fn pick_owner<'a>(
     sessions: impl Iterator<Item = &'a Session>,
     pinned: Option<&SessionKey>,

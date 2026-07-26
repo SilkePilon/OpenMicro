@@ -1,15 +1,3 @@
-//! SGR styling, matching the palette table in `docs/tui-style.md`.
-//!
-//! Every style call goes through one [`Style`] value so that `NO_COLOR` and
-//! non-tty output are handled in exactly one place: when colour is disabled
-//! the helpers return the text untouched and the rest of the renderer never
-//! has to think about it. Codes are plain SGR (`ESC[36m` etc.) with the
-//! *specific* reset partners the spec lists (`39` for foreground, `22` for
-//! bold/dim, ...) rather than a blanket `ESC[0m` — a full reset would clobber
-//! enclosing styles when helpers nest (e.g. dim text inside a dim gutter).
-
-/// Styling switch plus the SGR helpers. Copy-cheap by design so pure frame
-/// builders can take it by value.
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
     enabled: bool,
@@ -18,11 +6,6 @@ pub struct Style {
 impl Style {
     pub fn new(enabled: bool) -> Self {
         Style { enabled }
-    }
-
-    /// Whether ANSI is being emitted (false under `NO_COLOR` or a pipe).
-    pub fn enabled(&self) -> bool {
-        self.enabled
     }
 
     fn sgr(&self, open: &str, close: &str, s: &str) -> String {
@@ -73,22 +56,17 @@ impl Style {
         self.sgr("46", "49", s)
     }
 
-    /// 256-colour foreground, used only by the banner gradient.
     pub fn fg256(&self, n: u8, s: &str) -> String {
         self.sgr(&format!("38;5;{n}"), "39", s)
     }
 }
 
-/// The banner's vertical gray gradient, one 256-colour per row, light at the
-/// top — the exact six codes the spec extracted from `npx skills add`.
 pub(crate) const BANNER_GRADIENT: [u8; 6] = [250, 248, 245, 243, 240, 238];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The spec's palette table gives exact SGR pairs; assert every one so a
-    /// refactor cannot silently swap e.g. gray (90) for dim (2).
     #[test]
     fn sgr_codes_match_spec_table() {
         let s = Style::new(true);

@@ -1,66 +1,20 @@
-//! Encoding WS2812 pixel data into an SPI bit stream.
-//!
-//! The Creator Micro 2 drives both of its LED chains from SPI hosts, not from
-//! the RMT peripheral — that is what the stock firmware does, recovered from
-//! its image (see `docs/hardware/creator-micro-2-pinout-findings.md`). SPI has
-//! no notion of a WS2812 bit, so each one is spelled out as a fixed pattern of
-//! SPI bits whose high time encodes the value:
-//!
-//! ```text
-//! SPI clock 2.5 MHz  ->  one SPI bit = 400 ns
-//! WS2812 bit         =  3 SPI bits  = 1.2 us
-//!
-//! '0' -> 100    400 ns high,  800 ns low
-//! '1' -> 110    800 ns high,  400 ns low
-//! ```
-//!
-//! This is deliberately the same scheme ESP-IDF's `led_strip` SPI backend
-//! uses, because that is what the vendor firmware drives these exact chains
-//! with — a known-good configuration on this board beats a merely in-spec one.
-//! Both high times sit comfortably mid-window (T0H 250–550 ns, T1H 650–950 ns)
-//! rather than near the edges, and three bits per LED bit means each colour
-//! byte lands on exactly three whole SPI bytes.
-//!
-//! Changing the clock without changing the pattern silently produces wrong
-//! colours, or nothing at all.
-//!
-//! This lives here, rather than in the firmware crate, because it is pure
-//! byte-shuffling and therefore the one part of the LED path that can be
-//! tested on a host. The firmware just hands the resulting buffer to SPI.
-
 use crate::Rgb;
 
-/// SPI clock this encoding assumes. Driving the bus at any other rate breaks
-/// the timings above.
 pub const SPI_HZ: u32 = 2_500_000;
 
-/// SPI bits emitted per WS2812 bit.
 pub const SPI_BITS_PER_BIT: usize = 3;
 
-/// One WS2812 bit's worth of SPI bits, for a zero and for a one.
 const PATTERN_ZERO: u32 = 0b100;
 const PATTERN_ONE: u32 = 0b110;
 
-/// Encoded bytes per pixel: 24 colour bits x 3 SPI bits = 72 bits = 9 bytes.
 pub const BYTES_PER_PIXEL: usize = 24 * SPI_BITS_PER_BIT / 8;
 
-/// Trailing low bytes that make up the inter-frame reset.
-///
-/// WS2812 latches when the line is held low for >= 50 us. At 2.5 MHz one byte
-/// of zeros is 3.2 us, so 20 bytes is 64 us — comfortably over, and cheap.
 pub const RESET_BYTES: usize = 20;
 
-/// Buffer size needed to encode `pixel_count` pixels plus the reset gap.
 pub const fn buffer_len(pixel_count: usize) -> usize {
     pixel_count * BYTES_PER_PIXEL + RESET_BYTES
 }
 
-/// Encode one colour byte into exactly three SPI bytes.
-///
-/// Eight colour bits at three SPI bits each is 24 bits, so the patterns are
-/// accumulated into a 24-bit word MSB-first and then split into bytes — which
-/// is simpler, and less error-prone, than trying to place bit triples that
-/// straddle byte boundaries by hand.
 fn encode_byte(value: u8, out: &mut [u8; 3]) {
     let mut word: u32 = 0;
     for bit in (0..8).rev() {
@@ -72,15 +26,6 @@ fn encode_byte(value: u8, out: &mut [u8; 3]) {
     out[2] = word as u8;
 }
 
-/// Encode `pixels` into `out`, returning how many bytes were written.
-///
-/// Colour order is **GRB**, which is what the WS2812 family expects on the
-/// wire and what the vendor firmware's `led_strip` default produces. `out`
-/// must be at least [`buffer_len`] bytes; anything beyond the written length
-/// is left alone, so a caller can reuse one oversized buffer.
-///
-/// Returns `None` when the buffer is too small rather than writing a partial,
-/// un-latched frame.
 pub fn encode(pixels: &[Rgb], out: &mut [u8]) -> Option<usize> {
     let needed = buffer_len(pixels.len());
     if out.len() < needed {
@@ -88,7 +33,6 @@ pub fn encode(pixels: &[Rgb], out: &mut [u8]) -> Option<usize> {
     }
     let mut at = 0;
     for px in pixels {
-        // Wire order is green, red, blue — not RGB.
         for value in [px.g, px.r, px.b] {
             let mut chunk = [0u8; 3];
             encode_byte(value, &mut chunk);
@@ -107,8 +51,6 @@ mod tests {
     use super::*;
     use std::vec;
 
-    /// Expand encoded SPI bytes back into the bit pattern, so tests can assert
-    /// on what the LED actually sees rather than on byte trivia.
     fn spi_bits(bytes: &[u8]) -> std::vec::Vec<u8> {
         let mut bits = vec![];
         for b in bytes {
@@ -145,7 +87,6 @@ mod tests {
 
     #[test]
     fn pixels_go_out_in_grb_order() {
-        // Pure red must appear in the *second* byte group, not the first.
         let red = Rgb { r: 255, g: 0, b: 0 };
         let mut buf = [0u8; buffer_len(1)];
         encode(&[red], &mut buf).unwrap();
@@ -153,7 +94,6 @@ mod tests {
         let green_group = &buf[0..3];
         let red_group = &buf[3..6];
         let blue_group = &buf[6..9];
-        // 0b100 repeated eight times, and 0b110 repeated eight times.
         assert_eq!(green_group, &[0x92, 0x49, 0x24], "green is zero: {green_group:?}");
         assert_eq!(red_group, &[0xDB, 0x6D, 0xB6], "red is full: {red_group:?}");
         assert_eq!(blue_group, &[0x92, 0x49, 0x24], "blue is zero: {blue_group:?}");
@@ -166,18 +106,15 @@ mod tests {
         assert_eq!(written, buffer_len(2));
         assert!(buf[written - RESET_BYTES..written].iter().all(|b| *b == 0));
 
-        // The datasheet wants >= 50us of low; check the arithmetic holds rather
-        // than trusting the constant.
         let low_ns = RESET_BYTES as u64 * 8 * 1_000_000_000 / SPI_HZ as u64;
         assert!(low_ns >= 50_000, "reset gap is only {low_ns} ns");
     }
 
     #[test]
     fn the_bit_patterns_land_inside_the_ws2812b_timing_windows() {
-        // This is the check that stops someone "optimising" the clock later.
         let bit_ns = 1_000_000_000 / SPI_HZ as u64;
-        let t0h = bit_ns; // one high SPI bit
-        let t1h = bit_ns * 2; // two high SPI bits
+        let t0h = bit_ns;
+        let t1h = bit_ns * 2;
         let period = bit_ns * SPI_BITS_PER_BIT as u64;
         assert!((250..=550).contains(&t0h), "T0H {t0h} ns outside 250..550");
         assert!((650..=950).contains(&t1h), "T1H {t1h} ns outside 650..950");
@@ -186,7 +123,6 @@ mod tests {
 
     #[test]
     fn encoding_refuses_a_buffer_that_is_too_small() {
-        // A partial frame would leave the strip un-latched showing garbage.
         let mut small = [0u8; 4];
         assert!(encode(&[Rgb { r: 0, g: 0, b: 0 }], &mut small).is_none());
     }

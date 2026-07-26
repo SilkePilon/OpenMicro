@@ -1,34 +1,25 @@
-//! Host-testable LED effect resolver shared by firmware and (future) daemon
-//! preview code. `#![no_std]`, no HAL dependencies, no `unsafe`.
-//!
-//! [`resolve`] turns a single [`LedSlot`] plus a millisecond timestamp into a
-//! concrete [`Rgb`] color. All animation is a pure function of `t_ms` so it is
-//! fully deterministic and unit-testable without a clock or hardware.
-
 #![no_std]
 
 #[cfg(test)]
 extern crate std;
 
+pub mod demo;
 pub mod power;
+pub mod ring;
 pub mod startup;
+pub mod status;
 pub mod ws2812;
 
 pub use openmicro_proto::{Effect, LedSlot, Rgb};
 
-/// Breath: slow, smooth triangle-wave brightness modulation.
 const BREATH_PERIOD_MS: u32 = 3000;
 const BREATH_MIN_PCT: u32 = 15;
 
-/// Pulse: faster, sharper (squared) brightness modulation.
 const PULSE_PERIOD_MS: u32 = 700;
 const PULSE_MIN_PCT: u32 = 10;
 
-/// Rainbow: full hue sweep.
 const RAINBOW_PERIOD_MS: u32 = 4000;
 
-/// Resolve a slot's effect at time `t_ms` (milliseconds, wraps every ~49.7
-/// days at `u32::MAX` — acceptable for a render clock) into a concrete color.
 pub fn resolve(slot: &LedSlot, t_ms: u32) -> Rgb {
     if slot.brightness == 0 {
         return Rgb { r: 0, g: 0, b: 0 };
@@ -50,7 +41,14 @@ pub fn resolve(slot: &LedSlot, t_ms: u32) -> Rgb {
     }
 }
 
-/// Per-channel scale of `c` by `brightness` (0..=255, where 255 is unchanged).
+pub fn gamma_channel(v: u8) -> u8 {
+    ((v as u16 * v as u16) / 255) as u8
+}
+
+pub fn gamma(c: Rgb) -> Rgb {
+    Rgb { r: gamma_channel(c.r), g: gamma_channel(c.g), b: gamma_channel(c.b) }
+}
+
 pub fn scale(c: Rgb, brightness: u8) -> Rgb {
     Rgb {
         r: scale_channel(c.r, brightness),
@@ -63,11 +61,6 @@ fn scale_channel(v: u8, brightness: u8) -> u8 {
     ((v as u16 * brightness as u16) / 255) as u8
 }
 
-/// Integer HSV -> RGB, `h`/`s`/`v` all 0..=255. No floating point.
-///
-/// Classic six-region integer conversion (as used by e.g. FastLED /
-/// Adafruit_NeoPixel). `h` wraps every 256 steps; `s`/`v` are 0 (none) to
-/// 255 (full).
 pub fn hsv_to_rgb(h: u8, s: u8, v: u8) -> Rgb {
     if s == 0 {
         return Rgb { r: v, g: v, b: v };
@@ -76,8 +69,8 @@ pub fn hsv_to_rgb(h: u8, s: u8, v: u8) -> Rgb {
     let s = s as u32;
     let v = v as u32;
 
-    let region = h / 43; // 6 regions of ~42.67 each across 0..=255
-    let remainder = (h - region * 43) * 6; // rescaled to 0..=255ish within a region
+    let region = h / 43;
+    let remainder = (h - region * 43) * 6;
 
     let p = (v * (255 - s)) / 255;
     let q = (v * (255 - (s * remainder) / 255)) / 255;
@@ -94,22 +87,22 @@ pub fn hsv_to_rgb(h: u8, s: u8, v: u8) -> Rgb {
     Rgb { r: r as u8, g: g as u8, b: b as u8 }
 }
 
-/// Deterministic triangle wave, `0` at `t_ms % period_ms == 0`, peaking at
-/// `255` at half the period, and back down to `0` at a full period.
-fn triangle_wave(t_ms: u32, period_ms: u32) -> u32 {
+pub fn triangle(t_ms: u32, period_ms: u32) -> u8 {
+    let period_ms = period_ms.max(2);
     let phase = t_ms % period_ms;
     let half = period_ms / 2;
-    if phase <= half {
+    let v = if phase <= half {
         (phase * 255) / half
     } else {
         ((period_ms - phase) * 255) / half
-    }
+    };
+    v.min(255) as u8
 }
 
-/// Shared LFO-driven brightness envelope for Breath/Pulse: interpolates
-/// between `min_pct`% and 100% of `max_brightness` following a triangle
-/// wave. When `sharp` is true the triangle is squared first, giving Pulse
-/// its faster-attack, snappier shape versus Breath's smooth linear ramp.
+fn triangle_wave(t_ms: u32, period_ms: u32) -> u32 {
+    triangle(t_ms, period_ms) as u32
+}
+
 fn lfo_brightness(max_brightness: u8, t_ms: u32, period_ms: u32, min_pct: u32, sharp: bool) -> u8 {
     let tri = triangle_wave(t_ms, period_ms);
     let shaped = if sharp { (tri * tri) / 255 } else { tri };
@@ -134,10 +127,47 @@ mod tests {
     }
 
     #[test]
+    fn gamma_is_monotonic_and_keeps_the_endpoints() {
+        assert_eq!(gamma_channel(0), 0);
+        assert!(gamma_channel(255) > 235, "full scale must stay near full");
+        for v in 1..=255u8 {
+            assert!(
+                gamma_channel(v) >= gamma_channel(v - 1),
+                "gamma dips at {v}: {} then {}",
+                gamma_channel(v - 1),
+                gamma_channel(v)
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_pulls_the_midpoint_well_below_half() {
+        let mid = gamma_channel(128);
+        assert!(mid < 90, "gamma is too weak to fix a crossfade: {mid}");
+        assert!(mid > 50, "gamma is crushing the mid-range: {mid}");
+    }
+
+    #[test]
+    fn gamma_never_makes_a_step_bigger_than_the_input_step() {
+        for v in 1..=255u8 {
+            let step = gamma_channel(v) as i32 - gamma_channel(v - 1) as i32;
+            assert!(step <= 3, "gamma jumps {step} at {v}");
+        }
+    }
+
+    #[test]
+    fn gamma_applies_to_every_channel() {
+        let c = Rgb { r: 255, g: 128, b: 0 };
+        let g = gamma(c);
+        assert_eq!(g.r, gamma_channel(255));
+        assert_eq!(g.g, gamma_channel(128));
+        assert_eq!(g.b, 0);
+    }
+
+    #[test]
     fn scale_halves_full_white_at_128() {
         let c = Rgb { r: 255, g: 255, b: 255 };
         let got = scale(c, 128);
-        // 255 * 128 / 255 == 128, which is the nearest integer to "half".
         assert_eq!(got, Rgb { r: 128, g: 128, b: 128 });
     }
 
@@ -165,9 +195,6 @@ mod tests {
 
     #[test]
     fn hsv_green_near_hue_85() {
-        // 85/255 of the wheel is the canonical green point. The integer
-        // six-region conversion has a few units of rounding residue right at
-        // region boundaries, so assert "essentially green" rather than exact.
         let got = hsv_to_rgb(85, 255, 255);
         assert_eq!(got.g, 255);
         assert!(got.r <= 3, "expected r near 0, got {}", got.r);
@@ -178,7 +205,6 @@ mod tests {
     fn resolve_solid_at_brightness_128_halves_each_channel() {
         let s = slot(Rgb { r: 255, g: 255, b: 255 }, Effect::Solid, 128);
         assert_eq!(resolve(&s, 0), Rgb { r: 128, g: 128, b: 128 });
-        // Solid ignores time entirely.
         assert_eq!(resolve(&s, 999_999), Rgb { r: 128, g: 128, b: 128 });
     }
 
@@ -194,8 +220,6 @@ mod tests {
     #[test]
     fn resolve_breath_trough_dimmer_than_peak() {
         let s = slot(Rgb { r: 255, g: 255, b: 255 }, Effect::Breath, 255);
-        // Triangle wave: t=0 is the trough (~15% of brightness), t=period/2
-        // (1500ms) is the peak (100% of brightness).
         let trough = resolve(&s, 0);
         let peak = resolve(&s, BREATH_PERIOD_MS / 2);
         assert!(
@@ -204,7 +228,6 @@ mod tests {
             peak.r,
             trough.r
         );
-        // Trough is dim but not fully off (>=15% floor), peak is full.
         assert_eq!(peak, Rgb { r: 255, g: 255, b: 255 });
         assert!(trough.r > 0);
         assert!(trough.r < peak.r);
@@ -221,9 +244,6 @@ mod tests {
 
     #[test]
     fn resolve_pulse_is_sharper_than_breath_at_quarter_period() {
-        // At 1/4 through the period the linear triangle is at 50% of its
-        // range; pulse squares that curve so it should sit further from the
-        // peak (dimmer) than breath's linear midpoint at the same fraction.
         let breath = slot(Rgb { r: 255, g: 255, b: 255 }, Effect::Breath, 255);
         let pulse = slot(Rgb { r: 255, g: 255, b: 255 }, Effect::Pulse, 255);
         let breath_mid = resolve(&breath, BREATH_PERIOD_MS / 4);

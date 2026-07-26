@@ -1,44 +1,3 @@
-//! OpenMicro ESP32-S3 firmware — embedded skeleton.
-//!
-//! # Status: COMPILES ON CI, NEVER RUN ON HARDWARE
-//!
-//! This crate builds for `xtensa-esp32s3-none-elf` on CI
-//! (`.github/workflows/firmware.yml`), against the version set pinned in
-//! `Cargo.toml` (esp-hal 1.1.1 + esp-rtos 0.3.0 + esp-radio 0.18.0 +
-//! trouble-host 0.6.0 — the same set as the upstream `esp-hal-v1.1.1`
-//! `bas_peripheral` BLE example). Compiling is all it is proven to do: it has
-//! never been flashed to or run on a device.
-//!
-//! The GPIO map in `pins.rs` is real, recovered from Work Louder's own
-//! published firmware (`docs/hardware/creator-micro-2-pinout-findings.md`).
-//! What is still missing is the HAL plumbing in the task bodies below.
-//!
-//! # Keeping the vendor's behaviour
-//!
-//! Two things about the stock firmware are worth preserving, and are:
-//! - the **power button** — short press wakes, ~2 s turns off (see
-//!   `openmicro_effects::power`, which also adds a long hold as a
-//!   bootloader escape hatch);
-//! - **entering and leaving the ROM bootloader on command** (`bootloader.rs`).
-//!   Unlike the vendor's, this firmware exposes USB-Serial-JTAG, so the host
-//!   can also reset it into download mode with esptool directly — that path
-//!   keeps working even if this firmware is wedged.
-//!
-//! # Task layout
-//!
-//! Four embassy tasks, wired together with `embassy-sync` channels:
-//! - `ble_task`: TrouBLE GATT server (`ble.rs`) — receives `LedFrame`
-//!   writes from the host, forwards decoded frames to `led_render_task`;
-//!   drains `InputEvent`s produced by `input_task` and notifies them.
-//! - `led_render_task`: every `leds::RENDER_PERIOD_MS`, resolves the latest
-//!   `LedFrame` (via `openmicro_effects::resolve`, the host-tested effect
-//!   core) and pushes it out over RMT (`leds.rs`).
-//! - `input_task`: scans the key matrix / encoder / joystick (`input.rs`)
-//!   and pushes `InputEvent`s to the BLE task.
-//! - `battery_task`: reads the MAX77972 fuel gauge over I2C and updates the
-//!   Battery Service characteristic via the BLE task.
-//! - `power_task`: debounces the rear power button and acts on the gesture.
-
 #![no_std]
 #![no_main]
 
@@ -48,10 +7,6 @@ mod input;
 mod leds;
 mod pins;
 
-// Registers esp-backtrace's `#[panic_handler]` (and, on panic, prints a
-// backtrace via esp-println) — required because `#![no_std]` binaries must
-// supply their own panic handler and this crate never calls into
-// `esp_backtrace` directly otherwise.
 use esp_backtrace as _;
 
 use embassy_executor::Spawner;
@@ -62,50 +17,25 @@ use openmicro_effects::Rgb;
 use openmicro_proto::{Battery, InputEvent, LedFrame};
 use static_cell::StaticCell;
 
-// esp-hal 1.1's boot flow requires the application to embed an ESP-IDF app
-// descriptor for the 2nd-stage bootloader / espflash to accept the image.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// Host -> firmware: decoded LED frames from the BLE write characteristic.
-/// Depth 2 so a fresh write can supersede one not yet rendered without
-/// blocking the BLE task.
 static LED_FRAME_CHANNEL: Channel<CriticalSectionRawMutex, LedFrame, 2> = Channel::new();
 
-/// Firmware -> host: input events awaiting a BLE notification. Depth 8
-/// gives the BLE task room to drain a burst of key presses / encoder ticks
-/// without the input task blocking.
 static INPUT_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 
-/// Firmware -> host: latest battery reading, for the Battery Service.
 static BATTERY_CHANNEL: Channel<CriticalSectionRawMutex, Battery, 1> = Channel::new();
 
-/// Heap for `alloc` users (`openmicro-proto`'s postcard encode/decode uses
-/// `alloc::vec::Vec`; TrouBLE/esp-radio may also need heap for connection
-/// bookkeeping depending on configuration). Size is a placeholder — tune
-/// once real memory pressure is measured on hardware.
 const HEAP_SIZE: usize = 64 * 1024;
 
-/// Drives one WS2812 chain from an RMT channel.
-///
-/// RMT rather than SPI. The SPI path was matched to ESP-IDF's `led_strip`
-/// backend exactly — same 2.5 MHz clock, same three-SPI-bits-per-LED-bit
-/// `100`/`110` encoding, same GRB order, same DMA — and it accepted every
-/// transfer without error while lighting nothing, on a board where the vendor
-/// firmware lights the same chains happily. RMT is the peripheral built for
-/// this: the timing is stated in nanoseconds rather than smuggled through a
-/// clock divider and a bit pattern.
 struct RmtWriter<const N: usize> {
     channel: Option<esp_hal::rmt::Channel<'static, esp_hal::Blocking, esp_hal::rmt::Tx>>,
     codes: [esp_hal::rmt::PulseCode; N],
 }
 
-/// RMT ticks for a duration in nanoseconds, at 80 MHz with divider 1 (12.5 ns
-/// per tick). Written as a divide so the constants below stay in nanoseconds.
 const fn ticks(ns: u32) -> u16 {
     (ns * 8 / 100) as u16
 }
 
-// WS2812B datasheet intervals.
 const T0H: u16 = ticks(400);
 const T0L: u16 = ticks(850);
 const T1H: u16 = ticks(800);
@@ -131,7 +61,7 @@ impl<const N: usize> leds::PixelOut for RmtWriter<N> {
         }
         let mut at = 0;
         for px in pixels {
-            // Wire order is green, red, blue.
+            let px = openmicro_effects::gamma(*px);
             for byte in [px.g, px.r, px.b] {
                 for bit in (0..8).rev() {
                     self.codes[at] = if (byte >> bit) & 1 == 1 {
@@ -143,8 +73,6 @@ impl<const N: usize> leds::PixelOut for RmtWriter<N> {
                 }
             }
         }
-        // An all-zero code ends the sequence; the channel is configured to idle
-        // low, so the line then holds down and that is the inter-frame latch.
         self.codes[at] = PulseCode(0);
 
         let channel = self.channel.take().ok_or(())?;
@@ -167,58 +95,31 @@ impl<const N: usize> leds::PixelOut for RmtWriter<N> {
     }
 }
 
-/// Per-key chain pulse-code buffer length.
 const PER_KEY_CODES: usize = pins::PER_KEY_LED_COUNT * 24 + 1;
-/// Underglow chain pulse-code buffer length.
 const UNDERGLOW_CODES: usize = pins::UNDERGLOW_LED_COUNT * 24 + 1;
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    // Fixed level rather than `init_logger_from_env`: that reads ESP_LOG at
-    // compile time, and a missing or mis-plumbed value silently filters every
-    // message, which is indistinguishable from the firmware being dead.
     esp_println::logger::init_logger(log::LevelFilter::Info);
     esp_println::println!("openmicro-fw boot");
 
-    // Clear the force-download-boot bit first thing. It survives a reset — and
-    // on the Pro, whose RTC domain is battery-backed, it survives losing USB
-    // power too — so a device that was put into download mode once would
-    // otherwise keep going back there on every boot.
     bootloader::clear_force_download();
     log::info!("openmicro-fw {} starting", env!("CARGO_PKG_VERSION"));
 
-    // esp-hal 1.x peripheral init. `esp_hal::init` hands back the
-    // peripheral singletons used to construct every driver below.
     let peripherals =
         esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
-    // Global allocator. `esp_alloc::heap_allocator!` is a safe macro that
-    // sets up a `#[global_allocator]` backed by a static buffer of
-    // `HEAP_SIZE` bytes; no raw pointer/unsafe code needed at this call
-    // site (the macro contains its own minimal, upstream-reviewed unsafe).
     esp_alloc::heap_allocator!(size: HEAP_SIZE);
 
-    // esp-rtos scheduler start: provides both the embassy time driver /
-    // executor integration (`embassy` feature) and the RTOS scheduler that
-    // esp-radio 0.18 requires (`esp-radio` feature). Replaces the former
-    // `esp_hal_embassy::init` — esp-hal-embassy is dead upstream past
-    // esp-hal 1.0.x (see Cargo.toml's rationale block).
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     let sw_int =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // esp-radio's BLE controller: `BleConnector` wraps the BT peripheral as
-    // a `bt-hci` `Controller` impl for `trouble-host` to drive (wrapped in
-    // `ExternalController` inside `ble_task`). In esp-radio 0.18 there is
-    // no separate `esp_radio::init` step — the scheduler comes from
-    // `esp_rtos::start` above, per the upstream bas_peripheral example.
     let ble_controller =
         esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default())
             .expect("BLE controller init");
 
-    // Two RMT channels, one per chain. 80 MHz with divider 1 gives 12.5 ns
-    // ticks, which resolves every WS2812 interval exactly.
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
         .expect("rmt init");
     let rmt_cfg = esp_hal::rmt::TxChannelConfig::default()
@@ -239,23 +140,15 @@ async fn main(spawner: Spawner) {
             .with_pin(peripherals.GPIO6),
     );
 
-    // embassy-executor 0.10 reshaped this: `#[task]` functions now return
-    // `Result<SpawnToken, SpawnError>` and `Spawner::spawn` takes the token and
-    // returns `()`. The only failure is the task's pool being exhausted, which
-    // for these single-instance tasks would be a bug here, not a runtime
-    // condition worth handling.
     spawner.spawn(ble_task(ble_controller).expect("ble_task token"));
     spawner.spawn(
         led_render_task(
             per_key_leds,
             underglow_leds,
+            input_pin(peripherals.GPIO42, esp_hal::gpio::Pull::Up),
         )
         .expect("led_render_task token"),
     );
-    // Power the upper PCB before anything tries to drive it. The LEDs live up
-    // there; until this runs they have no supply, and the SPI writes go
-    // nowhere visible. Levels are the vendor's, not a guess — see
-    // `pins::TOP_BOARD_POWER`.
     let _top_board_power = [
         esp_hal::gpio::Output::new(
             peripherals.GPIO36,
@@ -273,16 +166,9 @@ async fn main(spawner: Spawner) {
             esp_hal::gpio::OutputConfig::default(),
         ),
     ];
-    // Deliberately leaked. `Output` is a guard: dropping it releases the GPIO,
-    // and `main` returns as soon as the tasks are spawned — which would cut
-    // power to the upper board before a single LED frame is drawn. That is
-    // exactly the failure this chased for hours, with both SPI and RMT
-    // faithfully clocking data into an unpowered board.
     core::mem::forget(_top_board_power);
     esp_println::println!("top board powered (held)");
 
-    // ADC1 specifically: ADC2 is unusable while the radio is running, and this
-    // firmware keeps BLE up continuously.
     let joystick_adc = {
         let mut cfg = esp_hal::analog::adc::AdcConfig::new();
         let x = cfg.enable_pin(peripherals.GPIO9, esp_hal::analog::adc::Attenuation::_11dB);
@@ -295,7 +181,6 @@ async fn main(spawner: Spawner) {
             adc: joystick_adc.0,
             joy_x: joystick_adc.1,
             joy_y: joystick_adc.2,
-            // Drive lines idle low; a scan asserts one at a time.
             drive: [
                 esp_hal::gpio::Output::new(
                     peripherals.GPIO46,
@@ -318,8 +203,6 @@ async fn main(spawner: Spawner) {
                     esp_hal::gpio::OutputConfig::default(),
                 ),
             ],
-            // Sense lines: pull-DOWN, per the vendor firmware. A pressed key
-            // pulls them up toward the asserted drive line.
             sense: [
                 input_pin(peripherals.GPIO13, esp_hal::gpio::Pull::Down),
                 input_pin(peripherals.GPIO5, esp_hal::gpio::Pull::Down),
@@ -332,6 +215,12 @@ async fn main(spawner: Spawner) {
         })
         .expect("input_task token"),
     );
+    let (serial_rx, serial_tx) =
+        esp_hal::usb_serial_jtag::UsbSerialJtag::new(peripherals.USB_DEVICE).split();
+    core::mem::forget(serial_tx);
+    spawner.spawn(serial_command_task(serial_rx).expect("serial_command_task token"));
+    spawner.spawn(serial_input_task().expect("serial_input_task token"));
+
     spawner.spawn(battery_task().expect("battery_task token"));
     spawner.spawn(
         power_task(input_pin(peripherals.GPIO2, esp_hal::gpio::Pull::Up))
@@ -341,23 +230,12 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn ble_task(controller: esp_radio::ble::controller::BleConnector<'static>) {
-    // See `ble.rs` for the (unverified) TrouBLE GATT server sketch. In the
-    // real implementation this owns the `HostResources`/`GattServer`,
-    // reads `LED_FRAME_CHANNEL` -> forwards to `led_render_task` via a
-    // second channel (or shares `LED_FRAME_CHANNEL` as the single source
-    // of truth — TBD once the attribute-write callback shape is known),
-    // and drains `INPUT_EVENT_CHANNEL` / `BATTERY_CHANNEL` to notify.
     let _ = controller;
     loop {
-        embassy_time::Timer::after_secs(3600).await; // placeholder idle loop
+        embassy_time::Timer::after_secs(3600).await;
     }
 }
 
-/// The rear power button: short press wakes, ~2 s powers off, a long hold is
-/// the bootloader escape hatch.
-///
-/// The gesture recognition is host-tested in `openmicro_effects::power`; all
-/// this task owes it is a debounced level and a clock.
 #[embassy_executor::task]
 async fn power_task(button: esp_hal::gpio::Input<'static>) {
     use openmicro_effects::power::{PowerAction, PowerButton};
@@ -365,18 +243,12 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
     let mut gesture = PowerButton::new();
     let start = embassy_time::Instant::now();
     loop {
-        // Active low: the button shorts a pulled-up line to ground. INFERRED —
-        // the vendor firmware only tells us the pin is an any-edge input, not
-        // its rest level, so if the device powers itself off the instant it
-        // boots, this is the polarity to flip.
         let pressed = button.is_low();
         let now_ms = start.elapsed().as_millis() as u32;
 
         match gesture.update(pressed, now_ms) {
             PowerAction::EnterBootloader => bootloader::reboot_to_bootloader(),
             PowerAction::PowerOff => {
-                // NEXT: blank both LED chains, then enter deep sleep with the
-                // button as the wake source.
             }
             PowerAction::Wake => touch_activity(now_ms),
             PowerAction::None => {}
@@ -386,7 +258,13 @@ async fn power_task(button: esp_hal::gpio::Input<'static>) {
 }
 
 #[embassy_executor::task]
-async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter<UNDERGLOW_CODES>) {
+async fn led_render_task(
+    per_key: RmtWriter<PER_KEY_CODES>,
+    underglow: RmtWriter<UNDERGLOW_CODES>,
+    usb_detect: esp_hal::gpio::Input<'static>,
+) {
+    use openmicro_effects::status::{self, Link};
+
     log::info!(
         "leds: per-key {} on GPIO{}, underglow {} on GPIO{}",
         pins::PER_KEY_LED_COUNT,
@@ -394,37 +272,90 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
         pins::UNDERGLOW_LED_COUNT,
         pins::UNDERGLOW_LED_GPIO
     );
-    let mut keys = leds::PerKeyChain::new(per_key);
-    let mut glow = leds::UnderglowChain::new(underglow);
+    let mut keys = leds::KeyChain::new(per_key);
+    let mut glow = leds::GlowRing::new(underglow);
+    let mut ticker =
+        embassy_time::Ticker::every(embassy_time::Duration::from_millis(leds::RENDER_PERIOD_MS));
     let start = embassy_time::Instant::now();
     let mut last_beat_ms = 0u32;
     let mut asleep = false;
+    let mut last_link: Option<Link> = None;
+    let mut last_demo_index: Option<usize> = None;
+    let mut held = LedFrame::BLANK;
 
     loop {
         let t_ms = start.elapsed().as_millis() as u32;
 
-        if DIAGNOSTIC_COLOURS {
-            let phase = (t_ms / 2000) % 4;
-            let colour = match phase {
-                0 => Rgb { r: 255, g: 0, b: 0 },
-                1 => Rgb { r: 0, g: 255, b: 0 },
-                2 => Rgb { r: 0, g: 0, b: 255 },
-                _ => Rgb { r: 255, g: 255, b: 255 },
-            };
-            keys.set_all(colour);
-            glow.set(colour);
-            if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
+        if display_mode() == MODE_PROBE {
+            keys.set_chain_indices(&[
+                (PROBE_FIRST, Rgb { r: 255, g: 0, b: 0 }),
+                (PROBE_MIDDLE, Rgb { r: 0, g: 255, b: 0 }),
+                (PROBE_LAST, Rgb { r: 0, g: 0, b: 255 }),
+            ]);
+            glow.set_chain_index(0, Rgb { r: 255, g: 255, b: 255 });
+            if t_ms.wrapping_sub(last_beat_ms) >= 3000 {
                 last_beat_ms = t_ms;
-                esp_println::println!("diag t={}ms phase={}", t_ms, phase);
+                esp_println::println!(
+                    "probe: chain {} red, {} green, {} blue",
+                    PROBE_FIRST,
+                    PROBE_MIDDLE,
+                    PROBE_LAST
+                );
             }
-            embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+            ticker.next().await;
             continue;
         }
 
+        if display_mode() == MODE_IDENTIFY {
+            let step = ((t_ms / IDENTIFY_DWELL_MS) % (pins::PER_KEY_LED_COUNT as u32)) as usize;
+            keys.set_chain_index(step, Rgb { r: 255, g: 255, b: 255 });
+            let ring_step =
+                ((t_ms / IDENTIFY_DWELL_MS) % (pins::UNDERGLOW_LED_COUNT as u32)) as usize;
+            glow.set_chain_index(ring_step, Rgb { r: 255, g: 120, b: 0 });
+            if t_ms.wrapping_sub(last_beat_ms) >= IDENTIFY_DWELL_MS {
+                last_beat_ms = t_ms;
+                esp_println::println!("identify: key chain index {} / ring {}", step, ring_step);
+            }
+            ticker.next().await;
+            continue;
+        }
+
+        if display_mode() == MODE_DEMO {
+            use openmicro_effects::demo;
+            let (index, step) = demo::scene_at(t_ms);
+            if last_demo_index != Some(index) {
+                last_demo_index = Some(index);
+                esp_println::println!("demo {}/{}: {}", index + 1, demo::SCENE_COUNT, step.label);
+            }
+            match step.scene {
+                demo::Scene::Local(link) => {
+                    keys.blank();
+                    glow.render_link(link, demo::DEMO_BRIGHTNESS, t_ms);
+                }
+                demo::Scene::Host(frame) => {
+                    keys.render(&frame, t_ms);
+                    glow.render(&frame.glow, t_ms);
+                }
+            }
+            ticker.next().await;
+            continue;
+        }
+
+        while let Ok(frame) = LED_FRAME_CHANNEL.try_receive() {
+            held = frame;
+            LAST_FRAME_MS.store(t_ms, core::sync::atomic::Ordering::Relaxed);
+            if frame != LedFrame::BLANK {
+                touch_activity(t_ms);
+            }
+        }
+
+        let idle_for = t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed));
+        let since_frame =
+            t_ms.wrapping_sub(LAST_FRAME_MS.load(core::sync::atomic::Ordering::Relaxed));
+        let host_attached = usb_detect.is_low();
+        let link = status::link_state(host_attached, since_frame);
+
         if openmicro_effects::startup::is_running(t_ms) {
-            // The boot animation doubles as a wiring test: a sweep makes a
-            // wrong chain length, order or colour order obvious, where a static
-            // colour would hide all three.
             keys.render_startup(t_ms);
             glow.render_startup(t_ms);
             if t_ms < 40 {
@@ -434,12 +365,7 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
                     leds::UNDERGLOW_BUF_LEN
                 );
             }
-        } else if t_ms.wrapping_sub(LAST_ACTIVITY_MS.load(core::sync::atomic::Ordering::Relaxed))
-            >= LED_SLEEP_MS
-        {
-            // Asleep: hold everything dark until something happens. Blanking
-            // repeatedly is harmless — each frame is identical — and it keeps
-            // the wake path a single comparison.
+        } else if idle_for >= LED_SLEEP_MS {
             if !asleep {
                 asleep = true;
                 esp_println::println!("leds: sleeping after {} ms idle", LED_SLEEP_MS);
@@ -451,45 +377,163 @@ async fn led_render_task(per_key: RmtWriter<PER_KEY_CODES>, underglow: RmtWriter
                 asleep = false;
                 esp_println::println!("leds: awake");
             }
-            // NEXT: render the latest `LedFrame` from the BLE task here. Until
-            // that channel is wired, the keys stay dark and the underglow
-            // breathes — which is at least honest about the device being alive
-            // and simply having nothing to show.
-            glow.render_idle(t_ms);
+            if last_link != Some(link) {
+                last_link = Some(link);
+                esp_println::println!("link: {:?} (usb={})", link, host_attached);
+            }
+            match link {
+                Link::Live => {
+                    keys.render(&held, t_ms);
+                    glow.render(&held.glow, t_ms);
+                }
+                Link::NoDaemon | Link::Offline => {
+                    keys.blank();
+                    glow.render_link(link, LOCAL_BRIGHTNESS, t_ms);
+                }
+            }
         }
 
-        // Heartbeat. USB-Serial-JTAG throws away anything written while no
-        // host is listening, so a one-shot boot message is invisible unless a
-        // monitor happened to be attached at exactly the right moment. A
-        // periodic line makes "is it alive?" answerable at any time.
         if t_ms.wrapping_sub(last_beat_ms) >= 2000 {
             last_beat_ms = t_ms;
-            esp_println::println!("alive t={}ms", t_ms);
+            esp_println::println!("alive t={}ms link={:?}", t_ms, link);
         }
 
-        embassy_time::Timer::after_millis(leds::RENDER_PERIOD_MS).await;
+        ticker.next().await;
     }
 }
 
-/// How long the device may sit untouched before the LEDs are blanked.
-///
-/// WS2812s held at a constant colour for days is how panels develop uneven
-/// ageing, and this is a device that lives on a desk. Any input wakes it.
 const LED_SLEEP_MS: u32 = 5 * 60 * 1000;
 
-/// Milliseconds since boot when the device was last touched. Written by the
-/// input and power tasks, read by the render loop.
 static LAST_ACTIVITY_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Record activity, waking the LEDs.
+static LAST_FRAME_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn touch_activity(now_ms: u32) {
     LAST_ACTIVITY_MS.store(now_ms, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Bring-up aid: hold every LED at a solid primary, cycling.
-const DIAGNOSTIC_COLOURS: bool = false;
+const LOCAL_BRIGHTNESS: u8 = 255;
 
-/// `bool` to esp-hal's pin level.
+static DISPLAY_MODE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(INITIAL_DISPLAY_MODE);
+
+pub const MODE_NORMAL: u8 = 0;
+pub const MODE_DEMO: u8 = 1;
+pub const MODE_IDENTIFY: u8 = 2;
+pub const MODE_PROBE: u8 = 3;
+
+const INITIAL_DISPLAY_MODE: u8 = if option_env!("OPENMICRO_DEMO").is_some() {
+    MODE_DEMO
+} else if option_env!("OPENMICRO_IDENTIFY").is_some() {
+    MODE_IDENTIFY
+} else {
+    MODE_NORMAL
+};
+
+const RX_CHUNK: usize = 64;
+
+const TRACE_CABLE_BYTES: bool = option_env!("OPENMICRO_TRACE_RX").is_some();
+
+pub const IDENTITY: &str = "openmicro-fw";
+
+fn display_mode() -> u8 {
+    DISPLAY_MODE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub const COMMAND_PREFIX: u8 = b'!';
+
+fn handle_serial_command(byte: u8, armed: &mut bool) {
+    if !*armed {
+        *armed = byte == COMMAND_PREFIX;
+        return;
+    }
+    *armed = false;
+    let mode = match byte {
+        b'n' | b'N' => MODE_NORMAL,
+        b'd' | b'D' => MODE_DEMO,
+        b'i' | b'I' => MODE_IDENTIFY,
+        b'p' | b'P' => MODE_PROBE,
+        b'?' => {
+            esp_println::println!("{} {}", IDENTITY, env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        other => {
+            esp_println::println!(
+                "mode: unknown command {:?} (want !n, !d, !i or !?)",
+                other as char
+            );
+            return;
+        }
+    };
+    DISPLAY_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
+    let name = match mode {
+        MODE_DEMO => "demo",
+        MODE_IDENTIFY => "identify",
+        MODE_PROBE => "probe",
+        _ => "normal",
+    };
+    esp_println::println!("mode: {}", name);
+}
+
+#[embassy_executor::task]
+async fn serial_command_task(
+    mut rx: esp_hal::usb_serial_jtag::UsbSerialJtagRx<'static, esp_hal::Blocking>,
+) {
+    use openmicro_proto::wire;
+
+    esp_println::println!("cable: ready ('!?' to identify, '!d' demo, '!n' normal)");
+    let mut reader = wire::Reader::new();
+    let mut armed = false;
+
+    loop {
+        let mut chunk = [0u8; RX_CHUNK];
+        let got = rx.drain_rx_fifo(&mut chunk);
+        for &byte in &chunk[..got] {
+            if TRACE_CABLE_BYTES {
+                esp_println::println!("rx {:02x}", byte);
+            }
+            match reader.push(byte) {
+                wire::Feed::Frame => match LedFrame::decode(reader.frame()) {
+                    Ok(frame) => {
+                        if LED_FRAME_CHANNEL.try_send(frame).is_err() {
+                            let _ = LED_FRAME_CHANNEL.try_receive();
+                            let _ = LED_FRAME_CHANNEL.try_send(frame);
+                        }
+                    }
+                    Err(_) => esp_println::println!("cable: undecodable frame"),
+                },
+                wire::Feed::Bad => esp_println::println!("cable: bad checksum"),
+                wire::Feed::None => {
+                    if !reader.in_frame() && byte.is_ascii() {
+                        handle_serial_command(byte, &mut armed);
+                    }
+                }
+            }
+        }
+        embassy_time::Timer::after_millis(5).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn serial_input_task() {
+    use openmicro_proto::wire;
+
+    loop {
+        let event = INPUT_EVENT_CHANNEL.receive().await;
+        let Ok(payload) = event.encode() else { continue };
+        let mut framed = [0u8; wire::MAX_PAYLOAD + 3];
+        if let Some(n) = wire::encode(&payload, &mut framed) {
+            esp_println::Printer::write_bytes(&framed[..n]);
+        }
+    }
+}
+
+const IDENTIFY_DWELL_MS: u32 = 1500;
+
+const PROBE_FIRST: usize = 0;
+const PROBE_MIDDLE: usize = pins::PER_KEY_LED_COUNT / 2;
+const PROBE_LAST: usize = pins::PER_KEY_LED_COUNT - 1;
+
 fn level_of(high: bool) -> esp_hal::gpio::Level {
     if high {
         esp_hal::gpio::Level::High
@@ -498,7 +542,6 @@ fn level_of(high: bool) -> esp_hal::gpio::Level {
     }
 }
 
-/// Configure one GPIO as an input with the given pull.
 fn input_pin<'d>(
     pin: impl esp_hal::gpio::InputPin + 'd,
     pull: esp_hal::gpio::Pull,
@@ -506,10 +549,6 @@ fn input_pin<'d>(
     esp_hal::gpio::Input::new(pin, esp_hal::gpio::InputConfig::default().with_pull(pull))
 }
 
-/// Everything `input_task` drives, moved in at spawn time.
-///
-/// Grouped into one struct because embassy tasks take their arguments by
-/// value and eleven separate parameters would be unreadable.
 struct InputPins {
     adc: esp_hal::analog::adc::Adc<'static, esp_hal::peripherals::ADC1<'static>, esp_hal::Blocking>,
     joy_x: esp_hal::analog::adc::AdcPin<
@@ -531,8 +570,6 @@ struct InputPins {
 async fn input_task(mut io: InputPins) {
     let mut matrix = input::MatrixState::new();
     let start = embassy_time::Instant::now();
-    // Quadrature state, packed as (A << 1) | B, seeded from the pins so the
-    // first real edge is not read as a phantom step.
     let mut prev_ab = ab_state(&io.encoder_a, &io.encoder_b);
     let mut sw_was_down = io.encoder_sw.is_low();
     let mut last_joystick_ms = 0u32;
@@ -540,15 +577,9 @@ async fn input_task(mut io: InputPins) {
     loop {
         let now_ms = start.elapsed().as_millis() as u32;
 
-        // Scan: assert one drive line at a time and read every sense line.
-        // The polarity is the vendor's, and it is backwards from the usual
-        // keyboard convention — sense lines are pulled DOWN, so a pressed key
-        // reads HIGH while its drive line is high.
         let mut raw = [[false; pins::MATRIX_SENSE_COUNT]; pins::MATRIX_DRIVE_COUNT];
         for (d, drive) in io.drive.iter_mut().enumerate() {
             drive.set_high();
-            // Let the line settle before sampling: with a pull-down and any
-            // trace capacitance the first read after a transition is a lie.
             embassy_time::Timer::after_micros(20).await;
             for (s, sense) in io.sense.iter().enumerate() {
                 raw[d][s] = sense.is_high() == pins::MATRIX_ACTIVE_HIGH;
@@ -556,18 +587,11 @@ async fn input_task(mut io: InputPins) {
             drive.set_low();
         }
         matrix.debounce(&raw, now_ms, |event| {
-            // Only real events count as activity; the scan itself runs
-            // continuously and would otherwise keep the LEDs awake forever.
             touch_activity(now_ms);
-            // Logged as well as queued: until the BLE link exists, the serial
-            // console is the only way to see that a key press was detected —
-            // and it is what identifies the key-ID map.
             log::info!("input: {:?}", event);
             let _ = INPUT_EVENT_CHANNEL.try_send(event);
         });
 
-        // Encoder: decode every quadrature transition, not just detents, so a
-        // fast twist does not drop steps.
         let ab = ab_state(&io.encoder_a, &io.encoder_b);
         if ab != prev_ab {
             let step = input::encoder_step(prev_ab, ab);
@@ -578,8 +602,6 @@ async fn input_task(mut io: InputPins) {
             }
         }
 
-        // Encoder press. Active low: the pin carries a pull-up and the switch
-        // shorts it to ground.
         let sw_down = io.encoder_sw.is_low();
         if sw_down != sw_was_down {
             sw_was_down = sw_down;
@@ -590,14 +612,10 @@ async fn input_task(mut io: InputPins) {
             });
         }
 
-        // Joystick, sampled once every few scans — it is a menu selector, not
-        // a pointer, so there is nothing to gain from 500 Hz.
         if now_ms.wrapping_sub(last_joystick_ms) >= JOYSTICK_PERIOD_MS {
             last_joystick_ms = now_ms;
             let x_raw = io.adc.read_blocking(&mut io.joy_x);
             let y_raw = io.adc.read_blocking(&mut io.joy_y);
-            // The vendor firmware reports X inverted; match it so the host sees
-            // the same orientation whichever firmware is running.
             let x = if pins::JOYSTICK_X_INVERTED {
                 ADC_MAX.saturating_sub(x_raw)
             } else {
@@ -614,39 +632,20 @@ async fn input_task(mut io: InputPins) {
     }
 }
 
-/// 12-bit ADC full scale, and the nominal centre of an un-deflected stick.
 const ADC_MAX: u16 = 4095;
 const ADC_CENTRE: u16 = 2048;
-/// Deflection required before a direction is reported. Not calibrated against
-/// a real stick — this is a first guess and wants tuning on hardware.
 const JOYSTICK_DEADZONE: u16 = 700;
-/// How often the stick is sampled.
 const JOYSTICK_PERIOD_MS: u32 = 40;
 
-/// Pack the encoder's two phases into the 2-bit code `input::encoder_step`
-/// expects.
 fn ab_state(a: &esp_hal::gpio::Input<'static>, b: &esp_hal::gpio::Input<'static>) -> u8 {
     ((a.is_high() as u8) << 1) | (b.is_high() as u8)
 }
 
 #[embassy_executor::task]
 async fn battery_task() {
-    // There is no analog battery pin to sample: the board carries a Maxim
-    // MAX77972 combined charger and fuel gauge on I2C, and that is where the
-    // host protocol's percentage and charging flag come from.
-    //
-    // BLOCKED: the bus pins are the one thing the vendor firmware would not
-    // give up statically — it reaches the chip through Arduino's `Wire`, whose
-    // `begin(sda, scl, freq)` is dispatched virtually. Candidates are
-    // `pins::BATTERY_I2C_CANDIDATES`; an I2C scan on a real device for
-    // `pins::BATTERY_I2C_ADDR` settles it in minutes. Until then this reports
-    // nothing rather than inventing a reading.
     loop {
         embassy_time::Timer::after_secs(30).await;
     }
 }
 
-/// Static allocation cell placeholder for structures the real
-/// implementation will need to `'static`-promote (e.g. `HostResources`).
-/// Kept here as a visible reminder rather than left implicit.
 static _RESOURCES_CELL: StaticCell<()> = StaticCell::new();
