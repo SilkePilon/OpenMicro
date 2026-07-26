@@ -138,6 +138,12 @@ pub enum UsbMode {
 ///
 /// Bootloader wins if both are somehow seen, since that is the state every
 /// flashing operation cares about.
+///
+/// **`BOOTLOADER_PID` is ambiguous** and this function cannot resolve it: id
+/// `303a:1001` is both the ESP32-S3 ROM bootloader *and* any firmware exposing a
+/// USB-Serial-JTAG console, which OpenMicro's does for its logs. Deciding
+/// between them needs I/O, so it happens in [`usb_mode`]; this stays a pure
+/// function over ids and reports the conservative answer.
 pub fn classify(ids: &[(u16, u16)]) -> UsbMode {
     if ids.contains(&(WL_VID, BOOTLOADER_PID)) {
         return UsbMode::Bootloader;
@@ -150,9 +156,31 @@ pub fn classify(ids: &[(u16, u16)]) -> UsbMode {
     UsbMode::Absent
 }
 
-/// Current USB mode, read from sysfs.
+/// Resolve the `303a:1001` ambiguity by asking the device.
+///
+/// Given [`classify`]'s answer and whether OpenMicro firmware replied on the
+/// serial port, produce the real mode. Split out from the I/O so the rule itself
+/// is testable: a running device must not be reported as being in bootloader
+/// mode, which is the bug this fixes — the TUI used to say "bootloader mode"
+/// forever, including immediately after being told to go back to normal.
+pub fn resolve_ambiguous(mode: UsbMode, firmware_answered: bool) -> UsbMode {
+    match mode {
+        // The ROM bootloader never answers, so a reply means firmware is running.
+        UsbMode::Bootloader if firmware_answered => UsbMode::App(BOOTLOADER_PID),
+        other => other,
+    }
+}
+
+/// Current USB mode, read from sysfs and — when the id is ambiguous — confirmed
+/// by asking the device.
 pub fn usb_mode() -> UsbMode {
-    classify(&crate::flash::detect_usb())
+    let seen = classify(&crate::flash::detect_usb());
+    // Only pay for the probe when the id cannot settle it; the check costs up to
+    // ~600 ms of waiting for a bootloader that will never reply.
+    if seen == UsbMode::Bootloader {
+        return resolve_ambiguous(seen, crate::display::firmware_answers());
+    }
+    seen
 }
 
 /// esptool argv that just talks to whatever is on the port, without resetting
@@ -509,6 +537,33 @@ mod tests {
     fn exit_args_pass_an_explicit_port_through() {
         let args = exit_args(Some("/dev/ttyACM0"));
         assert!(args.windows(2).any(|w| w == ["--port", "/dev/ttyACM0"]));
+    }
+
+    #[test]
+    fn a_device_that_answers_is_running_not_in_the_bootloader() {
+        // The reported bug: id 303a:1001 is shared by the ROM bootloader and our
+        // own firmware's serial console, so the TUI insisted the device was in
+        // bootloader mode even right after being switched back to normal.
+        assert_eq!(
+            resolve_ambiguous(UsbMode::Bootloader, true),
+            UsbMode::App(BOOTLOADER_PID),
+            "firmware answered, so it is running"
+        );
+    }
+
+    #[test]
+    fn a_silent_device_on_the_ambiguous_id_is_still_the_bootloader() {
+        assert_eq!(resolve_ambiguous(UsbMode::Bootloader, false), UsbMode::Bootloader);
+    }
+
+    #[test]
+    fn resolving_never_changes_an_unambiguous_answer() {
+        // An app PID or an absent device needs no probe, and a stray reply must
+        // not be able to rewrite either.
+        for mode in [UsbMode::App(APP_PIDS[0]), UsbMode::Absent] {
+            assert_eq!(resolve_ambiguous(mode, true), mode);
+            assert_eq!(resolve_ambiguous(mode, false), mode);
+        }
     }
 
     #[test]

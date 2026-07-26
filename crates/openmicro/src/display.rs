@@ -12,7 +12,7 @@
 //! When the GATT server lands this should move onto the daemon path, and this
 //! module becomes the fallback for a device with no daemon.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// What the device's LEDs should be doing.
@@ -76,6 +76,64 @@ pub fn send_to(port: &Path, mode: Mode) -> Result<(), String> {
     Ok(())
 }
 
+/// The banner the firmware sends in reply to `?`. Must match `IDENTITY` in
+/// `firmware/src/main.rs`.
+pub const FIRMWARE_BANNER: &str = "openmicro-fw";
+
+/// How long to wait for a reply to `?`. The firmware answers immediately; the
+/// ROM bootloader answers never, so this is purely how long "never" takes.
+const IDENTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Does OpenMicro firmware answer on `port`?
+///
+/// This exists because USB id `303a:1001` is **ambiguous**: it is both the
+/// ESP32-S3 ROM bootloader and *any* firmware exposing a USB-Serial-JTAG console
+/// — which ours does, for its logs. So the id alone cannot distinguish "running
+/// our firmware" from "sitting in the bootloader", and reading it as the latter
+/// is why the TUI used to insist the device was in bootloader mode forever.
+///
+/// The distinguishing fact is behavioural: our firmware replies to `?`, and the
+/// ROM bootloader does not.
+pub fn firmware_answers_on(port: &Path) -> bool {
+    let Ok(mut file) =
+        std::fs::OpenOptions::new().read(true).write(true).open(port)
+    else {
+        return false;
+    };
+    if file.write_all(b"?\n").is_err() || file.flush().is_err() {
+        return false;
+    }
+
+    // Read in slices rather than to end-of-file: this is a character device, so
+    // there is no EOF, and the firmware is also emitting its own periodic log
+    // lines that we have to read past.
+    let deadline = std::time::Instant::now() + IDENTIFY_TIMEOUT;
+    let mut seen = String::new();
+    let mut buf = [0u8; 256];
+    while std::time::Instant::now() < deadline {
+        match file.read(&mut buf) {
+            Ok(0) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(n) => {
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if seen.contains(FIRMWARE_BANNER) {
+                    return true;
+                }
+                // Bound the buffer: a chatty device must not grow this forever.
+                if seen.len() > 8192 {
+                    seen.clear();
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Is our firmware running, on whichever port the device is on?
+pub fn firmware_answers() -> bool {
+    find_port().is_some_and(|p| firmware_answers_on(&p))
+}
+
 /// Send `mode` to whichever port the device is on.
 pub fn send(mode: Mode) -> Result<String, String> {
     let port = find_port().ok_or_else(|| {
@@ -88,6 +146,42 @@ pub fn send(mode: Mode) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_banner_matches_the_firmware() {
+        // Contract with `IDENTITY` in firmware/src/main.rs. If these drift, the
+        // TUI silently reports every running device as being in bootloader mode.
+        assert_eq!(FIRMWARE_BANNER, "openmicro-fw");
+    }
+
+    #[test]
+    fn identifying_a_missing_port_is_false_not_a_panic() {
+        assert!(!firmware_answers_on(Path::new("/definitely/not/a/port")));
+    }
+
+    #[test]
+    fn a_silent_port_does_not_identify_as_our_firmware() {
+        // The ROM bootloader is exactly this: it accepts the write and says
+        // nothing. It must not be mistaken for running firmware.
+        let dir = std::env::temp_dir().join(format!("om-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent");
+        std::fs::write(&path, b"").unwrap();
+        assert!(!firmware_answers_on(&path), "a silent device must not identify");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_port_already_carrying_the_banner_identifies() {
+        // Stands in for the firmware's reply. Also checks the banner is found
+        // amid other log output rather than needing to be the whole content.
+        let dir = std::env::temp_dir().join(format!("om-ident2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chatty");
+        std::fs::write(&path, format!("alive t=1\n{FIRMWARE_BANNER} 0.3.0\nalive t=2\n")).unwrap();
+        assert!(firmware_answers_on(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn command_bytes_match_the_firmware() {

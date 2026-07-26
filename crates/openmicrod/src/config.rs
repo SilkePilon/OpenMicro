@@ -4,8 +4,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
-    #[default]
+    /// No device: render into memory. Useful for testing the daemon alone.
     Mock,
+    /// USB cable, over the firmware's USB-Serial-JTAG console.
+    ///
+    /// The default, and the only transport that currently reaches real hardware:
+    /// the firmware's BLE GATT server is still a sketch, so `Ble` cannot deliver
+    /// a frame. Cable also needs no pairing and cannot drop out mid-session.
+    #[default]
+    Cable,
+    /// Bluetooth LE. Requires a firmware GATT server, which does not exist yet.
     Ble,
 }
 
@@ -29,7 +37,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             brightness: 200,
-            transport: Transport::Mock,
+            transport: Transport::Cable,
             colors: AgentColors::default(),
             sleep_minutes: default_sleep_minutes(),
         }
@@ -99,9 +107,17 @@ mod tests {
     }
 
     #[test]
-    fn transport_defaults_to_mock() {
-        assert_eq!(Config::from_toml_str("").transport, Transport::Mock);
-        assert_eq!(Config::from_toml_str("brightness = 80").transport, Transport::Mock);
+    fn transport_defaults_to_cable() {
+        // Cable, not BLE: it is the only transport that currently reaches real
+        // hardware, and it needs no pairing.
+        assert_eq!(Config::from_toml_str("").transport, Transport::Cable);
+        assert_eq!(Config::from_toml_str("brightness = 80").transport, Transport::Cable);
+    }
+
+    #[test]
+    fn transport_cable_and_mock_parse() {
+        assert_eq!(Config::from_toml_str("transport = \"cable\"").transport, Transport::Cable);
+        assert_eq!(Config::from_toml_str("transport = \"mock\"").transport, Transport::Mock);
     }
 
     #[test]
@@ -165,7 +181,7 @@ mod tests {
     #[test]
     fn invalid_transport_falls_back_to_default_config() {
         let cfg = Config::from_toml_str("transport = \"laser\"");
-        assert_eq!(cfg.transport, Transport::Mock);
+        assert_eq!(cfg.transport, Transport::Cable);
         assert_eq!(cfg.brightness, 200);
     }
 }

@@ -692,6 +692,7 @@ dependencies = [
  "async-trait",
  "bluer",
  "futures",
+ "libc",
  "openmicro-effects",
  "openmicro-proto",
  "serde",

@@ -1,5 +1,6 @@
 mod action;
 mod ble;
+mod cable;
 mod config;
 mod control;
 mod device;
@@ -55,6 +56,23 @@ async fn main() -> anyhow::Result<()> {
             drop(input_tx);
             drop(battery_tx);
             Arc::new(Mutex::new(MockDevice::new()))
+        }
+        Transport::Cable => {
+            // The battery reading comes from the BLE Battery Service, which the
+            // cable link has no equivalent for yet.
+            drop(battery_tx);
+            match cable::CableDevice::open(input_tx) {
+                Ok(dev) => {
+                    println!("openmicrod: device connected over the cable ({}).", dev.port().display());
+                    Arc::new(Mutex::new(dev))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "openmicrod: cable connect failed ({e}); falling back to mock device."
+                    );
+                    Arc::new(Mutex::new(MockDevice::new()))
+                }
+            }
         }
         Transport::Ble => match ble::BleDevice::connect(input_tx, battery_tx).await {
             Ok(dev) => {

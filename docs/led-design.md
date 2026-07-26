@@ -189,10 +189,8 @@ speeds, and fails if any LED lurches by more than a smooth ramp would.
 - **Demo** — a scripted walk through all eight scenes, 4 s each.
 - **Identify LEDs** — one chain position at a time, logging its index.
 
-This goes down USB-Serial-JTAG as a single byte, *not* through the daemon: the
-daemon talks to the device over BLE and that is not wired yet. So it works on an
-already-flashed device with no daemon and no rebuild. When the GATT server lands
-this should move onto the daemon path.
+This goes down USB-Serial-JTAG as a single byte, on the same link the daemon uses.
+It works on an already-flashed device with no daemon and no rebuild.
 
 ## Where the code lives
 
@@ -221,6 +219,36 @@ current frame every `HEARTBEAT_MS` (1.5 s) and the device falls back after
 `DAEMON_TIMEOUT_MS` (6 s) — comfortably more than three heartbeats, so a couple
 of dropped writes do not make the display flicker between modes.
 
+## Transports
+
+| Transport | Status |
+|---|---|
+| **Cable** (USB-Serial-JTAG) | **Works.** The default. |
+| BLE | Not implemented — `firmware/src/ble.rs` is still a sketch. |
+| Mock | Renders into memory, for testing the daemon alone. |
+
+Cable is the default because it is the one that reaches hardware, and it is the
+better link anyway: no pairing to lose, no connection to drop mid-session.
+
+Both directions are `wire`-framed (`0xF5 len payload sum`), because the link
+shares one byte stream with the firmware's log output. The marker is `0xF5`
+specifically because it cannot occur in valid UTF-8, so no log line can be
+mistaken for a frame.
+
+Three things about this link were non-obvious enough to be worth recording:
+
+1. **The tty must be put in raw mode.** By default the line discipline *rewrites
+   the stream* — `ONLCR` turns 0x0A into CRLF, `IXON` eats 0x11/0x13. ASCII mode
+   commands survive that, which is exactly why the first version looked like it
+   worked; binary frames containing 0x0A were silently corrupted and the device
+   never saw a valid frame.
+2. **Drain the RX FIFO before doing any work.** Reading byte-at-a-time with a log
+   write in between loses the rest of the USB packet: a six-byte frame arrived as
+   its first byte and nothing else. Empty the FIFO first, then process.
+3. **A frame's payload bytes must not also be parsed as commands.** The reader
+   exposes `in_frame()` for this; without it every payload byte is additionally
+   read as a mode command.
+
 ## Status
 
 Implemented and unit-tested: all of the above.
@@ -228,7 +256,11 @@ Implemented and unit-tested: all of the above.
 Verified on hardware: the boot sweep, `Offline`, `NoDaemon`, the serial
 mode-switch round trip, and — via demo mode — every host-driven state.
 
-**Not reachable on hardware yet:** the real host-driven path, because
-`firmware/src/ble.rs` is still a sketch, so `LED_FRAME_CHANNEL` has nothing
-feeding it. Wiring the GATT server is the remaining piece; when it lands, the
-demo scenes become live states with no rendering changes.
+Verified end-to-end over the cable: the daemon connects, a hook event reaches the
+device, and the firmware reports `link=Live` — then falls back to `NoDaemon`
+exactly `DAEMON_TIMEOUT_MS` after the daemon stops.
+
+**BLE is still not implemented.** `firmware/src/ble.rs` remains a sketch, so
+`Transport::Ble` cannot deliver a frame. Nothing about the rendering depends on
+which transport carries it, so wiring the GATT server later changes no display
+code.

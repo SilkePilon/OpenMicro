@@ -17,3 +17,4 @@ async-trait.workspace = true
 bluer.workspace = true
 uuid.workspace = true
 futures.workspace = true
+libc.workspace = true

@@ -27,3 +27,7 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 uuid = "1"
 futures = "0.3"
 hidapi = "2.6"
+# Raw-mode termios for the cable link. A tty in its default line discipline
+# rewrites binary (LF -> CRLF, flow control on 0x11/0x13), which silently
+# corrupts every framed LED packet.
+libc = "0.2"

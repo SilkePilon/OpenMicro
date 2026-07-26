@@ -349,6 +349,7 @@ async fn main(spawner: Spawner) {
         esp_hal::usb_serial_jtag::UsbSerialJtag::new(peripherals.USB_DEVICE).split();
     core::mem::forget(serial_tx);
     spawner.spawn(serial_command_task(serial_rx).expect("serial_command_task token"));
+    spawner.spawn(serial_input_task().expect("serial_input_task token"));
 
     spawner.spawn(battery_task().expect("battery_task token"));
     spawner.spawn(
@@ -640,6 +641,16 @@ const INITIAL_DISPLAY_MODE: u8 = if option_env!("OPENMICRO_DEMO").is_some() {
     MODE_NORMAL
 };
 
+/// One drain of the RX FIFO. The peripheral's OUT endpoint is 64 bytes, so this
+/// empties it completely in a single pass.
+const RX_CHUNK: usize = 64;
+
+/// Bring-up aid: log every byte arriving on the cable.
+const TRACE_CABLE_BYTES: bool = option_env!("OPENMICRO_TRACE_RX").is_some();
+
+/// Banner sent in reply to `?`. The host matches on this exact prefix.
+pub const IDENTITY: &str = "openmicro-fw";
+
 fn display_mode() -> u8 {
     DISPLAY_MODE.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -654,6 +665,14 @@ fn handle_serial_command(byte: u8) {
         b'd' | b'D' => MODE_DEMO,
         b'i' | b'I' => MODE_IDENTIFY,
         b'p' | b'P' => MODE_PROBE,
+        // Identify. The host needs this because USB PID 303a:1001 is *both* the
+        // ROM bootloader and any firmware exposing USB-Serial-JTAG — ours does,
+        // so the id alone cannot tell "running" from "in the bootloader". The
+        // ROM bootloader answers nothing, which is the distinguishing fact.
+        b'?' => {
+            esp_println::println!("{} {}", IDENTITY, env!("CARGO_PKG_VERSION"));
+            return;
+        }
         b'\r' | b'\n' | b' ' | b'\t' => return,
         other => {
             esp_println::println!("mode: unknown command {:?} (want n, d or i)", other as char);
@@ -670,26 +689,101 @@ fn handle_serial_command(byte: u8) {
     esp_println::println!("mode: {}", name);
 }
 
-/// Read display-mode commands from USB-Serial-JTAG.
+/// The cable link: display-mode commands and `LedFrame`s in, input events out.
 ///
-/// Only the RX half is taken. esp-println writes to the TX FIFO through raw
-/// register access rather than through this driver, so the two coexist — but it
-/// does mean the TX guard must not be dropped, or output stops.
+/// **This is the transport that actually works today.** The BLE GATT server is
+/// still a sketch, so until it lands this is how the daemon drives the display —
+/// and it is the more reliable of the two anyway, since it needs no pairing and
+/// cannot drop out mid-session.
+///
+/// Two kinds of traffic share the RX stream:
+/// - single ASCII bytes are display-mode commands (`d`/`i`/`p`/`n`/`?`);
+/// - `wire`-framed binary is a postcard-encoded `LedFrame`.
+///
+/// They cannot be confused: the frame marker `0xF5` is not a legal UTF-8 byte,
+/// and the mode commands are all ASCII.
+///
+/// Only the RX half of the peripheral is taken. esp-println writes to the TX FIFO
+/// through raw register access rather than through this driver, so the two
+/// coexist — but it does mean the TX guard must not be dropped, or output stops.
 #[embassy_executor::task]
 async fn serial_command_task(
     mut rx: esp_hal::usb_serial_jtag::UsbSerialJtagRx<'static, esp_hal::Blocking>,
 ) {
-    esp_println::println!(
-        "mode: send 'd' demo, 'i' identify, 'p' probe, 'n' normal"
-    );
+    use openmicro_proto::wire;
+
+    esp_println::println!("cable: ready ('?' to identify, 'd' demo, 'n' normal)");
+    let mut reader = wire::Reader::new();
+
     loop {
         // Drain whatever arrived. `read_byte` is non-blocking, so this returns
         // promptly and the poll interval below governs latency.
-        while let Ok(byte) = rx.read_byte() {
-            handle_serial_command(byte);
+        //
+        // The RX FIFO is 64 bytes and a framed LedFrame is around 50, so this
+        // must not fall behind: hence a 5 ms poll rather than the 50 ms that a
+        // mode-switch alone would have justified.
+        // Drain the FIFO in one pass *before* doing anything with the bytes.
+        //
+        // Byte-at-a-time with work in between loses data: the earlier version
+        // printed a log line from inside this loop, and a framed packet arrived
+        // as its first byte and nothing else. Writing to the TX FIFO while the
+        // OUT endpoint still holds unread bytes costs enough time to lose them,
+        // so the rule is: empty the FIFO first, then process.
+        let mut chunk = [0u8; RX_CHUNK];
+        let got = rx.drain_rx_fifo(&mut chunk);
+        for &byte in &chunk[..got] {
+            if TRACE_CABLE_BYTES {
+                esp_println::println!("rx {:02x}", byte);
+            }
+            match reader.push(byte) {
+                wire::Feed::Frame => match LedFrame::decode(reader.frame()) {
+                    Ok(frame) => {
+                        // Depth-2 channel: if the render loop has not caught up,
+                        // drop the older frame rather than the newer one. An
+                        // out-of-date display frame is never worth showing.
+                        if LED_FRAME_CHANNEL.try_send(frame).is_err() {
+                            let _ = LED_FRAME_CHANNEL.try_receive();
+                            let _ = LED_FRAME_CHANNEL.try_send(frame);
+                        }
+                    }
+                    Err(_) => esp_println::println!("cable: undecodable frame"),
+                },
+                wire::Feed::Bad => esp_println::println!("cable: bad checksum"),
+                // Not part of a frame, so it may be a mode command. Framing
+                // bytes never reach here, because the reader consumes them.
+                // Not part of a frame, so it may be a mode command. Bytes the
+                // reader is *mid-frame* on belong to the frame, and ASCII is the
+                // only thing a command can be — without both checks every
+                // payload byte is also parsed as a command.
+                wire::Feed::None => {
+                    if !reader.in_frame() && byte.is_ascii() {
+                        handle_serial_command(byte);
+                    }
+                }
+            }
         }
-        // 50 ms is imperceptible for a mode switch and costs nothing.
-        embassy_time::Timer::after_millis(50).await;
+        embassy_time::Timer::after_millis(5).await;
+    }
+}
+
+/// Send queued input events to the host, `wire`-framed.
+///
+/// Runs regardless of which transport the host is using: over the cable this is
+/// how key presses reach the daemon, and the framing means the daemon can pick
+/// them out of the same stream that carries the logs.
+#[embassy_executor::task]
+async fn serial_input_task() {
+    use openmicro_proto::wire;
+
+    loop {
+        let event = INPUT_EVENT_CHANNEL.receive().await;
+        let Ok(payload) = event.encode() else { continue };
+        let mut framed = [0u8; wire::MAX_PAYLOAD + 3];
+        if let Some(n) = wire::encode(&payload, &mut framed) {
+            // Raw bytes through esp-println's writer, which owns the TX FIFO.
+            // Not `write!` — formatting would mangle the binary payload.
+            esp_println::Printer::write_bytes(&framed[..n]);
+        }
     }
 }
 
