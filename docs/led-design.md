@@ -189,8 +189,25 @@ speeds, and fails if any LED lurches by more than a smooth ramp would.
 - **Demo** — a scripted walk through all eight scenes, 4 s each.
 - **Identify LEDs** — one chain position at a time, logging its index.
 
-This goes down USB-Serial-JTAG as a single byte, on the same link the daemon uses.
-It works on an already-flashed device with no daemon and no rebuild.
+This goes down USB-Serial-JTAG as `!` followed by one byte — `!n`, `!d`, `!i`,
+`!p`, or `!?` to identify — on the same link the daemon uses. It works on an
+already-flashed device with no daemon and no rebuild.
+
+The `!` is not decoration. This console carries the firmware's log output *and*
+its command input, and a host tty in its default line discipline echoes whatever
+it receives straight back out — so every line the firmware printed arrived back
+at the firmware as input. With bare letters as commands that closed a loop:
+`link:` contains `i` and `n`, and any line with a `d` in it put the board into
+demo mode on its own. That is why a board would appear to enter demo mode by
+itself. Anything arriving without the prefix is now dropped silently — replying
+would print more output to echo.
+
+For the same reason the host opens the port **raw and non-blocking**. Raw stops
+the echo and stops the line discipline rewriting binary frames; non-blocking is
+what makes a read timeout mean anything at all. A blocking read on a silent port
+never returns, so a deadline checked *between* reads is never reached — that hung
+the setup wizard at "Starting the new firmware", waiting for a reply from a ROM
+bootloader, which by definition never sends one.
 
 ## Where the code lives
 

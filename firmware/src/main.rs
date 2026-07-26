@@ -655,11 +655,32 @@ fn display_mode() -> u8 {
     DISPLAY_MODE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Apply a single-byte display-mode command.
+/// Commands must be introduced by this byte.
 ///
-/// Whitespace is ignored so a line-buffered terminal, which sends a trailing
-/// newline, does not look like an unknown command.
-fn handle_serial_command(byte: u8) {
+/// Without it the board reprograms itself. This console carries the firmware's
+/// log output *and* its command input, and a host tty in its default line
+/// discipline echoes everything it receives straight back out — so every line
+/// printed here arrived back as input. With bare letters as commands that is a
+/// feedback loop: `link:` contains `i` (identify) and `n` (normal), and any line
+/// with a `d` in it put the board into demo mode on its own. Observed on
+/// hardware, which is how it was found.
+///
+/// `!` never appears in this firmware's output, so the loop cannot close. Must
+/// match `COMMAND_PREFIX` in `crates/openmicro/src/display.rs`.
+pub const COMMAND_PREFIX: u8 = b'!';
+
+/// Apply a display-mode command byte, given whether the prefix just arrived.
+///
+/// `armed` is the whole parser state: [`COMMAND_PREFIX`] sets it, and the very
+/// next byte is taken as the command. Bytes arriving unarmed are dropped
+/// **silently** — they are almost certainly this firmware's own output echoed
+/// back, and replying would print more output to echo.
+fn handle_serial_command(byte: u8, armed: &mut bool) {
+    if !*armed {
+        *armed = byte == COMMAND_PREFIX;
+        return;
+    }
+    *armed = false;
     let mode = match byte {
         b'n' | b'N' => MODE_NORMAL,
         b'd' | b'D' => MODE_DEMO,
@@ -673,9 +694,11 @@ fn handle_serial_command(byte: u8) {
             esp_println::println!("{} {}", IDENTITY, env!("CARGO_PKG_VERSION"));
             return;
         }
-        b'\r' | b'\n' | b' ' | b'\t' => return,
         other => {
-            esp_println::println!("mode: unknown command {:?} (want n, d or i)", other as char);
+            esp_println::println!(
+                "mode: unknown command {:?} (want !n, !d, !i or !?)",
+                other as char
+            );
             return;
         }
     };
@@ -697,7 +720,7 @@ fn handle_serial_command(byte: u8) {
 /// cannot drop out mid-session.
 ///
 /// Two kinds of traffic share the RX stream:
-/// - single ASCII bytes are display-mode commands (`d`/`i`/`p`/`n`/`?`);
+/// - prefixed ASCII pairs are display-mode commands (`!d`/`!i`/`!p`/`!n`/`!?`);
 /// - `wire`-framed binary is a postcard-encoded `LedFrame`.
 ///
 /// They cannot be confused: the frame marker `0xF5` is not a legal UTF-8 byte,
@@ -712,8 +735,11 @@ async fn serial_command_task(
 ) {
     use openmicro_proto::wire;
 
-    esp_println::println!("cable: ready ('?' to identify, 'd' demo, 'n' normal)");
+    esp_println::println!("cable: ready ('!?' to identify, '!d' demo, '!n' normal)");
     let mut reader = wire::Reader::new();
+    // One byte of parser state, shared across FIFO drains: a prefix arriving at
+    // the end of one chunk must still arm the command at the start of the next.
+    let mut armed = false;
 
     loop {
         // Drain whatever arrived. `read_byte` is non-blocking, so this returns
@@ -757,7 +783,7 @@ async fn serial_command_task(
                 // payload byte is also parsed as a command.
                 wire::Feed::None => {
                     if !reader.in_frame() && byte.is_ascii() {
-                        handle_serial_command(byte);
+                        handle_serial_command(byte, &mut armed);
                     }
                 }
             }

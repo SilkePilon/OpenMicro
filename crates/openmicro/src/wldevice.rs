@@ -171,10 +171,25 @@ pub fn resolve_ambiguous(mode: UsbMode, firmware_answered: bool) -> UsbMode {
     }
 }
 
+/// Current USB mode straight from sysfs, with the `303a:1001` ambiguity left
+/// unresolved.
+///
+/// Cheap and side-effect free. Use this anywhere the answer only has to
+/// distinguish "something is on the bus" from "nothing is", and in any loop:
+/// [`usb_mode`] writes to the device and can wait up to
+/// [`crate::display::IDENTIFY_TIMEOUT`], which is not something to do every
+/// 250 ms.
+pub fn usb_mode_raw() -> UsbMode {
+    classify(&crate::flash::detect_usb())
+}
+
 /// Current USB mode, read from sysfs and — when the id is ambiguous — confirmed
 /// by asking the device.
+///
+/// This one talks to the device, so it belongs in the paths that report state to
+/// the user, not in polling loops or in the middle of a flash sequence.
 pub fn usb_mode() -> UsbMode {
-    let seen = classify(&crate::flash::detect_usb());
+    let seen = usb_mode_raw();
     // Only pay for the probe when the id cannot settle it; the check costs up to
     // ~600 ms of waiting for a bootloader that will never reply.
     if seen == UsbMode::Bootloader {
@@ -244,7 +259,10 @@ pub fn download_mode_responds(port: Option<&str>) -> bool {
 pub fn enter_bootloader() -> Result<Vec<String>, String> {
     let mut log = Vec::new();
 
-    match usb_mode() {
+    // Raw, not the probing form: the `download_mode_responds` check just below
+    // already resolves the ambiguity, and better — it asks the bootloader
+    // directly instead of inferring from our firmware's silence.
+    match usb_mode_raw() {
         UsbMode::Bootloader => {
             // Could be the ROM bootloader, or could be OpenMicro firmware
             // exposing the same USB-Serial-JTAG identity. Ask before assuming.
@@ -275,7 +293,7 @@ pub fn enter_bootloader() -> Result<Vec<String>, String> {
     let deadline = Instant::now() + BOOTLOADER_APPEAR_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
-        if usb_mode() == UsbMode::Bootloader {
+        if usb_mode_raw() == UsbMode::Bootloader {
             log.push("device is in bootloader mode.".to_string());
             return Ok(log);
         }
@@ -369,7 +387,13 @@ fn send_rpc(request: &str) -> Result<(), String> {
 /// straps on USB-Serial-JTAG, and this board exposes no DTR/RTS lines for the
 /// classic auto-reset, so `--after watchdog-reset` is the only thing that works.
 pub fn exit_bootloader(port: Option<&str>) -> Result<Vec<String>, String> {
-    if usb_mode() == UsbMode::Absent {
+    // Raw, not the probing form. This runs immediately after flashing, when the
+    // device is sitting in the ROM bootloader and therefore silent — and the
+    // question here is only "is anything on the bus", which the id answers on
+    // its own. Probing here is what hung the wizard at "Starting the new
+    // firmware": the step that exists to *get out* of the bootloader was waiting
+    // on a reply that a bootloader never sends.
+    if usb_mode_raw() == UsbMode::Absent {
         return Ok(vec!["no device on USB; nothing to do.".to_string()]);
     }
     let esptool = crate::flash::esptool_path().ok_or_else(|| {
@@ -579,5 +603,63 @@ mod tests {
     fn usb_mode_does_not_panic_without_hardware() {
         // No macropad attached in CI; this must still return a value.
         let _ = usb_mode();
+    }
+
+    #[test]
+    fn the_raw_mode_check_does_no_device_io() {
+        // `usb_mode_raw` exists to be safe inside loops and inside the flash
+        // sequence, which means it must not talk to the device. Reading sysfs
+        // takes microseconds; an identify probe takes up to IDENTIFY_TIMEOUT,
+        // so the gap between the two is enormous and easy to assert on.
+        let started = std::time::Instant::now();
+        let _ = usb_mode_raw();
+        let took = started.elapsed();
+        assert!(
+            took < crate::display::IDENTIFY_TIMEOUT / 2,
+            "usb_mode_raw took {took:?}; it is probing the device, which callers rely on it not doing"
+        );
+    }
+
+    /// Hardware round trip: into the bootloader and back out.
+    ///
+    /// Ignored by default — needs a real device, and resets it:
+    ///
+    /// ```text
+    /// cargo test -p openmicro -- --ignored --nocapture bootloader_and_back
+    /// ```
+    ///
+    /// This is here because the wizard hung at "Starting the new firmware", the
+    /// one step whose job is to get the device *out* of the bootloader, and no
+    /// unit test could have caught it: the cause was a blocking read on a
+    /// character device, and the tests stood in with ordinary files, which
+    /// report end-of-file at once. Only real hardware is silent the way a ROM
+    /// bootloader is silent. So this asserts the thing that cannot be faked —
+    /// that the sequence finishes at all.
+    #[test]
+    #[ignore = "needs a device on USB, and resets it"]
+    fn bootloader_and_back() {
+        use std::time::{Duration, Instant};
+        /// Generous, but far below "forever". The bug was unbounded, so any
+        /// finite bound catches it.
+        const BUDGET: Duration = Duration::from_secs(90);
+
+        assert_ne!(usb_mode_raw(), UsbMode::Absent, "no device on USB");
+
+        let log = enter_bootloader().expect("could not enter the bootloader");
+        println!("enter_bootloader:\n  {}", log.join("\n  "));
+
+        let started = Instant::now();
+        let log = exit_bootloader(None).expect("could not leave the bootloader");
+        let took = started.elapsed();
+        println!("exit_bootloader ({took:?}):\n  {}", log.join("\n  "));
+        assert!(took < BUDGET, "leaving the bootloader took {took:?}; it is blocking, not working");
+
+        // And firmware is genuinely running again, not merely reset — the USB id
+        // cannot tell us that, since the ROM bootloader shares it.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            crate::display::firmware_answers(),
+            "came out of the bootloader but no firmware answered"
+        );
     }
 }

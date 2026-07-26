@@ -21,3 +21,6 @@ uuid.workspace = true
 # Vendor HID control: asking the firmware to reboot into ROM download mode is
 # the only way into the bootloader on this board (no usable boot button).
 hidapi.workspace = true
+# Raw-mode/non-blocking tty setup for the serial console. Without it, reading a
+# silent port blocks forever and the tty echoes the device's own logs back at it.
+libc.workspace = true

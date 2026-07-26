@@ -653,6 +653,7 @@ dependencies = [
  "crossterm",
  "futures",
  "hidapi",
+ "libc",
  "openmicro-proto",
  "serde",
  "serde_json",
